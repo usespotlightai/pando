@@ -1,7 +1,9 @@
 //! The store as Pando sees it: segments, refs, change lists and hints over [`Store`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use pando_format::{Hash, Ref, SegId, SegmentIndex, keys};
@@ -16,6 +18,21 @@ pub struct RemoteStats {
     pub puts: AtomicU64,
     pub put_bytes: AtomicU64,
     pub ref_puts: AtomicU64,
+}
+
+/// A stored segment: the size and upload time of its data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SegmentInfo {
+    pub(crate) size: u64,
+    pub(crate) modified: SystemTime,
+}
+
+/// A stored change list: the root it leads to, the root it starts from, and its upload time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChangeListInfo {
+    pub(crate) root: Hash,
+    pub(crate) from: Hash,
+    pub(crate) modified: SystemTime,
 }
 
 #[derive(Debug, Clone)]
@@ -176,5 +193,57 @@ impl Remote {
             Err(StoreError::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Every stored segment. A segment whose data is missing shows its index.
+    pub(crate) async fn list_segments(&self) -> Result<HashMap<SegId, SegmentInfo>> {
+        let prefix = format!("{}/", keys::SEGMENTS);
+        let mut out = HashMap::new();
+        for o in self.store.list(keys::SEGMENTS).await? {
+            let Some(name) = o.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(id) = keys::parse_segment(name) else {
+                continue;
+            };
+            let info = SegmentInfo {
+                size: o.size,
+                modified: o.modified,
+            };
+            if !name.ends_with(".idx") {
+                out.insert(id, info);
+            } else {
+                out.entry(id).or_insert(info);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes a segment: its index first, so a half-deleted segment has no index to read.
+    pub(crate) async fn delete_segment(&self, id: SegId) -> Result<()> {
+        self.store.delete(&keys::segment_index(id)).await?;
+        Ok(self.store.delete(&keys::segment(id)).await?)
+    }
+
+    pub(crate) async fn list_change_lists(&self) -> Result<Vec<ChangeListInfo>> {
+        let prefix = format!("{}/", keys::CHANGES);
+        Ok(self
+            .store
+            .list(keys::CHANGES)
+            .await?
+            .into_iter()
+            .filter_map(|o| {
+                let (root, from) = keys::parse_change_list(o.key.strip_prefix(&prefix)?)?;
+                Some(ChangeListInfo {
+                    root,
+                    from,
+                    modified: o.modified,
+                })
+            })
+            .collect())
+    }
+
+    pub(crate) async fn delete_change_list(&self, root: Hash, from: Hash) -> Result<()> {
+        Ok(self.store.delete(&keys::change_list(root, from)).await?)
     }
 }

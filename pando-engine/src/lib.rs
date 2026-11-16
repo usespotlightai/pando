@@ -17,10 +17,12 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code, reason = "handoff, hydrate, base builds and GC use these next")]
 
+pub mod branch;
 mod cache;
 mod dedup;
 mod error;
 mod flight;
+pub mod gc;
 mod local;
 mod packer;
 pub mod ports;
