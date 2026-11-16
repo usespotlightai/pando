@@ -1,0 +1,120 @@
+#cloud-config
+# Bench host ${host}. Rendered by Terraform; shell variables are written as $NAME, never with braces.
+
+package_update: true
+packages:
+  - btrfs-progs
+  - docker.io
+  - fio
+  - git
+  - jq
+  - mdadm
+  - nbd-client
+  - nvme-cli
+  - qemu-utils
+  - xfsprogs
+  - zfsutils-linux
+  - zstd
+
+write_files:
+  - path: /etc/pando-bench.env
+    permissions: "0644"
+    content: |
+      PANDO_BENCH_HOST=${host}
+      AWS_REGION=${region}
+      S3_REGION=${region}
+      S3_BUCKET=${bucket}
+      PANDO_BENCH_REGISTRY=${registry}
+      PANDO_BENCH_EBS_VOLUME=${ebs_volume}
+      PANDO_BENCH_DATA=/data
+
+  - path: /etc/modules-load.d/pando-bench.conf
+    content: |
+      ublk_drv
+      nbd
+      dm_mod
+      loop
+
+  - path: /etc/modprobe.d/pando-bench.conf
+    content: |
+      options nbd nbds_max=16
+
+  # Instance storage is empty after every stop and start, so this runs at each boot: it puts
+  # XFS (reflink on) on the instance-store NVMe disks, striped when there are several, at /data.
+  - path: /usr/local/sbin/pando-bench-data
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      mountpoint -q /data && exit 0
+      mapfile -t disks < <(lsblk -dn -o NAME,MODEL | awk '/Instance Storage/ {print "/dev/" $1}')
+      if [ "$${#disks[@]}" -eq 0 ]; then
+        echo "no instance-store NVMe disk found" >&2
+        exit 1
+      fi
+      dev=$${disks[0]}
+      if [ -e /dev/md/pando-data ]; then
+        dev=/dev/md/pando-data
+      elif [ "$${#disks[@]}" -gt 1 ]; then
+        mdadm --create /dev/md/pando-data --run --level=0 --raid-devices=$${#disks[@]} "$${disks[@]}"
+        dev=/dev/md/pando-data
+      fi
+      blkid "$dev" >/dev/null 2>&1 || mkfs.xfs -f -m reflink=1 "$dev"
+      mkdir -p /data
+      mount -o noatime "$dev" /data
+      chown ubuntu:ubuntu /data
+
+  - path: /etc/systemd/system/pando-bench-data.service
+    content: |
+      [Unit]
+      Description=Instance-store NVMe at /data for the Pando bench
+      Before=docker.service
+      After=local-fs.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/pando-bench-data
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+%{ if max_hours > 0 ~}
+
+  # Cost guard: power off ${max_hours} h after every boot. The instance stops, not terminates, so
+  # EBS volumes stay and compute billing ends; instance-store data in /data is lost.
+  - path: /etc/systemd/system/pando-bench-poweroff.timer
+    content: |
+      [Unit]
+      Description=Power off the Pando bench host ${max_hours} h after boot
+
+      [Timer]
+      OnBootSec=${max_hours}h
+
+      [Install]
+      WantedBy=timers.target
+
+  - path: /etc/systemd/system/pando-bench-poweroff.service
+    content: |
+      [Unit]
+      Description=Power off the Pando bench host
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/systemctl poweroff
+%{ endif ~}
+
+runcmd:
+  # Background package updates would add noise to the measurements.
+  - systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
+  # ublk_drv and nbd ship in the extra modules package on some kernel flavours.
+  - apt-get install -y "linux-modules-extra-$(uname -r)" || true
+  - systemctl restart systemd-modules-load.service
+  - snap install aws-cli --classic
+  - systemctl daemon-reload
+  - systemctl enable --now pando-bench-data.service
+%{ if max_hours > 0 ~}
+  - systemctl enable --now pando-bench-poweroff.timer
+%{ endif ~}
+  - usermod -aG docker ubuntu
+  - echo 'set -a; . /etc/pando-bench.env; set +a' > /etc/profile.d/pando-bench.sh
+  - lsmod | grep -E '^(ublk_drv|nbd|dm_mod) ' > /var/log/pando-bench-modules.txt || true

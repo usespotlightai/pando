@@ -2,3 +2,12 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+/bench/infra/.terraform/
+/bench/infra/*.tfstate
+/bench/infra/*.tfstate.*
+/bench/infra/*.tfvars
+/bench/infra/bootstrap/.terraform/
+/bench/infra/bootstrap/*.tfstate
+/bench/infra/bootstrap/*.tfstate.*
+/bench/infra/backend_override.tf
+/bench/infra/*.auto.tfvars.json
