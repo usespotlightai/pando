@@ -3,6 +3,7 @@
 
 mod clock;
 mod cpu;
+mod device;
 mod fs;
 mod rng;
 mod store;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 
 pub use clock::SimClock;
 pub use cpu::InlineCpu;
+pub use device::{SimBlock, SimDevices};
 pub use fs::SimFs;
 pub use rng::SimRng;
 pub use store::{Fault, SimStore, StoreOp};

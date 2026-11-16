@@ -16,8 +16,8 @@ use tokio::task::JoinHandle;
 
 use crate::base::{BaseView, Bases};
 use crate::cache::Cache;
-use crate::dedup::Dedup;
 use crate::dedup::learned::Learner;
+use crate::dedup::{Dedup, PreparedChunks};
 use crate::flight::bounded;
 use crate::local::{Journal, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
@@ -25,6 +25,8 @@ use crate::ports::{Cpu, CpuClass, LocalFs, Version, on_cpu};
 use crate::remote::Remote;
 use crate::tree::Tree;
 use crate::{Error, Ports, Result};
+
+mod image;
 
 const STRIPES: usize = 64;
 const CHUNK: u64 = CHUNK_SIZE as u64;
@@ -47,6 +49,22 @@ struct Mem {
     touched: HashSet<u64>,
     flushing: Option<Arc<HashMap<u64, Bytes>>>,
     jfloor: u64,
+    /// Dirty chunks whose bytes are also in a file that stays until they are published.
+    dirty_ref: HashMap<u64, ChunkRef>,
+    /// The chunks written since tracking started, while a handoff copies the branch.
+    track: Option<HashSet<u64>>,
+    /// Flushes committed so far.
+    flush_seq: u64,
+    /// Per file, the last flush that recorded a chunk as a reference into it.
+    ref_seq: HashMap<PathBuf, u64>,
+}
+
+/// A chunk whose bytes are `CHUNK_SIZE` bytes at `offset` of the file at `path`.
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkRef {
+    pub(crate) path: PathBuf,
+    pub(crate) offset: u64,
+    pub(crate) hash: Hash,
 }
 
 #[derive(Debug)]
@@ -90,6 +108,9 @@ struct Inner {
     /// The block keys of the chunks in the latest change list that earlier uploads packed.
     chunk_keys: Mutex<HashMap<Hash, BlockKeys>>,
     base: Mutex<Option<Arc<BaseView>>>,
+    prepared: Mutex<Option<Arc<PreparedChunks>>>,
+    /// The last flush an upload published.
+    uploaded_seq: watch::Sender<u64>,
 }
 
 /// One writable branch.
@@ -212,6 +233,8 @@ impl Volume {
             learner: Mutex::default(),
             chunk_keys: Mutex::default(),
             base: Mutex::default(),
+            prepared: Mutex::default(),
+            uploaded_seq: watch::Sender::new(0),
         });
         if let Some(s) = resume {
             let mut writes = Vec::new();
@@ -620,6 +643,10 @@ impl Inner {
         }
         let mut m = self.mem.lock().expect("mem lock");
         m.touched.insert(idx);
+        m.dirty_ref.remove(&idx);
+        if let Some(t) = &mut m.track {
+            t.insert(idx);
+        }
         match fresh {
             None => m.dirty.get_mut(&idx).expect("dirty under the stripe lock")[at..at + data.len()]
                 .copy_from_slice(data),
@@ -646,7 +673,7 @@ impl Inner {
             return Ok(());
         }
         let generation = self.journal.rotate().await?;
-        let (snapshot, root) = {
+        let (snapshot, refs, root) = {
             let mut m = self.mem.lock().expect("mem lock");
             let snap: HashMap<u64, Bytes> = std::mem::take(&mut m.dirty)
                 .into_iter()
@@ -654,16 +681,21 @@ impl Inner {
                 .collect();
             let snap = Arc::new(snap);
             m.flushing = Some(snap.clone());
-            (snap, m.root)
+            (snap, std::mem::take(&mut m.dirty_ref), m.root)
         };
         drop(guards);
-        match self.commit_snapshot(&snapshot, &root).await {
+        match self.commit_snapshot(&snapshot, &refs, &root).await {
             Ok(new_root) => {
                 {
                     let mut m = self.mem.lock().expect("mem lock");
                     m.root = new_root;
                     m.flushing = None;
                     m.jfloor = generation;
+                    m.flush_seq += 1;
+                    let seq = m.flush_seq;
+                    for r in refs.into_values() {
+                        m.ref_seq.insert(r.path, seq);
+                    }
                 }
                 self.persist().await?;
                 self.journal.drop_below(generation).await;
@@ -674,17 +706,27 @@ impl Inner {
                 let mut m = self.mem.lock().expect("mem lock");
                 m.flushing = None;
                 for (idx, b) in snapshot.iter() {
-                    m.dirty.entry(*idx).or_insert_with(|| b.to_vec());
+                    if !m.dirty.contains_key(idx) {
+                        m.dirty.insert(*idx, b.to_vec());
+                        if let Some(r) = refs.get(idx) {
+                            m.dirty_ref.insert(*idx, r.clone());
+                        }
+                    }
                 }
                 Err(e)
             }
         }
     }
 
-    async fn commit_snapshot(&self, snapshot: &HashMap<u64, Bytes>, root: &Entry) -> Result<Entry> {
+    async fn commit_snapshot(
+        &self,
+        snapshot: &HashMap<u64, Bytes>,
+        refs: &HashMap<u64, ChunkRef>,
+        root: &Entry,
+    ) -> Result<Entry> {
         let mut futs = Vec::with_capacity(snapshot.len());
         for (idx, b) in snapshot {
-            futs.push(self.store_chunk(*idx, b.clone()));
+            futs.push(self.store_chunk(*idx, b.clone(), refs.get(idx)));
         }
         let mut updates = bounded(futs, STORE_PARALLEL)
             .await
@@ -704,7 +746,19 @@ impl Inner {
         Ok(new_root)
     }
 
-    async fn store_chunk(&self, idx: u64, b: Bytes) -> Result<(u64, Entry)> {
+    async fn store_chunk(&self, idx: u64, b: Bytes, r: Option<&ChunkRef>) -> Result<(u64, Entry)> {
+        if let Some(r) = r {
+            self.cache
+                .put_ref(r.hash, &r.path, r.offset, CHUNK_SIZE as u32)
+                .await?;
+            return Ok((
+                idx,
+                Entry {
+                    hash: r.hash,
+                    ..Entry::EMPTY
+                },
+            ));
+        }
         let hashed = b.clone();
         let h = on_cpu(self.cpu.as_ref(), CpuClass::Foreground, move || {
             (!is_zero(&hashed)).then(|| Hash::of(&hashed))
@@ -762,7 +816,10 @@ impl Inner {
 
     /// Packs everything pending under the current local root and publishes it.
     async fn upload(&self) -> Result<()> {
-        let root = self.root();
+        let (root, seq) = {
+            let m = self.mem.lock().expect("mem lock");
+            (m.root, m.flush_seq)
+        };
         let (known, version) = {
             let up = self.up.lock().expect("up lock");
             if root.hash == up.uploaded.hash || up.fenced {
@@ -772,6 +829,7 @@ impl Inner {
         };
         let dedup = self.dedup.lock().expect("dedup lock").clone();
         let learner = self.learner.lock().expect("learner lock").clone();
+        let prepared = self.prepared.lock().expect("prepared lock").clone();
         let mut p = Packer::new(
             self.remote.clone(),
             self.cpu.clone(),
@@ -779,7 +837,7 @@ impl Inner {
             SEG_MAX,
             known,
         )
-        .with_dedup(dedup.clone(), None)
+        .with_dedup(dedup.clone(), prepared.clone())
         .with_learner(learner.clone());
         let packed = match self.tree.pack(&root, &mut p).await {
             Ok(e) => e,
@@ -844,6 +902,10 @@ impl Inner {
                 up.uploaded = packed;
             }
         }
+        if let Some(p) = &prepared {
+            p.drop_through(seq);
+        }
+        self.uploaded_seq.send_modify(|s| *s = (*s).max(seq));
         self.notify();
         let _ = self.persist().await;
         Ok(())

@@ -24,6 +24,7 @@ mod dedup;
 mod error;
 mod flight;
 pub mod gc;
+mod handoff;
 mod local;
 mod packer;
 pub mod ports;

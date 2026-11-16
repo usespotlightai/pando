@@ -15,10 +15,32 @@ enum Node {
     Dir,
 }
 
+const BLOCK: u64 = 4096;
+
 #[derive(Debug, Default)]
 struct Data {
     current: Vec<u8>,
     durable: Vec<u8>,
+    /// Where each allocated 4 KiB block of the file is on the disk. A write moves the blocks it
+    /// covers to new places; a clone shares the places of its source.
+    blocks: BTreeMap<u64, u64>,
+    durable_blocks: BTreeMap<u64, u64>,
+}
+
+impl Data {
+    fn write(&mut self, at: u64, n: u64, next_place: &mut u64) {
+        if n == 0 {
+            return;
+        }
+        for b in at / BLOCK..=(at + n - 1) / BLOCK {
+            *next_place += 1;
+            self.blocks.insert(b, *next_place);
+        }
+    }
+
+    fn truncate(&mut self, len: u64) {
+        self.blocks.retain(|b, _| b * BLOCK < len);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -29,6 +51,7 @@ struct State {
     next_inode: u64,
     locks: BTreeMap<PathBuf, u64>,
     next_lock: u64,
+    next_place: u64,
 }
 
 /// A file system in memory that keeps what a crash would keep apart from what it would lose:
@@ -53,6 +76,7 @@ impl SimFs {
         let mut s = self.lock_state();
         for d in s.data.values_mut() {
             d.current = d.durable.clone();
+            d.blocks = d.durable_blocks.clone();
         }
         s.names = s.durable_names.clone();
         s.locks.clear();
@@ -77,14 +101,15 @@ impl SimFs {
         }
     }
 
-    fn new_file(s: &mut State, p: &Path, bytes: Vec<u8>) -> u64 {
+    fn new_file(s: &mut State, p: &Path, bytes: Vec<u8>, blocks: BTreeMap<u64, u64>) -> u64 {
         s.next_inode += 1;
         let i = s.next_inode;
         s.data.insert(
             i,
             Data {
                 current: bytes,
-                durable: Vec::new(),
+                blocks,
+                ..Data::default()
             },
         );
         s.names.insert(p.to_path_buf(), Node::File(i));
@@ -113,7 +138,7 @@ impl LocalFs for SimFs {
             }
             (Open::Create | Open::CreateNew, Err(e)) if e.kind() == io::ErrorKind::NotFound => {
                 Self::parent_exists(&s, path)?;
-                Self::new_file(&mut s, path, Vec::new())
+                Self::new_file(&mut s, path, Vec::new(), BTreeMap::new())
             }
             (_, found) => found?,
         };
@@ -219,8 +244,8 @@ impl LocalImage for SimFs {
         let mut s = self.lock_state();
         let src = Self::inode(&s, from)?;
         Self::parent_exists(&s, to)?;
-        let bytes = s.data[&src].current.clone();
-        Self::new_file(&mut s, to, bytes);
+        let (bytes, blocks) = (s.data[&src].current.clone(), s.data[&src].blocks.clone());
+        Self::new_file(&mut s, to, bytes, blocks);
         Ok(())
     }
 
@@ -231,17 +256,23 @@ impl LocalImage for SimFs {
     async fn extents(&self, path: &Path) -> io::Result<Vec<Extent>> {
         let s = self.lock_state();
         let i = Self::inode(&s, path)?;
-        let len = s.data[&i].current.len() as u64;
-        Ok(if len == 0 {
-            Vec::new()
-        } else {
-            vec![Extent {
-                logical: 0,
-                physical: i << 40,
-                len,
-                shared: false,
-            }]
-        })
+        let d = &s.data[&i];
+        let len = d.current.len() as u64;
+        let mut out: Vec<Extent> = Vec::new();
+        for (&b, &place) in &d.blocks {
+            let (logical, physical) = (b * BLOCK, place * BLOCK);
+            let n = BLOCK.min(len - logical);
+            match out.last_mut() {
+                Some(x) if x.logical + x.len == logical && x.physical + x.len == physical => x.len += n,
+                _ => out.push(Extent {
+                    logical,
+                    physical,
+                    len: n,
+                    shared: false,
+                }),
+            }
+        }
+        Ok(out)
     }
 
     async fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
@@ -251,6 +282,8 @@ impl LocalImage for SimFs {
         let end = (offset + len).min(d.current.len() as u64) as usize;
         let start = (offset as usize).min(end);
         d.current[start..end].fill(0);
+        let (first, last) = ((start as u64).div_ceil(BLOCK), end as u64 / BLOCK);
+        d.blocks.retain(|b, _| *b < first || *b >= last);
         Ok(())
     }
 
@@ -274,12 +307,16 @@ struct SimFile {
 
 impl SimFile {
     fn with<T>(&self, f: impl FnOnce(&mut Data) -> T) -> T {
-        f(self
-            .fs
-            .lock_state()
-            .data
-            .get_mut(&self.inode)
-            .expect("open file has data"))
+        self.with_places(|d, _| f(d))
+    }
+
+    fn with_places<T>(&self, f: impl FnOnce(&mut Data, &mut u64) -> T) -> T {
+        let mut s = self.fs.lock_state();
+        let s = &mut *s;
+        f(
+            s.data.get_mut(&self.inode).expect("open file has data"),
+            &mut s.next_place,
+        )
     }
 }
 
@@ -303,13 +340,14 @@ impl LocalFile for SimFile {
     }
 
     async fn write_at(&self, bufs: Vec<Bytes>, offset: u64) -> io::Result<()> {
-        self.with(|d| {
+        self.with_places(|d, next| {
             let mut at = offset as usize;
             for b in bufs {
                 if d.current.len() < at + b.len() {
                     d.current.resize(at + b.len(), 0);
                 }
                 d.current[at..at + b.len()].copy_from_slice(&b);
+                d.write(at as u64, b.len() as u64, next);
                 at += b.len();
             }
         });
@@ -317,12 +355,18 @@ impl LocalFile for SimFile {
     }
 
     async fn sync_data(&self) -> io::Result<()> {
-        self.with(|d| d.durable = d.current.clone());
+        self.with(|d| {
+            d.durable = d.current.clone();
+            d.durable_blocks = d.blocks.clone();
+        });
         Ok(())
     }
 
     async fn set_len(&self, len: u64) -> io::Result<()> {
-        self.with(|d| d.current.resize(len as usize, 0));
+        self.with(|d| {
+            d.current.resize(len as usize, 0);
+            d.truncate(len);
+        });
         Ok(())
     }
 
