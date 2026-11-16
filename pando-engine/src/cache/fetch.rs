@@ -23,10 +23,10 @@ const RUNS_IN_FLIGHT: usize = 8;
 /// writes its tree nodes after its chunks.
 const NODE_TAIL: u32 = 1 << 20;
 
-/// The end of a segment: its bytes from `off` on.
 /// A test of an object hash that a decode can keep past the call.
 pub(super) type HashTest = Arc<dyn Fn(&Hash) -> bool + Send + Sync>;
 
+/// The end of a segment: its bytes from `off` on.
 #[derive(Debug)]
 pub(super) struct Tail {
     off: u32,
@@ -44,6 +44,7 @@ pub(super) struct Decode<'a> {
     pub(super) keep_rest: bool,
     /// The held recipe chunks whose missing sources the caller wants to know.
     pub(super) follow: Option<&'a (dyn Fn(&Hash) -> bool + Sync)>,
+    pub(super) sink: Option<&'a dyn super::Sink>,
 }
 
 impl Decode<'_> {
@@ -54,6 +55,7 @@ impl Decode<'_> {
             whole: None,
             keep_rest: false,
             follow: None,
+            sink: None,
         }
     }
 }
@@ -274,10 +276,13 @@ impl Cache {
         })
         .await?;
         for (h, v) in decoded.objects {
-            self.log.put(h, v.into_bytes()).await?;
+            let b = v.into_bytes();
+            if !d.sink.is_some_and(|s| s.object(&h, &b)) {
+                self.log.put(h, b).await?;
+            }
         }
         for (h, enc) in decoded.recipes {
-            if self.has(&h).await {
+            if d.sink.is_some_and(|s| s.recipe(&h, &enc)) || self.has(&h).await {
                 continue;
             }
             if !self.sources_here(&enc).await && self.hold(HeldId { hash: h, at }, &enc) {

@@ -272,6 +272,66 @@ impl Tree {
         Ok(())
     }
 
+    /// Visits every non-empty chunk under `root` with its index, in index order.
+    pub(crate) async fn leaves(&self, root: &Entry, mut visit: impl FnMut(u64, Entry)) -> Result<()> {
+        let mut stack = vec![(*root, self.depth - 1, 0u64)];
+        while let Some((e, level, prefix)) = stack.pop() {
+            if e.is_empty() {
+                continue;
+            }
+            let n = self.load(&e, true).await?;
+            let children = n.children().filter(|(_, c)| !c.is_empty());
+            if level == 0 {
+                for (slot, c) in children {
+                    visit(prefix << 8 | u64::from(slot), *c);
+                }
+            } else {
+                let next: Vec<_> = children
+                    .map(|(slot, c)| (*c, level - 1, prefix << 8 | u64::from(slot)))
+                    .collect();
+                stack.extend(next.into_iter().rev());
+            }
+        }
+        Ok(())
+    }
+
+    /// The encoded nodes reachable from `root`.
+    pub(crate) async fn nodes_of(&self, root: &Entry) -> Result<HashMap<Hash, Bytes>> {
+        let mut out = HashMap::new();
+        let mut stack = vec![(*root, self.depth - 1)];
+        while let Some((e, level)) = stack.pop() {
+            if e.is_empty() || out.contains_key(&e.hash) {
+                continue;
+            }
+            let n = self.load(&e, true).await?;
+            out.insert(e.hash, Bytes::from(n.encode()));
+            if level > 0 {
+                stack.extend(n.children().map(|(_, c)| (*c, level - 1)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Keeps the nodes of a node pack (see [`crate::base`]) whose bytes match their hashes;
+    /// the tree fetches the others. Returns how many it kept.
+    pub(crate) fn load_nodes(&self, nodes: impl IntoIterator<Item = (Hash, Bytes)>) -> usize {
+        let mut kept = Vec::new();
+        for (h, b) in nodes {
+            if Hash::of(&b) != h {
+                continue;
+            }
+            if let Ok(n) = Node::decode(&b) {
+                kept.push((h, Arc::new(n)));
+            }
+        }
+        let n = kept.len();
+        let mut m = self.nodes.lock().expect("nodes lock");
+        for (h, node) in kept {
+            m.entry(h).or_insert(node);
+        }
+        n
+    }
+
     /// Loads every node under `root`, one level at a time: each level's missing nodes are one
     /// parallel, coalesced fetch, so a cold tree costs one round trip per level, not per node.
     pub(crate) async fn prefetch_nodes(&self, root: &Entry, parallel: usize) -> Result<usize> {

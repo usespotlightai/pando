@@ -4,7 +4,7 @@
 //! recorded. An uploader packs pending objects into segments, uploads them and moves the
 //! branch's ref with a conditional update. A lost host loses only what was not uploaded yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use pando_format::{BlockKeys, CHUNK_SIZE, Entry, Hash, Loc, Ref, Writer, WriterI
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, watch};
 use tokio::task::JoinHandle;
 
+use crate::base::{BaseView, Bases};
 use crate::cache::Cache;
 use crate::dedup::Dedup;
 use crate::dedup::learned::Learner;
@@ -42,6 +43,8 @@ const LIST_PARALLEL: usize = 16;
 struct Mem {
     root: Entry,
     dirty: HashMap<u64, Vec<u8>>,
+    /// Every chunk written since the branch opened, so not the base image's any more.
+    touched: HashSet<u64>,
     flushing: Option<Arc<HashMap<u64, Bytes>>>,
     jfloor: u64,
 }
@@ -86,6 +89,7 @@ struct Inner {
     learner: Mutex<Option<Arc<Learner>>>,
     /// The block keys of the chunks in the latest change list that earlier uploads packed.
     chunk_keys: Mutex<HashMap<Hash, BlockKeys>>,
+    base: Mutex<Option<Arc<BaseView>>>,
 }
 
 /// One writable branch.
@@ -207,6 +211,7 @@ impl Volume {
             dedup: Mutex::default(),
             learner: Mutex::default(),
             chunk_keys: Mutex::default(),
+            base: Mutex::default(),
         });
         if let Some(s) = resume {
             let mut writes = Vec::new();
@@ -264,6 +269,28 @@ impl Volume {
     /// Keeps what later uploads send as themselves for later runs on this host.
     pub(crate) fn set_learner(&self, learner: Option<Arc<Learner>>) {
         *self.inner.learner.lock().expect("learner lock") = learner;
+    }
+
+    /// Reads unchanged chunks from the base image of the root the branch opened at, when this
+    /// host has it. Returns whether it has.
+    pub(crate) async fn use_base(&self, bases: &Bases) -> Result<bool> {
+        let opened = self.inner.opened.hash;
+        if !bases.has(&opened).await {
+            return Ok(false);
+        }
+        let view = BaseView::open(self.inner.fs.as_ref(), &bases.path(&opened)).await?;
+        *self.inner.base.lock().expect("base lock") = Some(Arc::new(view));
+        Ok(true)
+    }
+
+    /// Stops reading from the base image; returns the bytes reads took from it.
+    pub(crate) fn drop_base(&self) -> u64 {
+        self.inner
+            .base
+            .lock()
+            .expect("base lock")
+            .take()
+            .map_or(0, |b| b.served())
     }
 
     pub fn size(&self) -> u64 {
@@ -502,7 +529,22 @@ impl Inner {
             }
             m.root
         };
+        if let Some(b) = self.read_base(idx, at, n).await {
+            return Ok(b);
+        }
         self.read_committed(idx, &root, at, n).await
+    }
+
+    /// The base image's bytes of chunk `idx`, when no write since open changed it.
+    fn base_of(&self, idx: u64) -> Option<Arc<BaseView>> {
+        if self.mem.lock().expect("mem lock").touched.contains(&idx) {
+            return None;
+        }
+        self.base.lock().expect("base lock").clone()
+    }
+
+    async fn read_base(&self, idx: u64, at: usize, n: usize) -> Option<Bytes> {
+        self.base_of(idx)?.read(idx * CHUNK + at as u64, n).await
     }
 
     fn try_read_chunk(&self, idx: u64, at: usize, dst: &mut [u8]) -> Result<bool> {
@@ -521,6 +563,11 @@ impl Inner {
             }
             m.root
         };
+        if let Some(base) = self.base_of(idx)
+            && base.read_nowait(idx * CHUNK + at as u64, dst)
+        {
+            return Ok(true);
+        }
         let Some(e) = self.tree.lookup_nowait(&root, idx) else {
             return Ok(false);
         };
@@ -557,7 +604,14 @@ impl Inner {
         } else if let Some(f) = flushing {
             Some(f.to_vec())
         } else if data.len() < CHUNK_SIZE {
-            Some(self.read_committed(idx, &root, 0, CHUNK_SIZE).await?.to_vec())
+            let n = CHUNK.min(self.size - idx * CHUNK) as usize;
+            let b = match self.read_base(idx, 0, n).await {
+                Some(b) => b,
+                None => self.read_committed(idx, &root, 0, CHUNK_SIZE).await?,
+            };
+            let mut v = b.to_vec();
+            v.resize(CHUNK_SIZE, 0);
+            Some(v)
         } else {
             Some(vec![0; CHUNK_SIZE])
         };
@@ -565,6 +619,7 @@ impl Inner {
             self.journal.append(idx, at, Bytes::copy_from_slice(data)).await?;
         }
         let mut m = self.mem.lock().expect("mem lock");
+        m.touched.insert(idx);
         match fresh {
             None => m.dirty.get_mut(&idx).expect("dirty under the stripe lock")[at..at + data.len()]
                 .copy_from_slice(data),

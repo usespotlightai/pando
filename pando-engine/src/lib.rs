@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code, reason = "handoff, hydrate, base builds and GC use these next")]
 
+pub mod base;
 pub mod branch;
 mod cache;
 mod dedup;

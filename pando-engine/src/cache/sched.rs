@@ -128,6 +128,17 @@ pub(crate) struct FetchOpts<'a> {
     pub(crate) asked_only: Option<AskedOnly>,
     /// Told each position of the entries once that entry is here or held, or its fetch failed.
     pub(crate) ready: Option<&'a (dyn Fn(usize) + Sync)>,
+    /// Takes decoded objects instead of the cache.
+    pub(crate) sink: Option<&'a dyn Sink>,
+}
+
+/// Takes the objects a fetch decodes, so they go where the caller needs them (a base image)
+/// instead of into the cache. An object the sink refuses goes into the cache as usual.
+pub(crate) trait Sink: Sync {
+    /// Takes object `h`, checked against its hash.
+    fn object(&self, h: &Hash, b: &Bytes) -> bool;
+    /// Takes recipe chunk `h` to rebuild later.
+    fn recipe(&self, h: &Hash, enc: &Bytes) -> bool;
 }
 
 /// Decodes, checks and stores only the chunks asked for and their recipe sources, unless
@@ -243,6 +254,7 @@ impl Cache {
             whole: Some(&whole_frame),
             keep_rest: opts.asked_only.as_ref().is_some_and(|a| a.keep_rest),
             follow: Some(&follow),
+            sink: opts.sink,
         };
 
         let mut queue: Vec<Run<'_>> = Vec::new();

@@ -8,6 +8,7 @@
 mod fetch;
 mod held;
 mod kept;
+mod partial;
 mod sched;
 #[cfg(all(test, feature = "sim"))]
 mod tests;
@@ -15,11 +16,13 @@ mod tests;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use pando_format::{Entry, Hash, SegId, SegmentIndex};
+pub(crate) use partial::{BaseKey, PartialBase};
+pub(crate) use sched::{FetchOpts, Sink};
 
 use crate::flight::Flights;
 use crate::local::{ObjectLog, WritebackHold};
@@ -41,6 +44,8 @@ pub struct CacheStats {
     pub kept_hits: AtomicU64,
     /// Recipe chunks rebuilt from a held encoding.
     pub held_rebuilt: AtomicU64,
+    /// Objects read from a base image being built or seeded from.
+    pub base_hits: AtomicU64,
 }
 
 /// A frame: its segment and its number there.
@@ -60,6 +65,7 @@ pub struct Cache {
     held: held::Held,
     kept: Arc<kept::Kept>,
     window: sched::Window,
+    bases: RwLock<HashMap<BaseKey, Arc<PartialBase>>>,
     stats: CacheStats,
 }
 
@@ -115,6 +121,7 @@ impl Cache {
             held: held::Held::default(),
             kept: Arc::default(),
             window: sched::Window::default(),
+            bases: RwLock::default(),
             stats: CacheStats::default(),
         })
     }
@@ -130,14 +137,18 @@ impl Cache {
     /// A whole object from this host, or `None`.
     pub(crate) async fn local(&self, h: &Hash) -> Result<Option<Bytes>> {
         match self.log.get(h).await {
-            Err(e) if matches!(e.kind(), Error::ChunkLost { .. }) => Ok(None),
-            r => r,
+            Ok(Some(b)) => return Ok(Some(b)),
+            Err(e) if !matches!(e.kind(), Error::ChunkLost { .. }) => return Err(e),
+            _ => {}
         }
+        Ok(self.base_object(h).await)
     }
 
     /// Whether [`Self::local`] would return `h`.
     pub(crate) async fn has(&self, h: &Hash) -> bool {
-        self.log.has_own(h) || (self.log.has(h) && matches!(self.local(h).await, Ok(Some(_))))
+        self.log.has_own(h)
+            || self.base_has(h)
+            || (self.log.has(h) && matches!(self.local(h).await, Ok(Some(_))))
     }
 
     /// Writes an object to this host. It is durable after the next [`Self::sync_local`].
@@ -166,7 +177,7 @@ impl Cache {
 
     /// Reads bytes of `e` only from the page cache; `false` when that is not enough.
     pub(crate) fn read_nowait(&self, e: &Entry, inner: usize, dst: &mut [u8]) -> Result<bool> {
-        let hit = self.log.read_nowait(&e.hash, inner, dst)?;
+        let hit = self.log.read_nowait(&e.hash, inner, dst)? || self.base_read_nowait(&e.hash, inner, dst);
         if hit {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -213,6 +224,9 @@ impl Cache {
     pub(crate) async fn read(&self, e: &Entry, inner: usize, len: usize) -> Result<Bytes> {
         if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(b);
+        }
+        if let Some(b) = self.base_read(&e.hash, inner, len).await {
             return Ok(b);
         }
         if let Some(b) = self.rebuild_if_held(e, false).await? {

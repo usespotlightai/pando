@@ -61,6 +61,18 @@ impl BlockMap {
         }
     }
 
+    /// Drops the blocks of the chunks `stale` names.
+    pub(crate) fn drop_chunks(&mut self, stale: impl Fn(u64) -> bool) {
+        self.0.retain(|_, at| !stale(at.chunk()));
+    }
+
+    /// Adds every block of `other` that this map does not have.
+    pub(crate) fn merge(&mut self, other: BlockMap) {
+        for (k, at) in other.0 {
+            self.0.entry(k).or_insert(at);
+        }
+    }
+
     /// Adds block `blk` of chunk `idx` under key `k`, unless `k` is mapped already.
     pub(crate) fn add(&mut self, k: BlockKey, idx: u64, blk: usize) {
         self.0.entry(k).or_insert(BlockAt::new(idx, blk));
