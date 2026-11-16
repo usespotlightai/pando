@@ -15,10 +15,7 @@
 //! `clippy.toml` enforces these. With the `sim` feature, [`sim`] has in-memory adapters.
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    reason = "handoff, hydrate, base builds and GC use these next"
-)]
+#![allow(dead_code, reason = "handoff, hydrate, base builds and GC use these next")]
 
 mod cache;
 mod error;

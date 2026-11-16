@@ -269,7 +269,7 @@ impl Tree {
                 .filter(|e| !self.has_node(&e.hash))
                 .copied()
                 .collect();
-            fetched += self.cache.fetch_nodes(&missing, parallel).await?;
+            fetched += self.cache.fetch_nodes(&missing, parallel).await;
             let mut next = Vec::new();
             for e in &level {
                 let n = self.load(e, true).await?;
@@ -280,6 +280,21 @@ impl Tree {
             level = next;
         }
         Ok(fetched)
+    }
+
+    /// Brings every chunk under `root` to this host: the nodes first, a level at a time, then
+    /// the chunks as one background fetch in index order. Returns how many frames held them.
+    pub(crate) async fn hydrate(&self, root: &Entry, parallel: usize) -> Result<usize> {
+        self.prefetch_nodes(root, parallel).await?;
+        let mut chunks = Vec::new();
+        self.walk(root, true, |e, node| {
+            if !node {
+                chunks.push(*e);
+            }
+            true
+        })
+        .await?;
+        Ok(self.cache.fetch_entries(&chunks, parallel).await)
     }
 
     /// The chunks of `b` that differ from `a`, with `b`'s entries, in index order. It walks both
@@ -301,7 +316,7 @@ impl Tree {
                 .flat_map(|(x, y, _)| [*x, *y])
                 .filter(|e| !e.is_empty() && !self.has_node(&e.hash))
                 .collect();
-            self.cache.fetch_nodes(&missing, parallel).await?;
+            self.cache.fetch_nodes(&missing, parallel).await;
             let mut next = Vec::new();
             for (x, y, prefix) in level {
                 let (nx, ny) = (self.node_or_empty(&x).await?, self.node_or_empty(&y).await?);
@@ -591,6 +606,24 @@ mod tests {
             t2.cache().get(&e).await.unwrap(),
             Bytes::from(vec![70000u64 as u8 + 1; CHUNK_SIZE])
         );
+
+        let c3 = Cache::open_with(
+            ports.fs.clone(),
+            ports.cpu.clone(),
+            t2.cache().remote().clone(),
+            Path::new("/c"),
+        )
+        .await
+        .unwrap();
+        let t3 = Tree::new(Arc::new(c3), 1 << 20);
+        assert_eq!(
+            t3.hydrate(&packed, 4).await.unwrap(),
+            0,
+            "the node frame held every chunk"
+        );
+        for (_, e) in &ups {
+            assert!(t3.cache().has(&e.hash).await);
+        }
     }
 
     #[tokio::test]

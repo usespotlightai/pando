@@ -1,0 +1,232 @@
+//! The cache: this host's objects, and the remote frames that hold the rest.
+//!
+//! - [`fetch`]: a read's own fetch of the frame it needs, and the decoding all fetches share.
+//! - [`sched`]: background fetches of many entries through one window of bytes in flight.
+//! - [`held`]: recipe chunks whose sources are not here yet, kept encoded until asked for.
+//! - [`kept`]: compressed frames decoded in part, kept for the next fetch of them.
+
+mod fetch;
+mod held;
+mod kept;
+mod sched;
+#[cfg(all(test, feature = "sim"))]
+mod tests;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use pando_format::{Entry, Hash, SegId, SegmentIndex};
+
+use crate::flight::Flights;
+use crate::local::{ObjectLog, WritebackHold};
+use crate::ports::{Cpu, CpuClass, LocalFs};
+use crate::remote::Remote;
+use crate::{Error, Result};
+
+#[derive(Debug, Default)]
+pub struct CacheStats {
+    pub hits: AtomicU64,
+    /// Range GETs of frames.
+    pub runs: AtomicU64,
+    pub frames_fetched: AtomicU64,
+    pub bytes_fetched: AtomicU64,
+    /// Foreground reads that waited for the store, and how long in all.
+    pub stalls: AtomicU64,
+    pub stall_nanos: AtomicU64,
+    /// GETs served from a kept frame.
+    pub kept_hits: AtomicU64,
+    /// Recipe chunks rebuilt from a held encoding.
+    pub held_rebuilt: AtomicU64,
+}
+
+/// A frame: its segment and its number there.
+pub(crate) type FrameKey = (SegId, u32);
+
+/// The local tier, keyed by content hash, in front of the store. It holds every object this
+/// host wrote and has not uploaded yet, so it is also the write-back log.
+#[derive(Debug)]
+pub struct Cache {
+    remote: Remote,
+    cpu: Arc<dyn Cpu>,
+    log: ObjectLog,
+    indexes: Mutex<HashMap<SegId, Arc<SegmentIndex>>>,
+    index_flights: Flights<SegId>,
+    frame_flights: Flights<FrameKey>,
+    tails: Mutex<HashMap<SegId, Arc<fetch::Tail>>>,
+    held: held::Held,
+    kept: Arc<kept::Kept>,
+    window: sched::Window,
+    stats: CacheStats,
+}
+
+fn shared(e: Error) -> Arc<Error> {
+    match e {
+        Error::Shared(e) => e,
+        e => Arc::new(e),
+    }
+}
+
+fn class(background: bool) -> CpuClass {
+    if background {
+        CpuClass::Background
+    } else {
+        CpuClass::Foreground
+    }
+}
+
+fn not_in_frame(e: &Entry) -> Error {
+    Error::Corrupt(format!(
+        "object {} is not in frame {} of {}",
+        e.hash, e.loc.frame, e.loc.seg
+    ))
+}
+
+impl Cache {
+    /// Opens the cache of this host in `dir`, in front of the store of `ports`.
+    pub async fn open(ports: &crate::Ports, dir: &Path) -> Result<Cache> {
+        Cache::open_with(
+            ports.fs.clone(),
+            ports.cpu.clone(),
+            Remote::new(ports.store.clone()),
+            dir,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_with(
+        fs: Arc<dyn LocalFs>,
+        cpu: Arc<dyn Cpu>,
+        remote: Remote,
+        dir: &Path,
+    ) -> Result<Cache> {
+        let log = ObjectLog::open(fs, &dir.join("objects")).await?;
+        Ok(Cache {
+            remote,
+            cpu,
+            log,
+            indexes: Mutex::default(),
+            index_flights: Flights::default(),
+            frame_flights: Flights::default(),
+            tails: Mutex::default(),
+            held: held::Held::default(),
+            kept: Arc::default(),
+            window: sched::Window::default(),
+            stats: CacheStats::default(),
+        })
+    }
+
+    pub fn stats(&self) -> &CacheStats {
+        &self.stats
+    }
+
+    pub(crate) fn remote(&self) -> &Remote {
+        &self.remote
+    }
+
+    /// A whole object from this host, or `None`.
+    pub(crate) async fn local(&self, h: &Hash) -> Result<Option<Bytes>> {
+        match self.log.get(h).await {
+            Err(e) if matches!(e.kind(), Error::ChunkLost { .. }) => Ok(None),
+            r => r,
+        }
+    }
+
+    /// Whether [`Self::local`] would return `h`.
+    pub(crate) async fn has(&self, h: &Hash) -> bool {
+        self.log.has_own(h) || (self.log.has(h) && matches!(self.local(h).await, Ok(Some(_))))
+    }
+
+    /// Writes an object to this host. It is durable after the next [`Self::sync_local`].
+    pub(crate) async fn put_local(&self, h: Hash, b: Bytes) -> Result<()> {
+        self.log.put(h, b).await
+    }
+
+    /// Records that object `h` is the `len` bytes at `offset` of the file at `path`.
+    pub(crate) async fn put_ref(&self, h: Hash, path: &Path, offset: u64, len: u32) -> Result<()> {
+        self.log.put_ref(h, path, offset, len).await
+    }
+
+    /// Turns every object recorded in `path` into a miss; call it before removing the file.
+    pub(crate) fn drop_file(&self, path: &Path) {
+        self.log.drop_file(path);
+    }
+
+    pub(crate) fn hold_writeback(&self) -> WritebackHold<'_> {
+        self.log.hold_writeback()
+    }
+
+    /// Makes every [`Self::put_local`] so far durable.
+    pub(crate) async fn sync_local(&self) -> Result<()> {
+        self.log.sync().await
+    }
+
+    /// Reads bytes of `e` only from the page cache; `false` when that is not enough.
+    pub(crate) fn read_nowait(&self, e: &Entry, inner: usize, dst: &mut [u8]) -> Result<bool> {
+        let hit = self.log.read_nowait(&e.hash, inner, dst)?;
+        if hit {
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(hit)
+    }
+
+    /// The whole object `e`, fetching its frame when this host does not have it.
+    pub(crate) async fn get(&self, e: &Entry) -> Result<Bytes> {
+        self.get_as(e, false).await
+    }
+
+    /// [`Self::get`] for background work: it neither counts as a stall nor takes over fetches.
+    pub(crate) async fn get_background(&self, e: &Entry) -> Result<Bytes> {
+        self.get_as(e, true).await
+    }
+
+    fn get_boxed<'a>(&'a self, e: &'a Entry, background: bool) -> BoxFuture<'a, Result<Bytes>> {
+        Box::pin(self.get_as(e, background))
+    }
+
+    async fn get_as(&self, e: &Entry, background: bool) -> Result<Bytes> {
+        if let Some(b) = self.local(&e.hash).await? {
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(b);
+        }
+        if let Some(b) = self.rebuild_if_held(e, background).await? {
+            return Ok(b);
+        }
+        // A miss that waited for a background fetch may find the object left out (it decodes
+        // only what it was asked for); the second miss fetches the frame itself.
+        for _ in 0..2 {
+            self.miss(e, background).await?;
+            if let Some(b) = self.local(&e.hash).await? {
+                return Ok(b);
+            }
+            if let Some(b) = self.rebuild_if_held(e, background).await? {
+                return Ok(b);
+            }
+        }
+        Err(not_in_frame(e))
+    }
+
+    /// Bytes `[inner, inner + len)` of object `e`, fetching its frame when needed.
+    pub(crate) async fn read(&self, e: &Entry, inner: usize, len: usize) -> Result<Bytes> {
+        if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(b);
+        }
+        if let Some(b) = self.rebuild_if_held(e, false).await? {
+            return Ok(b.slice(inner..inner + len));
+        }
+        for _ in 0..2 {
+            self.miss(e, false).await?;
+            if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
+                return Ok(b);
+            }
+            if let Some(b) = self.rebuild_if_held(e, false).await? {
+                return Ok(b.slice(inner..inner + len));
+            }
+        }
+        Err(not_in_frame(e))
+    }
+}
