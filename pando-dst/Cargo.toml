@@ -1,0 +1,21 @@
+[package]
+name = "pando-dst"
+description = "Deterministic simulation, crash and fault scenarios, and port conformance suites."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+pando-engine = { workspace = true, features = ["sim"] }
+pando-format.workspace = true
+
+[dev-dependencies]
+object_store.workspace = true
+pando-s3.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "the format has no clock" },
+    { path = "std::time::SystemTime::now", reason = "the format has no clock" },
+    { path = "std::fs::read", reason = "the format does no I/O" },
+    { path = "std::fs::write", reason = "the format does no I/O" },
+    { path = "std::fs::File::open", reason = "the format does no I/O" },
+    { path = "std::fs::File::create", reason = "the format does no I/O" },
+]

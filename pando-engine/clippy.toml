@@ -1,0 +1,12 @@
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "use tokio::time, which the simulator pauses" },
+    { path = "std::time::SystemTime::now", reason = "wall time comes from the Clock port" },
+    { path = "std::thread::spawn", reason = "CPU work goes through the Cpu port" },
+    { path = "tokio::task::spawn_blocking", reason = "CPU work goes through the Cpu port, files through LocalFs" },
+    { path = "std::fs::read", reason = "local files go through the LocalFs port" },
+    { path = "std::fs::write", reason = "local files go through the LocalFs port" },
+    { path = "std::fs::File::open", reason = "local files go through the LocalFs port" },
+    { path = "std::fs::File::create", reason = "local files go through the LocalFs port" },
+    { path = "std::fs::rename", reason = "local files go through the LocalFs port" },
+    { path = "std::fs::remove_file", reason = "local files go through the LocalFs port" },
+]

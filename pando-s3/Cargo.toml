@@ -1,0 +1,18 @@
+[package]
+name = "pando-s3"
+description = "Pando's Store port over any S3-compatible object store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+object_store = { workspace = true, features = ["aws"] }
+pando-engine.workspace = true
+
+[lints]
+workspace = true

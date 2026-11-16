@@ -1,0 +1,312 @@
+//! The packer: objects into frames, frames into segments, segments into the store.
+
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bytes::Bytes;
+use pando_format::{BlockKeys, CHUNK_SIZE, FrameBuilder, Hash, Loc, SegId, SegmentIndex, Writer};
+use tokio::sync::{Semaphore, oneshot};
+use tokio::task::JoinSet;
+
+use crate::ports::{Cpu, CpuClass};
+use crate::remote::Remote;
+use crate::{Error, Result};
+
+/// A segment goes up once its frames are estimated to compress to this many bytes.
+pub(crate) const SEG_MAX: usize = 8 << 20;
+/// Segment PUTs in flight at once.
+const PUTS_IN_FLIGHT: usize = 8;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PackStats {
+    pub segments: usize,
+    pub bytes: u64,
+    pub raw_bytes: u64,
+    pub objects: usize,
+}
+
+type Compressed = oneshot::Receiver<Result<Vec<u8>, pando_format::FormatError>>;
+
+/// Appends objects to frames and frames to segments, and uploads full segments in parallel.
+/// An object's [`Loc`] is known as soon as it is appended, so parents can embed their
+/// children's locations before anything is uploaded. The locations hold only once
+/// [`Packer::finish`] returns.
+#[derive(Debug)]
+pub(crate) struct Packer {
+    remote: Remote,
+    cpu: Arc<dyn Cpu>,
+    writer: Arc<Writer>,
+    seg_max: usize,
+    known: Arc<HashMap<Hash, Loc>>,
+    added: HashMap<Hash, Loc>,
+    keys: HashMap<Hash, BlockKeys>,
+    deps: BTreeSet<SegId>,
+    seg_id: SegId,
+    seg: Vec<Compressed>,
+    seg_raw: usize,
+    frame_no: u32,
+    frame: FrameBuilder,
+    z_in: Arc<AtomicU64>,
+    z_out: Arc<AtomicU64>,
+    puts: JoinSet<Result<u64>>,
+    slots: Arc<Semaphore>,
+    stats: PackStats,
+}
+
+impl Packer {
+    /// A packer for `writer`; objects in `known` are uploaded already and go up again only
+    /// as their locations.
+    pub(crate) fn new(
+        remote: Remote,
+        cpu: Arc<dyn Cpu>,
+        writer: Arc<Writer>,
+        seg_max: usize,
+        known: Arc<HashMap<Hash, Loc>>,
+    ) -> Packer {
+        let seg_id = writer.next_seg_id();
+        Packer {
+            remote,
+            cpu,
+            writer,
+            seg_max,
+            known,
+            added: HashMap::new(),
+            keys: HashMap::new(),
+            deps: BTreeSet::new(),
+            seg_id,
+            seg: Vec::new(),
+            seg_raw: 0,
+            frame_no: 0,
+            frame: FrameBuilder::default(),
+            z_in: Arc::default(),
+            z_out: Arc::default(),
+            puts: JoinSet::new(),
+            slots: Arc::new(Semaphore::new(PUTS_IN_FLIGHT)),
+            stats: PackStats::default(),
+        }
+    }
+
+    pub(crate) fn lookup(&self, h: &Hash) -> Option<Loc> {
+        self.known.get(h).or_else(|| self.added.get(h)).copied()
+    }
+
+    /// The objects this packer appended, with their locations.
+    pub(crate) fn added(&self) -> &HashMap<Hash, Loc> {
+        &self.added
+    }
+
+    /// The block keys of the full chunks appended, for the change list.
+    pub(crate) fn keys(&self) -> &HashMap<Hash, BlockKeys> {
+        &self.keys
+    }
+
+    pub(crate) fn stats(&self) -> PackStats {
+        self.stats
+    }
+
+    /// Appends object `h` unless it is known or appended already.
+    pub(crate) async fn append_object(&mut self, h: Hash, b: &[u8]) -> Result<Loc> {
+        if let Some(l) = self.lookup(&h) {
+            return Ok(l);
+        }
+        Ok(self.append(h, b, false).await)
+    }
+
+    /// [`Self::append_object`] for a chunk: a full chunk also gets its block keys.
+    pub(crate) async fn append_chunk(&mut self, h: Hash, b: &[u8]) -> Result<Loc> {
+        if let Some(l) = self.lookup(&h) {
+            return Ok(l);
+        }
+        if b.len() == CHUNK_SIZE {
+            self.keys.insert(h, BlockKeys::of(b));
+        }
+        Ok(self.append(h, b, false).await)
+    }
+
+    async fn append(&mut self, h: Hash, b: &[u8], recipe: bool) -> Loc {
+        if self.frame.is_full_for(b.len()) {
+            self.close_frame().await;
+        }
+        let (inner, len) = self.frame.push(h, b, recipe);
+        let loc = Loc {
+            seg: self.seg_id,
+            frame: self.frame_no,
+            inner,
+            len,
+        };
+        self.added.insert(h, loc);
+        self.stats.objects += 1;
+        self.stats.raw_bytes += b.len() as u64;
+        loc
+    }
+
+    /// Starts compressing the open frame. A location names a frame by its number and an object
+    /// by its offset in the uncompressed frame, so no location waits for the compression.
+    async fn close_frame(&mut self) {
+        if self.frame.is_empty() {
+            return;
+        }
+        let fb = std::mem::take(&mut self.frame);
+        let raw = fb.payload_len();
+        let (tx, rx) = oneshot::channel();
+        let (z_in, z_out) = (self.z_in.clone(), self.z_out.clone());
+        self.cpu.spawn(
+            CpuClass::Background,
+            Box::new(move || {
+                let z = fb.finish();
+                if let Ok(z) = &z {
+                    z_in.fetch_add(raw as u64, Ordering::Relaxed);
+                    z_out.fetch_add(z.len() as u64, Ordering::Relaxed);
+                }
+                let _ = tx.send(z);
+            }),
+        );
+        self.seg.push(rx);
+        self.seg_raw += raw;
+        self.frame_no += 1;
+        if self.seg_estimate() >= self.seg_max {
+            self.ship().await;
+        }
+    }
+
+    /// The compressed size of the open segment, from the ratio of the frames compressed so
+    /// far; before the first one it assumes no compression.
+    fn seg_estimate(&self) -> usize {
+        let (i, o) = (
+            self.z_in.load(Ordering::Relaxed),
+            self.z_out.load(Ordering::Relaxed),
+        );
+        (self.seg_raw as u64 * o)
+            .checked_div(i)
+            .map_or(self.seg_raw, |n| n as usize)
+    }
+
+    async fn ship(&mut self) {
+        if self.seg.is_empty() {
+            return;
+        }
+        let id = std::mem::replace(&mut self.seg_id, self.writer.next_seg_id());
+        let frames = std::mem::take(&mut self.seg);
+        let deps: Vec<SegId> = std::mem::take(&mut self.deps).into_iter().collect();
+        self.seg_raw = 0;
+        self.frame_no = 0;
+        self.stats.segments += 1;
+        let slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the packer never closes its semaphore");
+        let remote = self.remote.clone();
+        self.puts.spawn(async move {
+            let _slot = slot;
+            let mut data = Vec::new();
+            let mut index = Vec::with_capacity(frames.len());
+            for f in frames {
+                let z = f.await.map_err(|_| Error::Cancelled)??;
+                index.push((data.len() as u32, z.len() as u32));
+                data.extend_from_slice(&z);
+            }
+            let n = data.len() as u64;
+            let idx = SegmentIndex { frames: index, deps }.encode();
+            remote
+                .put_segment(id, Bytes::from(data), Bytes::from(idx))
+                .await?;
+            Ok(n)
+        });
+    }
+
+    /// Uploads the last segment and waits until every segment is durable in the store. Only
+    /// then may the caller trust the locations in [`Self::added`].
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.close_frame().await;
+        self.ship().await;
+        let mut err = None;
+        while let Some(r) = self.puts.join_next().await {
+            match r {
+                Ok(Ok(n)) => self.stats.bytes += n,
+                Ok(Err(e)) => {
+                    err.get_or_insert(e);
+                }
+                Err(e) => {
+                    err.get_or_insert(Error::Corrupt(format!("segment upload task: {e}")));
+                }
+            }
+        }
+        err.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod tests {
+    use std::path::Path;
+
+    use pando_format::{Entry, WriterId};
+
+    use super::*;
+    use crate::cache::Cache;
+    use crate::ports::Store;
+    use crate::sim;
+
+    #[tokio::test]
+    async fn packed_objects_read_back_from_another_host() {
+        let (ports, store, _) = sim::ports(1);
+        let remote = Remote::new(ports.store.clone());
+        let writer = Arc::new(Writer::new(WriterId::new("main", 1), 0));
+        let mut p = Packer::new(remote.clone(), ports.cpu.clone(), writer, 1 << 20, Arc::default());
+        let mut es = Vec::new();
+        for i in 0..40u32 {
+            let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let b: Vec<u8> = (0..CHUNK_SIZE)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            let h = Hash::of(&b);
+            let loc = p.append_chunk(h, &b).await.unwrap();
+            es.push((Entry { hash: h, loc }, b));
+        }
+        p.finish().await.unwrap();
+        let st = p.stats();
+        assert!(st.segments >= 2, "{st:?}");
+        assert_eq!(st.objects, 40);
+        assert_eq!(p.keys().len(), 40);
+        let listed = store.list("segments").await.unwrap();
+        assert_eq!(listed.len(), 2 * st.segments);
+
+        let c = Cache::open_with(ports.fs.clone(), ports.cpu.clone(), remote, Path::new("/other"))
+            .await
+            .unwrap();
+        for (e, b) in &es {
+            assert_eq!(c.get(e).await.unwrap(), Bytes::from(b.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_object_is_not_appended_again() {
+        let (ports, _, _) = sim::ports(2);
+        let h = Hash::of(b"x");
+        let loc = Loc {
+            seg: SegId([1; 16]),
+            frame: 2,
+            inner: 3,
+            len: 1,
+        };
+        let known = Arc::new(HashMap::from([(h, loc)]));
+        let writer = Arc::new(Writer::new(WriterId::new("main", 1), 0));
+        let mut p = Packer::new(
+            Remote::new(ports.store.clone()),
+            ports.cpu.clone(),
+            writer,
+            SEG_MAX,
+            known,
+        );
+        assert_eq!(p.append_object(h, b"x").await.unwrap(), loc);
+        p.finish().await.unwrap();
+        assert_eq!(p.stats().segments, 0);
+    }
+}

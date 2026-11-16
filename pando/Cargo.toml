@@ -1,0 +1,19 @@
+[package]
+name = "pando"
+description = "Branchable copy-on-write block devices on object storage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+pando-engine.workspace = true
+pando-format.workspace = true
+pando-s3.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
