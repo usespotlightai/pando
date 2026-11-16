@@ -29,6 +29,12 @@ pub fn hints(key: &str) -> String {
     format!("{HINTS}/{key}")
 }
 
+/// The recording of the first reads of mounts at `root`. A new branch starts at its parent's
+/// root, so it inherits the parent's recording.
+pub fn recording(root: Hash) -> String {
+    hints(&format!("recording-{root}"))
+}
+
 /// The segment a key under [`SEGMENTS`] names (its data or its index).
 pub fn parse_segment(name: &str) -> Option<SegId> {
     name.strip_suffix(".idx").unwrap_or(name).parse().ok()

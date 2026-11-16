@@ -23,11 +23,13 @@ mod cache;
 mod dedup;
 mod error;
 mod flight;
+mod gate;
 pub mod gc;
 mod handoff;
 mod local;
 mod packer;
 pub mod ports;
+mod recording;
 mod remote;
 #[cfg(feature = "sim")]
 pub mod sim;

@@ -9,6 +9,7 @@ mod fetch;
 mod held;
 mod kept;
 mod partial;
+mod recorder;
 mod sched;
 #[cfg(all(test, feature = "sim"))]
 mod tests;
@@ -66,6 +67,7 @@ pub struct Cache {
     kept: Arc<kept::Kept>,
     window: sched::Window,
     bases: RwLock<HashMap<BaseKey, Arc<PartialBase>>>,
+    recorder: Mutex<recorder::Recorder>,
     stats: CacheStats,
 }
 
@@ -122,6 +124,7 @@ impl Cache {
             kept: Arc::default(),
             window: sched::Window::default(),
             bases: RwLock::default(),
+            recorder: Mutex::default(),
             stats: CacheStats::default(),
         })
     }
@@ -180,13 +183,16 @@ impl Cache {
         let hit = self.log.read_nowait(&e.hash, inner, dst)? || self.base_read_nowait(&e.hash, inner, dst);
         if hit {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            self.touched(e);
         }
         Ok(hit)
     }
 
     /// The whole object `e`, fetching its frame when this host does not have it.
     pub(crate) async fn get(&self, e: &Entry) -> Result<Bytes> {
-        self.get_as(e, false).await
+        let b = self.get_as(e, false).await?;
+        self.touched(e);
+        Ok(b)
     }
 
     /// [`Self::get`] for background work: it neither counts as a stall nor takes over fetches.
@@ -222,6 +228,12 @@ impl Cache {
 
     /// Bytes `[inner, inner + len)` of object `e`, fetching its frame when needed.
     pub(crate) async fn read(&self, e: &Entry, inner: usize, len: usize) -> Result<Bytes> {
+        let b = self.read_as(e, inner, len).await?;
+        self.touched(e);
+        Ok(b)
+    }
+
+    async fn read_as(&self, e: &Entry, inner: usize, len: usize) -> Result<Bytes> {
         if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(b);

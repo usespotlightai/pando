@@ -18,6 +18,7 @@ mod index;
 pub mod keys;
 mod node;
 mod recipe;
+mod recording;
 mod reference;
 mod verified;
 
@@ -31,5 +32,6 @@ pub use ids::{SegId, Writer, WriterId};
 pub use index::SegmentIndex;
 pub use node::{FANOUT, Node, depth_for, digit};
 pub use recipe::{Pick, RECIPE_SOURCES_MAX, Recipe, RecipeError, Run};
+pub use recording::{RECORDING_MAGIC, Recording};
 pub use reference::Ref;
 pub use verified::Verified;

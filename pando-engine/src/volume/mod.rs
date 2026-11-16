@@ -19,6 +19,7 @@ use crate::cache::Cache;
 use crate::dedup::learned::Learner;
 use crate::dedup::{Dedup, PreparedChunks};
 use crate::flight::bounded;
+use crate::gate::Gate;
 use crate::local::{Journal, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
 use crate::ports::{Cpu, CpuClass, LocalFs, Version, on_cpu};
@@ -109,6 +110,7 @@ struct Inner {
     chunk_keys: Mutex<HashMap<Hash, BlockKeys>>,
     base: Mutex<Option<Arc<BaseView>>>,
     prepared: Mutex<Option<Arc<PreparedChunks>>>,
+    gate: Arc<Gate>,
     /// The last flush an upload published.
     uploaded_seq: watch::Sender<u64>,
 }
@@ -234,6 +236,7 @@ impl Volume {
             chunk_keys: Mutex::default(),
             base: Mutex::default(),
             prepared: Mutex::default(),
+            gate: Arc::default(),
             uploaded_seq: watch::Sender::new(0),
         });
         if let Some(s) = resume {
@@ -415,6 +418,7 @@ impl Volume {
 
     /// Flushes and waits until everything is published in the store.
     pub async fn checkpoint(&self) -> Result<()> {
+        let _hurry = self.inner.gate.hurry();
         self.inner.flush().await?;
         let target = self.inner.root().hash;
         let mut rx = self.inner.changed.subscribe();
@@ -838,6 +842,7 @@ impl Inner {
             known,
         )
         .with_dedup(dedup.clone(), prepared.clone())
+        .with_gate(self.gate.clone())
         .with_learner(learner.clone());
         let packed = match self.tree.pack(&root, &mut p).await {
             Ok(e) => e,

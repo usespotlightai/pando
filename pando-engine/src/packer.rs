@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 
 use crate::dedup::learned::{LearnedRec, Learner};
 use crate::dedup::{Dedup, Prepared, PreparedChunks, prepare};
+use crate::gate::Gate;
 use crate::ports::{Cpu, CpuClass};
 use crate::remote::Remote;
 use crate::{Error, Result};
@@ -41,6 +42,7 @@ pub(crate) struct Preparer {
     dedup: Option<Arc<Dedup>>,
     pre: Option<Arc<PreparedChunks>>,
     taken: Arc<AtomicUsize>,
+    gate: Option<Arc<Gate>>,
 }
 
 impl Preparer {
@@ -53,6 +55,10 @@ impl Preparer {
 
     /// Makes chunk `h` ready from its bytes.
     pub(crate) async fn prepare(&self, h: Hash, b: Bytes) -> Prepared {
+        let _pass = match &self.gate {
+            Some(g) => Some(g.enter().await),
+            None => None,
+        };
         prepare(self.dedup.as_deref(), h, b).await
     }
 }
@@ -137,7 +143,14 @@ impl Packer {
             dedup,
             pre,
             taken: Arc::default(),
+            gate: self.preparer.gate.take(),
         };
+        self
+    }
+
+    /// Lets at most as many chunks be prepared at once as `gate` admits.
+    pub(crate) fn with_gate(mut self, gate: Arc<Gate>) -> Packer {
+        self.preparer.gate = Some(gate);
         self
     }
 

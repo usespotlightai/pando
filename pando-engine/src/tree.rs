@@ -58,7 +58,9 @@ impl Tree {
         let b = if background {
             self.cache.get_background(e).await?
         } else {
-            self.cache.get(e).await?
+            let b = self.cache.get(e).await?;
+            self.cache.touched_node(&e.hash);
+            b
         };
         let n = Arc::new(Node::decode(&b)?);
         self.nodes.lock().expect("nodes lock").insert(e.hash, n.clone());

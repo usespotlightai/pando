@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use pando_format::{Hash, Ref, SegId, SegmentIndex, keys};
+use pando_format::{Hash, Recording, Ref, SegId, SegmentIndex, keys};
 
 use crate::ports::{Store, StoreError, Version};
 use crate::{Error, Result};
@@ -193,6 +193,26 @@ impl Remote {
             Err(StoreError::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The recording of mounts at `root`; `None` when there is none or it does not decode.
+    pub(crate) async fn get_recording(&self, root: Hash) -> Result<Option<Recording>> {
+        match self.store.get(&keys::recording(root)).await {
+            Ok(o) => {
+                self.got(o.body.len());
+                Ok(Recording::decode(&o.body).ok())
+            }
+            Err(StoreError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(crate) async fn put_recording(&self, root: Hash, r: &Recording) -> Result<()> {
+        let b = Bytes::from(r.encode());
+        let n = b.len();
+        self.store.put(&keys::recording(root), b).await?;
+        self.put_done(n);
+        Ok(())
     }
 
     /// Every stored segment. A segment whose data is missing shows its index.

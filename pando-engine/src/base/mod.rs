@@ -7,6 +7,7 @@
 //! under its name only once it and both files are complete.
 
 mod build;
+pub(crate) mod follow;
 mod host_blocks;
 mod node_pack;
 mod view;

@@ -1,9 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use pando_format::{CHUNK_SIZE, Ref};
 
+use super::follow::{FOLLOW_MAX_AGE, Follower};
 use super::*;
 use crate::cache::{BaseKey, Cache};
 use crate::{Ports, Volume, sim};
@@ -155,4 +157,30 @@ async fn a_served_base_answers_chunk_reads_and_gives_upload_blocks() {
     let blocks = bases.blocks_for(&other, r.root).await.unwrap();
     assert!(blocks.is_some());
     assert!(other.has_node(&r.root.hash));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follower_builds_the_new_root_of_a_followed_branch_and_evicts_old_bases() {
+    let (ports, _, _) = sim::ports(4);
+    Volume::create(&ports, "main", SIZE).await.unwrap();
+    let a = host(&ports, "/a").await;
+    let r1 = write(&ports, &a, &data(7), 0).await;
+
+    let b = host(&ports, "/b").await;
+    let bases = Bases::new(&ports, Path::new("/b/bases"));
+    bases.note_follow("main").await.unwrap();
+    let mut f = Follower::new(bases.clone(), b.clone(), 8, 1, 0);
+    assert_eq!(f.once().await.unwrap(), 1);
+    assert!(bases.has(&r1.root.hash).await);
+    assert_eq!(f.once().await.unwrap(), 0);
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let r2 = write(&ports, &a, &[3; 100], 0).await;
+    assert_eq!(f.once().await.unwrap(), 1);
+    assert!(bases.has(&r2.root.hash).await);
+    assert!(!bases.has(&r1.root.hash).await, "only the most recent base stays");
+
+    tokio::time::sleep(FOLLOW_MAX_AGE + Duration::from_secs(1)).await;
+    write(&ports, &a, &[4; 100], 0).await;
+    assert_eq!(f.once().await.unwrap(), 0, "the note aged out");
 }
