@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use pando_format::{CHUNK_SIZE, Entry, Hash, Loc, Ref, Writer, WriterId, is_zero};
+use pando_format::{BlockKeys, CHUNK_SIZE, Entry, Hash, Loc, Ref, Writer, WriterId, is_zero};
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, watch};
 use tokio::task::JoinHandle;
 
 use crate::cache::Cache;
+use crate::dedup::Dedup;
+use crate::dedup::learned::Learner;
 use crate::flight::bounded;
 use crate::local::{Journal, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
@@ -66,7 +68,7 @@ struct Inner {
     from: Option<String>,
     remote: Remote,
     cache: Arc<Cache>,
-    tree: Tree,
+    tree: Arc<Tree>,
     fs: Arc<dyn LocalFs>,
     cpu: Arc<dyn Cpu>,
     writer: Arc<Writer>,
@@ -80,6 +82,10 @@ struct Inner {
     changed: watch::Sender<u64>,
     kick: Notify,
     stop: watch::Sender<bool>,
+    dedup: Mutex<Option<Arc<Dedup>>>,
+    learner: Mutex<Option<Arc<Learner>>>,
+    /// The block keys of the chunks in the latest change list that earlier uploads packed.
+    chunk_keys: Mutex<HashMap<Hash, BlockKeys>>,
 }
 
 /// One writable branch.
@@ -172,7 +178,7 @@ impl Volume {
             generation,
             from: r.from.clone(),
             remote,
-            tree: Tree::new(cache.clone(), r.size.div_ceil(CHUNK)),
+            tree: Arc::new(Tree::new(cache.clone(), r.size.div_ceil(CHUNK))),
             cache,
             fs: ports.fs.clone(),
             cpu: ports.cpu.clone(),
@@ -198,6 +204,9 @@ impl Volume {
             changed: watch::Sender::new(0),
             kick: Notify::new(),
             stop: watch::Sender::new(false),
+            dedup: Mutex::default(),
+            learner: Mutex::default(),
+            chunk_keys: Mutex::default(),
         });
         if let Some(s) = resume {
             let mut writes = Vec::new();
@@ -232,6 +241,29 @@ impl Volume {
 
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    pub(crate) fn tree(&self) -> &Arc<Tree> {
+        &self.inner.tree
+    }
+
+    /// The root the branch opened at.
+    pub(crate) fn opened(&self) -> Entry {
+        self.inner.opened
+    }
+
+    /// Lets later uploads send recipes of the blocks `dedup` finds.
+    pub(crate) fn set_dedup(&self, dedup: Option<Arc<Dedup>>) {
+        *self.inner.dedup.lock().expect("dedup lock") = dedup;
+    }
+
+    pub(crate) fn dedup(&self) -> Option<Arc<Dedup>> {
+        self.inner.dedup.lock().expect("dedup lock").clone()
+    }
+
+    /// Keeps what later uploads send as themselves for later runs on this host.
+    pub(crate) fn set_learner(&self, learner: Option<Arc<Learner>>) {
+        *self.inner.learner.lock().expect("learner lock") = learner;
     }
 
     pub fn size(&self) -> u64 {
@@ -683,13 +715,17 @@ impl Inner {
             }
             (up.known.clone(), up.version.clone())
         };
+        let dedup = self.dedup.lock().expect("dedup lock").clone();
+        let learner = self.learner.lock().expect("learner lock").clone();
         let mut p = Packer::new(
             self.remote.clone(),
             self.cpu.clone(),
             self.writer.clone(),
             SEG_MAX,
             known,
-        );
+        )
+        .with_dedup(dedup.clone(), None)
+        .with_learner(learner.clone());
         let packed = match self.tree.pack(&root, &mut p).await {
             Ok(e) => e,
             Err(e) => {
@@ -728,6 +764,15 @@ impl Inner {
         };
         let stats = p.stats();
         let added = p.added().clone();
+        if let Some(learned) = dedup.as_ref().and_then(|d| d.learned.as_ref()) {
+            learned.mark_used(p.used_learned());
+            if let Some(l) = &learner {
+                l.published(p.learned());
+                learned.add_published(l, p.learned()).await;
+            }
+        } else if let Some(l) = &learner {
+            l.published(p.learned());
+        }
         drop(p);
         {
             let mut up = self.up.lock().expect("up lock");
@@ -756,13 +801,17 @@ impl Inner {
         if from.is_empty() || from.loc.is_pending() || from.hash == root.hash {
             return;
         }
-        let Ok(cl) = self
-            .tree
-            .change_list(&from, root, LIST_PARALLEL, |h| keys.get(h).copied())
-            .await
-        else {
+        let earlier = self.chunk_keys.lock().expect("keys lock").clone();
+        let key_of = |h: &Hash| keys.get(h).or_else(|| earlier.get(h)).copied();
+        let Ok(cl) = self.tree.change_list(&from, root, LIST_PARALLEL, key_of).await else {
             return;
         };
+        let kept = cl
+            .changes
+            .iter()
+            .filter_map(|c| Some((c.entry.hash, key_of(&c.entry.hash)?)))
+            .collect();
+        *self.chunk_keys.lock().expect("keys lock") = kept;
         let _ = self
             .remote
             .put_change_list(root.hash, from.hash, Bytes::from(cl.encode()))

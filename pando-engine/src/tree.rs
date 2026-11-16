@@ -4,16 +4,20 @@
 //! copies only the path from the changed leaves to the root. New nodes are pending: they live
 //! only in the local cache until an upload packs them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use pando_format::{BlockKeys, Change, ChangeList, Entry, Hash, Node, NodeAt, depth_for, digit};
 
 use crate::cache::Cache;
 use crate::packer::Packer;
 use crate::{Error, Result};
+
+/// Chunks an upload reads and makes ready at once.
+const PREPARE_PARALLEL: usize = 16;
 
 #[derive(Debug)]
 pub(crate) struct Tree {
@@ -153,13 +157,26 @@ impl Tree {
     pub(crate) async fn pack(&self, root: &Entry, p: &mut Packer) -> Result<Entry> {
         let mut chunks = Vec::new();
         self.pending_chunks(root, &mut chunks).await?;
-        for h in chunks {
-            if p.lookup(&h).is_some() {
-                continue;
-            }
-            let b = self.cache.local(&h).await?.ok_or(Error::ChunkLost { hash: h })?;
-            p.append_chunk(h, &b).await?;
+        let mut seen = HashSet::new();
+        chunks.retain(|h| p.lookup(h).is_none() && seen.insert(*h));
+        let pr = p.preparer().clone();
+        let mut ready = futures::stream::iter(chunks)
+            .map(|h| {
+                let pr = pr.clone();
+                async move {
+                    if let Some(c) = pr.take(&h) {
+                        return Ok((h, c));
+                    }
+                    let b = self.cache.local(&h).await?.ok_or(Error::ChunkLost { hash: h })?;
+                    Ok::<_, Error>((h, pr.prepare(h, b).await))
+                }
+            })
+            .buffered(PREPARE_PARALLEL);
+        while let Some(r) = ready.next().await {
+            let (h, c) = r?;
+            p.commit(h, c).await;
         }
+        drop(ready);
         self.pack_at(*root, self.depth - 1, p).await
     }
 
@@ -206,7 +223,7 @@ impl Tree {
                                 .local(&c.hash)
                                 .await?
                                 .ok_or(Error::ChunkLost { hash: c.hash })?;
-                            p.append_chunk(c.hash, &b).await?
+                            p.append_chunk(c.hash, b).await?
                         }
                     };
                     Entry { hash: c.hash, loc }

@@ -18,6 +18,7 @@
 #![allow(dead_code, reason = "handoff, hydrate, base builds and GC use these next")]
 
 mod cache;
+mod dedup;
 mod error;
 mod flight;
 mod local;

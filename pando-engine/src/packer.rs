@@ -2,13 +2,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use pando_format::{BlockKeys, CHUNK_SIZE, FrameBuilder, Hash, Loc, SegId, SegmentIndex, Writer};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 
+use crate::dedup::learned::{LearnedRec, Learner};
+use crate::dedup::{Dedup, Prepared, PreparedChunks, prepare};
 use crate::ports::{Cpu, CpuClass};
 use crate::remote::Remote;
 use crate::{Error, Result};
@@ -24,6 +26,35 @@ pub struct PackStats {
     pub bytes: u64,
     pub raw_bytes: u64,
     pub objects: usize,
+    /// Chunks that went up as recipes, chunks that equal one in the store, and the chunk bytes
+    /// neither uploaded.
+    pub recipes: usize,
+    pub reused: usize,
+    pub recipe_saved: u64,
+    /// Chunks an absorb had prepared.
+    pub prepared: usize,
+}
+
+/// Makes chunks ready to append; it runs on many tasks at once, apart from the packer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Preparer {
+    dedup: Option<Arc<Dedup>>,
+    pre: Option<Arc<PreparedChunks>>,
+    taken: Arc<AtomicUsize>,
+}
+
+impl Preparer {
+    /// Chunk `h` as an absorb prepared it.
+    pub(crate) fn take(&self, h: &Hash) -> Option<Prepared> {
+        let c = self.pre.as_ref()?.take(h, self.dedup.as_ref())?;
+        self.taken.fetch_add(1, Ordering::Relaxed);
+        Some(c)
+    }
+
+    /// Makes chunk `h` ready from its bytes.
+    pub(crate) async fn prepare(&self, h: Hash, b: Bytes) -> Prepared {
+        prepare(self.dedup.as_deref(), h, b).await
+    }
 }
 
 type Compressed = oneshot::Receiver<Result<Vec<u8>, pando_format::FormatError>>;
@@ -52,6 +83,10 @@ pub(crate) struct Packer {
     puts: JoinSet<Result<u64>>,
     slots: Arc<Semaphore>,
     stats: PackStats,
+    preparer: Preparer,
+    learner: Option<Arc<Learner>>,
+    learned: Vec<LearnedRec>,
+    used_learned: Vec<u32>,
 }
 
 impl Packer {
@@ -84,7 +119,46 @@ impl Packer {
             puts: JoinSet::new(),
             slots: Arc::new(Semaphore::new(PUTS_IN_FLIGHT)),
             stats: PackStats::default(),
+            preparer: Preparer::default(),
+            learner: None,
+            learned: Vec::new(),
+            used_learned: Vec::new(),
         }
+    }
+
+    /// Lets chunks go up as recipes of the blocks `dedup` finds, and takes the chunks `pre`
+    /// holds instead of preparing them again.
+    pub(crate) fn with_dedup(
+        mut self,
+        dedup: Option<Arc<Dedup>>,
+        pre: Option<Arc<PreparedChunks>>,
+    ) -> Packer {
+        self.preparer = Preparer {
+            dedup,
+            pre,
+            taken: Arc::default(),
+        };
+        self
+    }
+
+    /// Keeps the chunks that go up as themselves for later runs on this host.
+    pub(crate) fn with_learner(mut self, learner: Option<Arc<Learner>>) -> Packer {
+        self.learner = learner;
+        self
+    }
+
+    pub(crate) fn preparer(&self) -> &Preparer {
+        &self.preparer
+    }
+
+    /// The records of the chunks this upload learned; they count once it is published.
+    pub(crate) fn learned(&self) -> &[LearnedRec] {
+        &self.learned
+    }
+
+    /// The learned chunks this upload uses, as recipe sources or as chunks it equals.
+    pub(crate) fn used_learned(&self) -> &[u32] {
+        &self.used_learned
     }
 
     pub(crate) fn lookup(&self, h: &Hash) -> Option<Loc> {
@@ -102,7 +176,10 @@ impl Packer {
     }
 
     pub(crate) fn stats(&self) -> PackStats {
-        self.stats
+        PackStats {
+            prepared: self.preparer.taken.load(Ordering::Relaxed),
+            ..self.stats
+        }
     }
 
     /// Appends object `h` unless it is known or appended already.
@@ -113,15 +190,58 @@ impl Packer {
         Ok(self.append(h, b, false).await)
     }
 
-    /// [`Self::append_object`] for a chunk: a full chunk also gets its block keys.
-    pub(crate) async fn append_chunk(&mut self, h: Hash, b: &[u8]) -> Result<Loc> {
+    /// [`Self::append_object`] for a chunk: it may go up as a recipe or as the chunk it
+    /// equals, and a full chunk also gets its block keys.
+    pub(crate) async fn append_chunk(&mut self, h: Hash, b: Bytes) -> Result<Loc> {
         if let Some(l) = self.lookup(&h) {
             return Ok(l);
         }
-        if b.len() == CHUNK_SIZE {
-            self.keys.insert(h, BlockKeys::of(b));
+        let c = match self.preparer.take(&h) {
+            Some(c) => c,
+            None => self.preparer.prepare(h, b).await,
+        };
+        Ok(self.commit(h, c).await)
+    }
+
+    /// Appends chunk `h` as [`Preparer::prepare`] made it ready.
+    pub(crate) async fn commit(&mut self, h: Hash, c: Prepared) -> Loc {
+        if let Some(l) = self.lookup(&h) {
+            return l;
         }
-        Ok(self.append(h, b, false).await)
+        if let Some(learned) = self.preparer.dedup.as_ref().and_then(|d| d.learned.as_ref()) {
+            match &c {
+                Prepared::Same(e) => learned.slots_of(&mut self.used_learned, std::slice::from_ref(e)),
+                Prepared::Recipe { enc, .. } => {
+                    learned.slots_of(&mut self.used_learned, &pando_format::Recipe::sources_of(enc));
+                }
+                Prepared::Plain { .. } => {}
+            }
+        }
+        match c {
+            Prepared::Same(e) => {
+                self.added.insert(h, e.loc);
+                self.stats.reused += 1;
+                self.stats.recipe_saved += CHUNK_SIZE as u64;
+                e.loc
+            }
+            Prepared::Recipe { enc, deps, keys } => {
+                self.deps.extend(deps);
+                self.stats.recipes += 1;
+                self.stats.recipe_saved += CHUNK_SIZE.saturating_sub(enc.len()) as u64;
+                self.keys.insert(h, keys);
+                self.append(h, &enc, true).await
+            }
+            Prepared::Plain { bytes, keys } => {
+                let loc = self.append(h, &bytes, false).await;
+                if let Some(keys) = keys {
+                    self.keys.insert(h, keys);
+                    if let Some(r) = self.learner.as_ref().and_then(|l| l.keep(h, loc, &bytes, &keys)) {
+                        self.learned.push(r);
+                    }
+                }
+                loc
+            }
+        }
     }
 
     async fn append(&mut self, h: Hash, b: &[u8], recipe: bool) -> Loc {
@@ -267,7 +387,7 @@ mod tests {
                 })
                 .collect();
             let h = Hash::of(&b);
-            let loc = p.append_chunk(h, &b).await.unwrap();
+            let loc = p.append_chunk(h, Bytes::from(b.clone())).await.unwrap();
             es.push((Entry { hash: h, loc }, b));
         }
         p.finish().await.unwrap();
