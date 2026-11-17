@@ -35,6 +35,7 @@ const DM_SKIP_LOCKFS_FLAG: u32 = 1 << 10;
 
 const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4C82;
 const LOOP_CONFIGURE: libc::c_ulong = 0x4C0A;
+const LOOP_SET_CAPACITY: libc::c_ulong = 0x4C07;
 const LOOP_CONFIG_LEN: usize = 304;
 const LO_FLAGS_AUTOCLEAR: u32 = 4;
 const LO_FLAGS_DIRECT_IO: u32 = 16;
@@ -380,6 +381,13 @@ fn attach_loop(image: &Path) -> io::Result<(PathBuf, OwnedFd)> {
     Ok((dev, lf.into()))
 }
 
+/// Sets the size of loop device `device` to the current length of its image.
+fn refresh_loop(device: &Path) -> io::Result<()> {
+    let devt = sys_dev("block", file_name(device)?)?;
+    let lf = open_usable(device, true, Some(&devt))?;
+    sys::ioctl_int(lf.as_raw_fd(), LOOP_SET_CAPACITY).map(drop)
+}
+
 fn loop_image(device: &Path) -> io::Result<Option<PathBuf>> {
     let name = file_name(device)?;
     match fs::read_to_string(Path::new("/sys/block").join(name).join("loop/backing_file")) {
@@ -482,6 +490,11 @@ impl DeviceSwitch for DmSwitch {
         let (dev, fd) = blocking(move || attach_loop(&image)).await?;
         self.loops.lock().expect("loops lock").insert(dev.clone(), fd);
         Ok(dev)
+    }
+
+    async fn refresh_loop(&self, device: &Path) -> io::Result<()> {
+        let device = device.to_owned();
+        blocking(move || refresh_loop(&device)).await
     }
 
     async fn loop_image(&self, device: &Path) -> io::Result<Option<PathBuf>> {

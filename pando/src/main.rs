@@ -94,6 +94,9 @@ enum Command {
     Attach(device::AttachArgs),
     /// Stops the device of an attached branch; returns once the branch is published.
     Detach(device::DetachArgs),
+    /// Grows an attached branch and the devices over it while it serves. The file system on
+    /// it keeps its size until it is grown too, with resize2fs for ext4.
+    Resize(device::ResizeArgs),
 }
 
 /// Parses durations such as `500ms`, `15s`, `10m` and `24h`.
@@ -108,6 +111,24 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
         "h" => Duration::from_secs(n * 3600),
         _ => bail!("duration {s:?}: the unit must be ms, s, m or h"),
     })
+}
+
+/// Parses sizes such as `4096`, `512M` and `8G`: bytes, or a number with K, M, G or T in
+/// powers of 1024.
+pub(crate) fn parse_size(s: &str) -> Result<u64> {
+    let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (n, unit) = s.split_at(at);
+    let n: u64 = n.parse().with_context(|| format!("size {s:?}"))?;
+    let shift = match unit {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => bail!("size {s:?}: the unit must be K, M, G or T"),
+    };
+    n.checked_mul(1 << shift)
+        .with_context(|| format!("size {s:?} is too large"))
 }
 
 #[tokio::main]
@@ -209,6 +230,7 @@ async fn main() -> Result<()> {
         }
         Command::Attach(a) => device::attach(&ports, cache().await?, a, cli.store.identity()).await,
         Command::Detach(d) => device::detach(d).await,
+        Command::Resize(r) => device::resize(r).await,
         Command::Stat => {
             let u = gc::usage(&cache().await?).await?;
             println!(
@@ -243,5 +265,14 @@ mod tests {
         assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
         assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
         assert!(parse_duration("3d").is_err());
+    }
+
+    #[test]
+    fn sizes_parse_in_powers_of_1024() {
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert_eq!(parse_size("512M").unwrap(), 512 << 20);
+        assert_eq!(parse_size("8G").unwrap(), 8 << 30);
+        assert!(parse_size("8GB").is_err());
+        assert!(parse_size("99999999T").is_err());
     }
 }

@@ -1,4 +1,6 @@
-//! The `attach` and `detach` commands: a branch served as a block device.
+//! The `attach`, `resize` and `detach` commands: a branch served as a block device. An attach
+//! listens on a control socket, `/run/pando/ublkbN.sock`, that `resize` asks to grow it. A
+//! request is one line, `grow <bytes>`; the answer is `ok <bytes>` or `error <why>`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -75,8 +77,19 @@ pub(crate) struct DetachArgs {
     pub(crate) publish_wait: Duration,
 }
 
+/// Which attached branch `resize` grows, and to what size.
+#[derive(Args, Debug)]
+pub(crate) struct ResizeArgs {
+    /// The ublk device the branch is served as, /dev/ublkbN.
+    #[arg(long)]
+    pub(crate) device: PathBuf,
+    /// The new size: bytes, or a number with K, M, G or T (powers of 1024). Branches only grow.
+    #[arg(value_parser = crate::parse_size)]
+    pub(crate) size: u64,
+}
+
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{attach, detach};
+pub(crate) use linux::{attach, detach, resize};
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) async fn attach(
@@ -93,19 +106,34 @@ pub(crate) async fn detach(_: DetachArgs) -> anyhow::Result<()> {
     anyhow::bail!("detach needs Linux")
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn resize(_: ResizeArgs) -> anyhow::Result<()> {
+    anyhow::bail!("resize needs Linux")
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, bail};
     use pando_engine::ports::DeviceSwitch;
     use pando_engine::{AttachOptions, Attachment, Cache, Ports};
     use pando_format::Hash;
     use pando_linux::{DmSwitch, Frontend, FrontendOptions};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
     use tokio::runtime::Handle;
+    use tokio::sync::watch;
 
-    use super::{AttachArgs, DetachArgs};
+    use super::{AttachArgs, DetachArgs, ResizeArgs};
+
+    const CONTROL_DIR: &str = "/run/pando";
+    /// How long a daemon waits for the request of a client that connected.
+    const REQUEST_WAIT: Duration = Duration::from_secs(5);
 
     /// Serves branch `a.name` until `detach` stops its device, then publishes it. `store` names
     /// the store, so chunks learned from one store never serve another.
@@ -175,6 +203,14 @@ mod linux {
                 ""
             }
         );
+        let (stop, stopping) = watch::channel(false);
+        let control = match listen(id) {
+            Ok(l) => Some(tokio::spawn(serve(l, att.clone(), id, a.name.clone(), stopping))),
+            Err(e) => {
+                eprintln!("{}: resize is off: {e}", control_path(id).display());
+                None
+            }
+        };
         let background = (!att.rejoined()).then(|| {
             let (att, name, hand_off) = (att.clone(), a.name.clone(), a.images.is_some());
             tokio::spawn(async move {
@@ -191,13 +227,130 @@ mod linux {
             })
         });
         fe.stopped().await;
+        stop.send_replace(true);
         if let Some(b) = background {
             b.abort();
             let _ = b.await;
         }
+        if let Some(c) = control {
+            let _ = c.await;
+            let _ = std::fs::remove_file(control_path(id));
+        }
         let published = finish(att, &a.name).await;
         drop(fe);
         published
+    }
+
+    /// The control socket of the daemon that serves ublk device `id`.
+    fn control_path(id: u32) -> PathBuf {
+        Path::new(CONTROL_DIR).join(format!("ublkb{id}.sock"))
+    }
+
+    /// Listens on the control socket of device `id`, in a directory only root may enter.
+    fn listen(id: u32) -> std::io::Result<UnixListener> {
+        std::fs::create_dir_all(CONTROL_DIR)?;
+        std::fs::set_permissions(CONTROL_DIR, Permissions::from_mode(0o700))?;
+        let p = control_path(id);
+        match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let l = UnixListener::bind(&p)?;
+        std::fs::set_permissions(&p, Permissions::from_mode(0o600))?;
+        Ok(l)
+    }
+
+    /// Answers requests on `l` one at a time until `stop`. A request in progress finishes
+    /// first, so a grow never stops between suspending the device and resuming it.
+    async fn serve(
+        l: UnixListener,
+        att: Arc<Attachment>,
+        id: u32,
+        name: String,
+        mut stop: watch::Receiver<bool>,
+    ) {
+        loop {
+            let conn = tokio::select! {
+                _ = stop.wait_for(|s| *s) => return,
+                c = l.accept() => c,
+            };
+            match conn {
+                Ok((c, _)) => {
+                    if let Err(e) = answer(c, &att, id, &name).await {
+                        eprintln!("resize {name}: {e:#}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{}: {e}; resize is off", control_path(id).display());
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn answer(conn: UnixStream, att: &Attachment, id: u32, name: &str) -> Result<()> {
+        let (r, mut w) = conn.into_split();
+        let mut line = String::new();
+        tokio::time::timeout(REQUEST_WAIT, BufReader::new(r).read_line(&mut line))
+            .await
+            .context("no request")??;
+        let reply = match parse_request(&line) {
+            Ok(size) => match att.grow(size, pando_linux::resize(id, size)).await {
+                Ok(()) => {
+                    println!("grew {name} to {size} bytes");
+                    format!("ok {size}\n")
+                }
+                Err(e) => format!("error {}\n", one_line(&e.to_string())),
+            },
+            Err(e) => format!("error {}\n", one_line(&format!("{e:#}"))),
+        };
+        w.write_all(reply.as_bytes()).await?;
+        Ok(())
+    }
+
+    fn parse_request(line: &str) -> Result<u64> {
+        match line.trim_end().split_once(' ') {
+            Some(("grow", n)) => n.parse().with_context(|| format!("size {n:?}")),
+            _ => bail!("unknown request {:?}", line.trim_end()),
+        }
+    }
+
+    fn one_line(s: &str) -> String {
+        s.replace('\n', " ")
+    }
+
+    /// Asks the daemon that serves `r.device` to grow its branch and the devices over it.
+    pub(crate) async fn resize(r: ResizeArgs) -> Result<()> {
+        let id = pando_linux::device_id(&r.device)?;
+        let p = control_path(id);
+        let conn = UnixStream::connect(&p).await.with_context(|| {
+            format!(
+                "connect to the daemon of {} at {}; is it attached?",
+                r.device.display(),
+                p.display()
+            )
+        })?;
+        let (rd, mut w) = conn.into_split();
+        w.write_all(format!("grow {}\n", r.size).as_bytes()).await?;
+        w.shutdown().await?;
+        let mut line = String::new();
+        BufReader::new(rd).read_line(&mut line).await?;
+        match line.trim_end().split_once(' ') {
+            Some(("ok", _)) => {
+                println!(
+                    "{} is {} bytes; grow the file system on it to use them (resize2fs for ext4)",
+                    r.device.display(),
+                    r.size
+                );
+                Ok(())
+            }
+            Some(("error", why)) => bail!("resize {}: {why}", r.device.display()),
+            _ => bail!(
+                "resize {}: the daemon answered {:?}",
+                r.device.display(),
+                line.trim_end()
+            ),
+        }
     }
 
     /// Waits until the kernel holds the I/O of device `id` for a new daemon. A live daemon
@@ -279,6 +432,14 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_grow_request_names_its_size() {
+            assert_eq!(parse_request("grow 8589934592\n").unwrap(), 8 << 30);
+            assert!(parse_request("grow\n").is_err());
+            assert!(parse_request("shrink 4096\n").is_err());
+            assert!(parse_request("grow -1\n").is_err());
+        }
 
         #[test]
         fn an_unused_device_may_be_stopped() {

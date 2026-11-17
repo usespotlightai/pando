@@ -15,7 +15,7 @@ mod ublk;
 mod users;
 
 pub use dm::DmSwitch;
-pub use ublk::{Frontend, FrontendOptions, daemon_dead, delete, device_id, stop};
+pub use ublk::{Frontend, FrontendOptions, daemon_dead, delete, device_id, resize, stop};
 
 /// What a stop of block device `dev` would cut off: each mount of it, each device stacked on
 /// it other than the device-mapper device named `over`, and, when neither explains it, an

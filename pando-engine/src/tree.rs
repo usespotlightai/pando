@@ -19,11 +19,13 @@ use crate::{Error, Result};
 /// Chunks an upload reads and makes ready at once.
 const PREPARE_PARALLEL: usize = 16;
 
+/// The tree of one depth. Every root walked with it must be a root of that depth: the depth of
+/// the size of the branch the root belongs to.
 #[derive(Debug)]
 pub(crate) struct Tree {
     cache: Arc<Cache>,
     depth: usize,
-    nodes: Mutex<HashMap<Hash, Arc<Node>>>,
+    nodes: Arc<Mutex<HashMap<Hash, Arc<Node>>>>,
 }
 
 impl Tree {
@@ -31,12 +33,37 @@ impl Tree {
         Tree {
             cache,
             depth: depth_for(chunks),
-            nodes: Mutex::default(),
+            nodes: Arc::default(),
+        }
+    }
+
+    /// The tree of depth `depth` over the same cache, sharing the nodes this one loaded.
+    pub(crate) fn at_depth(&self, depth: usize) -> Tree {
+        Tree {
+            cache: self.cache.clone(),
+            depth,
+            nodes: self.nodes.clone(),
         }
     }
 
     pub(crate) fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Root `root` of a tree of depth `from`, at most this tree's depth, as a root of this
+    /// tree: each added level holds the root below in slot 0, so every chunk keeps its index.
+    /// The new nodes are pending.
+    pub(crate) async fn lift(&self, root: &Entry, from: usize) -> Result<Entry> {
+        let mut e = *root;
+        for _ in from..self.depth {
+            if e.is_empty() {
+                break;
+            }
+            let mut n = Node::new();
+            n.set(0, e);
+            e = self.store(n).await?;
+        }
+        Ok(e)
     }
 
     pub(crate) fn cache(&self) -> &Arc<Cache> {
@@ -623,6 +650,32 @@ mod tests {
             .unwrap(),
             Entry::EMPTY
         );
+    }
+
+    #[tokio::test]
+    async fn a_lifted_root_keeps_every_chunk_at_its_index() {
+        let small = tree(2).await.at_depth(1);
+        let root = small
+            .update(&Entry::EMPTY, &[(0, leaf(1)), (7, leaf(2)), (255, leaf(3))])
+            .await
+            .unwrap();
+        let big = small.at_depth(3);
+        let lifted = big.lift(&root, 1).await.unwrap();
+        assert!(lifted.loc.is_pending());
+        for (idx, want) in [(0, leaf(1)), (7, leaf(2)), (255, leaf(3)), (256, Entry::EMPTY)] {
+            assert_eq!(
+                big.lookup(&lifted, idx, false).await.unwrap(),
+                want,
+                "chunk {idx}"
+            );
+        }
+        let grown = big.update(&lifted, &[(70000, leaf(4))]).await.unwrap();
+        assert_eq!(
+            big.changed_leaves(&lifted, &grown, 4).await.unwrap(),
+            vec![(70000, leaf(4))]
+        );
+        assert_eq!(big.lift(&Entry::EMPTY, 1).await.unwrap(), Entry::EMPTY);
+        assert_eq!(small.lift(&root, 1).await.unwrap(), root);
     }
 
     #[tokio::test]

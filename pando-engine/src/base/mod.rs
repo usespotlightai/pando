@@ -21,7 +21,7 @@ pub use build::BuildReport;
 pub(crate) use build::{BuildOptions, build};
 use bytes::Bytes;
 pub use follow::Follower;
-use pando_format::{Entry, Hash};
+use pando_format::{CHUNK_SIZE, Entry, Hash, depth_for};
 pub(crate) use view::BaseView;
 
 use crate::cache::Cache;
@@ -161,14 +161,17 @@ impl Bases {
     }
 
     /// The blocks of `root`'s image for uploads of a branch opened at `root`, with its nodes
-    /// loaded into `tree`; `None` when this host has no complete image of it.
-    pub(crate) async fn blocks_for(&self, tree: &Arc<Tree>, root: Entry) -> Result<Option<BaseBlocks>> {
+    /// loaded into `tree`'s nodes; `None` when this host has no complete image of it. The
+    /// blocks walk `root` at the depth of the image's size, whatever `tree`'s depth.
+    pub(crate) async fn blocks_for(&self, tree: &Tree, root: Entry) -> Result<Option<BaseBlocks>> {
         let p = self.path(&root.hash);
         if !self.exists(&p).await {
             return Ok(None);
         }
-        self.load_nodes(tree, &p).await?;
-        BaseBlocks::open(self.fs.as_ref(), &Bases::blocks_path(&p), &p, tree.clone(), root).await
+        let len = self.fs.open(&p, Open::Read).await?.size().await?;
+        let tree = Arc::new(tree.at_depth(depth_for(len.div_ceil(CHUNK_SIZE as u64))));
+        self.load_nodes(&tree, &p).await?;
+        BaseBlocks::open(self.fs.as_ref(), &Bases::blocks_path(&p), &p, tree, root).await
     }
 
     /// Starts a branch's image at `to` as a clone of `root`'s, sharing its disk blocks.
@@ -193,7 +196,7 @@ pub async fn build_branch(
         .get_ref(name)
         .await?
         .ok_or_else(|| Error::Corrupt(format!("{name}: no such branch")))?;
-    let tree = Tree::new(cache.clone(), r.size.div_ceil(pando_format::CHUNK_SIZE as u64));
+    let tree = Tree::new(cache.clone(), r.size.div_ceil(CHUNK_SIZE as u64));
     let opts = BuildOptions {
         parallel,
         serve: false,
