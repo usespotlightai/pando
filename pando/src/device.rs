@@ -70,6 +70,9 @@ pub(crate) struct DetachArgs {
     /// The file system loses the writes it has not flushed.
     #[arg(long)]
     pub(crate) force: bool,
+    /// How long to wait for the daemon to publish the branch and let go of the device.
+    #[arg(long, value_parser = crate::parse_duration, default_value = "30m")]
+    pub(crate) publish_wait: Duration,
 }
 
 #[cfg(target_os = "linux")]
@@ -253,12 +256,12 @@ mod linux {
                     switch.resume(dm).await?;
                 }
                 switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
-                return Ok(pando_linux::delete(id).await?);
+                return Ok(pando_linux::delete(id, d.publish_wait).await?);
             }
             switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
         }
         pando_linux::stop(id).await?;
-        Ok(pando_linux::delete(id).await?)
+        Ok(pando_linux::delete(id, d.publish_wait).await?)
     }
 
     /// Fails while `users` hold device `dev`, so a stop cannot cut a mounted file system off.
@@ -271,5 +274,26 @@ mod linux {
              device still serves the branch (--force stops it anyway and loses unflushed writes)",
             users.join(", ")
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn an_unused_device_may_be_stopped() {
+            in_use("/dev/ublkb1", &[]).unwrap();
+        }
+
+        #[test]
+        fn a_used_device_is_refused_with_its_users() {
+            let users = [
+                "mounted at /mnt/b1".to_owned(),
+                "under /dev/mapper/pando-b1".to_owned(),
+            ];
+            let e = in_use("/dev/ublkb1", &users).unwrap_err().to_string();
+            assert!(e.starts_with("/dev/ublkb1 is in use: mounted at /mnt/b1, under /dev/mapper/pando-b1."));
+            assert!(e.contains("still serves the branch"));
+        }
     }
 }
