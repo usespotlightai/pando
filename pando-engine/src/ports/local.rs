@@ -65,13 +65,14 @@ pub trait LocalFile: Send + Sync + fmt::Debug {
 
 pub trait FileLock: Send + Sync + fmt::Debug {}
 
-/// One extent of a file: `len` bytes at `logical` in the file, at `physical` on the disk.
+/// One extent of a file: `len` bytes at `logical` in the file, at `physical` on the disk. An
+/// unwritten extent has its place but reads as zeros.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Extent {
     pub logical: u64,
     pub physical: u64,
     pub len: u64,
-    pub shared: bool,
+    pub unwritten: bool,
 }
 
 /// Base images: block-sized files that share extents with their clones.

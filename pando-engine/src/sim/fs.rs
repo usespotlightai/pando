@@ -268,7 +268,7 @@ impl LocalImage for SimFs {
                     logical,
                     physical,
                     len: n,
-                    shared: false,
+                    unwritten: false,
                 }),
             }
         }

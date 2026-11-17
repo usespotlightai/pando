@@ -33,7 +33,8 @@ fn sorted(es: &[Extent]) -> Vec<Extent> {
 }
 
 /// The chunks, in order, whose bytes may differ between two clones of one image, and how many
-/// bytes differ: a byte differs when only one clone maps it or they map it to different places.
+/// bytes differ: a byte differs when only one clone maps it, or they map it to different places
+/// or in different states.
 /// Clones share every block nobody wrote since; a write moves a block to a new place. The walk
 /// is linear in the extents, whatever the size of the image.
 pub(crate) fn changed_chunks(prev: &[Extent], cur: &[Extent]) -> (Vec<u64>, u64) {
@@ -69,7 +70,9 @@ pub(crate) fn changed_chunks(prev: &[Extent], cur: &[Extent]) -> (Vec<u64>, u64)
             break;
         }
         let differs = match (a, b) {
-            (Some(a), Some(b)) => a.physical + pos - a.logical != b.physical + pos - b.logical,
+            (Some(a), Some(b)) => {
+                a.physical + pos - a.logical != b.physical + pos - b.logical || a.unwritten != b.unwritten
+            }
             (None, None) => false,
             _ => true,
         };
@@ -90,8 +93,19 @@ mod tests {
             logical,
             physical,
             len,
-            shared: false,
+            unwritten: false,
         }
+    }
+
+    #[test]
+    fn an_extent_written_in_place_is_a_change() {
+        let unwritten = |e: Extent| Extent { unwritten: true, ..e };
+        let prev = [unwritten(x(0, 1 << 30, 2 * CHUNK))];
+        let cur = [
+            x(0, 1 << 30, CHUNK),
+            unwritten(x(CHUNK, (1 << 30) + CHUNK, CHUNK)),
+        ];
+        assert_eq!(changed_chunks(&prev, &cur), (vec![0], CHUNK));
     }
 
     #[test]

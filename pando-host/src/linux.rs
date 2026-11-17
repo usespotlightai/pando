@@ -6,7 +6,7 @@ use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-use pando_engine::ports::Advice;
+use pando_engine::ports::{Advice, Extent};
 use rustix::fs::{FallocateFlags, fadvise, fallocate, ioctl_ficlone};
 use rustix::io::{Errno, ReadWriteFlags, preadv2};
 use rustix::ioctl::{Getter, Setter, ioctl, opcode};
@@ -87,9 +87,89 @@ pub(crate) fn extent_hint(f: &File, bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
+const FS_IOC_FIEMAP: libc::c_ulong = 0xc020_660b;
+const FIEMAP_FLAG_SYNC: u32 = 1;
+const FIEMAP_EXTENT_LAST: u32 = 1;
+const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x800;
+const FIEMAP_HEADER: usize = 32;
+const FIEMAP_EXTENT: usize = 56;
+const FIEMAP_BATCH: usize = 512;
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"))
+}
+
+/// The extents of `f`, after it writes back its dirty pages.
+pub(crate) fn extents(f: &File) -> io::Result<Vec<Extent>> {
+    let mut buf = vec![0u8; FIEMAP_HEADER + FIEMAP_BATCH * FIEMAP_EXTENT];
+    let mut out = Vec::new();
+    let mut start = 0u64;
+    loop {
+        buf.fill(0);
+        buf[0..8].copy_from_slice(&start.to_le_bytes());
+        buf[8..16].copy_from_slice(&(u64::MAX - start).to_le_bytes());
+        buf[16..20].copy_from_slice(&FIEMAP_FLAG_SYNC.to_le_bytes());
+        buf[24..28].copy_from_slice(&(FIEMAP_BATCH as u32).to_le_bytes());
+        // SAFETY: the kernel reads the header and writes at most fm_extent_count extents after
+        // it, which `buf` holds.
+        if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FIEMAP as _, buf.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = le32(&buf, 20) as usize;
+        if n == 0 {
+            return Ok(out);
+        }
+        let mut last = false;
+        for e in buf[FIEMAP_HEADER..].as_chunks::<FIEMAP_EXTENT>().0.iter().take(n) {
+            let flags = le32(e, 40);
+            let x = Extent {
+                logical: le64(e, 0),
+                physical: le64(e, 8),
+                len: le64(e, 16),
+                unwritten: flags & FIEMAP_EXTENT_UNWRITTEN != 0,
+            };
+            start = x.logical + x.len;
+            last |= flags & FIEMAP_EXTENT_LAST != 0;
+            out.push(x);
+        }
+        if last {
+            return Ok(out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extents_map_written_ranges_and_skip_holes() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("x"))
+            .unwrap();
+        f.write_all_at(&[1u8; 8192], 0).unwrap();
+        f.write_all_at(&[2u8; 4096], 1 << 20).unwrap();
+        let es = match extents(&f) {
+            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => return,
+            r => r.unwrap(),
+        };
+        let mapped: u64 = es.iter().map(|e| e.len).sum();
+        assert!((8192 + 4096..1 << 20).contains(&mapped), "{es:?}");
+        assert!(es.iter().all(|e| !e.unwritten && e.physical != 0));
+        assert!(
+            es.iter()
+                .any(|e| e.logical <= 1 << 20 && e.logical + e.len > 1 << 20)
+        );
+    }
 
     #[test]
     fn ioctl_numbers_match_linux() {

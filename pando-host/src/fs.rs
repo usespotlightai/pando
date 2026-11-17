@@ -217,11 +217,21 @@ impl LocalImage for HostFs {
         .await
     }
 
-    async fn extents(&self, _path: &Path) -> io::Result<Vec<Extent>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "extent maps are not implemented yet",
-        ))
+    async fn extents(&self, path: &Path) -> io::Result<Vec<Extent>> {
+        let path = path.to_path_buf();
+        blocking(move || {
+            #[cfg(target_os = "linux")]
+            return crate::linux::extents(&File::open(path)?);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = path;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "extent maps need Linux",
+                ))
+            }
+        })
+        .await
     }
 
     async fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
