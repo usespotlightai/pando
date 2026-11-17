@@ -76,23 +76,16 @@ async fn pack_metadata(
     Ok(packed.len())
 }
 
-/// Creates branch `name` with the bytes of the image file at `image`.
+/// Creates branch `name` with the bytes of the image file at `image`. The branch appears only
+/// once everything is uploaded; a failed import leaves segments that GC collects.
 pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path) -> Result<ImportReport> {
     let f = ports.fs.open(image, Open::Read).await?;
     let size = f.size().await?;
     let remote = cache.remote();
+    if remote.get_ref(name).await?.is_some() {
+        return Err(crate::Error::RefExists(name.to_owned()));
+    }
     let generation = 1;
-    let version = remote
-        .create_ref(
-            name,
-            &Ref {
-                size,
-                root: Entry::EMPTY,
-                generation,
-                from: None,
-            },
-        )
-        .await?;
     let tree = Tree::new(cache.clone(), size.div_ceil(CHUNK));
     let cpu = ports.cpu.clone();
     let mut chunks = futures::stream::iter(0..size.div_ceil(CHUNK))
@@ -133,7 +126,7 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
     let packed = tree.pack(&root, &mut p).await?;
     p.finish().await?;
     remote
-        .put_ref(
+        .create_ref(
             name,
             &Ref {
                 size,
@@ -141,7 +134,6 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
                 generation,
                 from: None,
             },
-            &version,
         )
         .await?;
     Ok(ImportReport {
@@ -178,6 +170,25 @@ mod tests {
         v.read_at(&mut got, 0).await.unwrap();
         assert_eq!(got, img);
         v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_import_leaves_no_branch() {
+        let (ports, store, _) = sim::ports(11);
+        let img = vec![3u8; 2 * CHUNK_SIZE];
+        ports.fs.create_dir_all(Path::new("/img")).await.unwrap();
+        let f = ports.fs.open(Path::new("/img/disk"), Open::Create).await.unwrap();
+        f.write_at(vec![Bytes::from(img.clone())], 0).await.unwrap();
+        let c = Arc::new(Cache::open(&ports, Path::new("/c")).await.unwrap());
+        store.inject(sim::Fault {
+            op: sim::StoreOp::Create,
+            applied: false,
+        });
+        assert!(import(&ports, &c, "main", Path::new("/img/disk")).await.is_err());
+        assert!(c.remote().get_ref("main").await.unwrap().is_none());
+        import(&ports, &c, "main", Path::new("/img/disk")).await.unwrap();
+        let again = import(&ports, &c, "main", Path::new("/img/disk")).await;
+        assert!(matches!(again.unwrap_err().kind(), crate::Error::RefExists(_)));
     }
 
     #[tokio::test(start_paused = true)]
