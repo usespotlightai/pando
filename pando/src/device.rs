@@ -379,7 +379,25 @@ mod linux {
             println!("snapshots of {name}: {s:?}");
         }
         let r = att.finish().await.with_context(|| format!("publish {name}"))?;
-        println!("published {name} in {:.1?}: {r:?}", t0.elapsed());
+        let total = t0.elapsed();
+        println!("published {name} in {total:.1?}: {r:?}");
+        let c = &r.checkpoint;
+        let last = c.last.unwrap_or_default();
+        println!(
+            "publish times {name}: total={:.4} absorb={:.4} flush={:.4} wait={:.4} pack={:.4} ref={:.4} \
+             after={:.4} passes_before={} bytes_before={} passes={} bytes={}",
+            total.as_secs_f64(),
+            r.absorb.as_secs_f64(),
+            c.flush.as_secs_f64(),
+            c.wait.as_secs_f64(),
+            last.pack.as_secs_f64(),
+            last.publish.as_secs_f64(),
+            r.after.as_secs_f64(),
+            c.passes_before,
+            c.bytes_before,
+            c.passes,
+            c.bytes,
+        );
         Ok(())
     }
 

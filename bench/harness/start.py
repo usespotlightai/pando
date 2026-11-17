@@ -544,16 +544,42 @@ class Pando(Workspace):
         raise SystemExit(f"pando attach of device {i} exited with {p.wait()} before printing {prefix.strip()!r}")
 
     def close(self, i):
+        self.close_timed(i)
+
+    def close_timed(self, i):
+        """Closes branch i. Returns the seconds the unmount, `pando detach` and the end of
+        `pando attach` took, the `key=value` publish times attach printed, the page cache's
+        dirty bytes before the unmount, and the bytes the device took before and during it."""
+        times = {}
+        live = os.path.exists(self._device(i))
+        if live:
+            times["dirty"] = dirty_bytes()
+            times["run_written"] = self.written(i)
+        t0 = time.perf_counter()
         unmount(self.root(i))
+        times["unmount"] = time.perf_counter() - t0
+        if live:
+            times["unmount_written"] = self.written(i) - times["run_written"]
         p, out = self.procs.pop(i, (None, None))
+        t0 = time.perf_counter()
         if os.path.exists(self._device(i)):
             dm = ["--dm", self._dm(i)] if self.handoff else []
             self._pando("detach", "--device", self._device(i), *dm, capture=True, check=False)
+        times["detach"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         if p:
-            out.write(p.stdout.read())
+            rest = p.stdout.read()
+            out.write(rest)
             if p.wait(timeout=600) != 0:
                 log(f"{self.name}: attach of b{i} exited with {p.returncode}")
             out.close()
+            times.update(publish_times(rest))
+        times["exit"] = time.perf_counter() - t0
+        return times
+
+    def written(self, i):
+        """Bytes written to device i since it was created."""
+        return int(Path(f"/sys/block/{Path(self._device(i)).name}/stat").read_text().split()[6]) * 512
 
     def teardown(self):
         for i in list(getattr(self, "procs", {})):
@@ -561,6 +587,21 @@ class Pando(Workspace):
         if hasattr(self, "bucket"):
             run("aws", "s3", "rm", "--recursive", "--quiet", f"s3://{self.bucket}/{self.prefix}/", check=False)
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def publish_times(text):
+    """The values of attach's `publish times` line, as numbers."""
+    for line in text.splitlines():
+        head, sep, rest = line.partition(": ")
+        if sep and head.startswith("publish times "):
+            return {k: float(v) for k, _, v in (kv.partition("=") for kv in rest.split())}
+    return {}
+
+
+def dirty_bytes():
+    """Dirty and writeback bytes in the page cache, host-wide."""
+    fields = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    return sum(int(fields[k].split()[0]) * 1024 for k in ("Dirty", "Writeback"))
 
 
 class PandoHandoff(Pando):

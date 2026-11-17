@@ -12,7 +12,13 @@ changes added to the store.
   JuiceFS   `sync` of the mount; data is uploaded as files close, and the metadata is in SQLite
             on the host, standing in for a metadata server. Bytes: growth of its bucket prefix.
 
-Rows: save.time in seconds, save.uploaded in bytes, save.npm_ci in seconds.
+Rows: save.time in seconds, save.uploaded in bytes, save.npm_ci in seconds. Pando also splits
+save.time: save.unmount, save.detach and save.exit (the end of `pando attach`); within the
+detach, attach's publish times (save.flush, save.wait, and save.pack and save.ref of the last
+upload pass); the bytes the device took during npm ci (save.run_written) and during the unmount
+(save.unmount_written); the page cache's dirty bytes before the unmount (save.dirty); and the
+upload passes and segment bytes before the detach (save.passes_before, save.bytes_before) and
+during it (save.passes, save.bytes).
 """
 
 import json
@@ -49,7 +55,7 @@ class PandoSaver(Saver):
         return bucket_bytes(self.s.bucket, self.s.prefix)
 
     def save(self, i, rep):
-        self.s.close(i)
+        self.split = self.s.close_timed(i)
         return None
 
     def after(self, i, rep):
@@ -151,7 +157,18 @@ def save_once(s, saver, i, rep, out):
     note = f"rep {rep}"
     out.add(s.name, "save.time", rep, t, "s", note)
     out.add(s.name, "save.uploaded", rep, uploaded, "B", note)
+    for key, value in getattr(saver, "split", {}).items():
+        if key != "total":
+            out.add(s.name, f"save.{key}", rep, value, split_unit(key), note)
     log(f"{s.name}: save rep {rep}: {t:.2f} s, {uploaded / 2**20:.1f} MiB")
+
+
+def split_unit(key):
+    if key.startswith("passes"):
+        return "n"
+    if key.startswith("bytes") or key.endswith("written") or key == "dirty":
+        return "B"
+    return "s"
 
 
 def measure(names, reps):
