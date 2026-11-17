@@ -16,5 +16,8 @@ pando-format.workspace = true
 pando-s3.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+pando-linux.workspace = true
+
 [lints]
 workspace = true

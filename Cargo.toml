@@ -22,6 +22,7 @@ publish = false
 pando-format = { path = "pando-format" }
 pando-engine = { path = "pando-engine" }
 pando-host = { path = "pando-host" }
+pando-linux = { path = "pando-linux" }
 pando-s3 = { path = "pando-s3" }
 
 anyhow = "1.0.104"
@@ -30,6 +31,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 hex = "0.4.3"
+io-uring = "0.7.16"
 libc = "0.2.186"
 object_store = { version = "0.14.2", default-features = false }
 proptest = "1.12.0"

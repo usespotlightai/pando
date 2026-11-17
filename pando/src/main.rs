@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod device;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,10 +90,14 @@ enum Command {
     },
     /// Shows what the store holds.
     Stat,
+    /// Serves a branch as a block device until `detach`, then publishes it.
+    Attach(device::AttachArgs),
+    /// Stops the device of an attached branch; returns once the branch is published.
+    Detach(device::DetachArgs),
 }
 
 /// Parses durations such as `500ms`, `15s`, `10m` and `24h`.
-fn parse_duration(s: &str) -> Result<Duration> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
     let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (n, unit) = s.split_at(at);
     let n: u64 = n.parse().with_context(|| format!("duration {s:?}"))?;
@@ -201,6 +206,8 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Attach(a) => device::attach(&ports, cache().await?, a, cli.store.identity()).await,
+        Command::Detach(d) => device::detach(d).await,
         Command::Stat => {
             let u = gc::usage(&cache().await?).await?;
             println!(

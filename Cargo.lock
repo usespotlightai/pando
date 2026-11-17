@@ -899,6 +899,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878c26bc5e45fe089ce2ca25689260c152a87ce1d7de2ca86101efeea6973932"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1136,6 +1147,7 @@ dependencies = [
  "pando-engine",
  "pando-format",
  "pando-host",
+ "pando-linux",
  "pando-s3",
  "tokio",
 ]
@@ -1195,6 +1207,13 @@ dependencies = [
 [[package]]
 name = "pando-linux"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "io-uring",
+ "libc",
+ "pando-engine",
+ "tokio",
+]
 
 [[package]]
 name = "pando-s3"

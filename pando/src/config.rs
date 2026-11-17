@@ -63,4 +63,14 @@ impl StoreArgs {
         };
         Ok(Arc::new(S3Store::new(&config)?))
     }
+
+    /// A name of the store that tells it apart from other stores and holds no secret.
+    pub(crate) fn identity(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.endpoint.as_deref().unwrap_or_default(),
+            self.bucket.as_deref().unwrap_or_default(),
+            self.remote
+        )
+    }
 }

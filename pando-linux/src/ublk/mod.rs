@@ -1,0 +1,243 @@
+//! The ublk frontend: serves a branch as `/dev/ublkbN`.
+//!
+//! The device is added with user recovery that reissues requests: when the daemon dies the
+//! kernel keeps the device, holds new I/O, and gives the requests that were in flight to the
+//! next daemon, which recovers the device with `START_USER_RECOVERY` and `END_USER_RECOVERY`.
+
+mod ctrl;
+mod queue;
+
+use std::io;
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use pando_engine::Volume;
+use tokio::runtime::Handle;
+
+use crate::dm::open_usable;
+use ctrl::{Ctrl, NewDevice};
+use queue::Queue;
+
+const DEPTH: u16 = 64;
+/// How long a recovery waits for the kernel to quiesce the device of a dead daemon.
+const QUIESCE_WAIT: Duration = Duration::from_secs(10);
+
+/// The number of `/dev/ublkbN`.
+pub fn device_id(dev: &Path) -> io::Result<u32> {
+    dev.to_str()
+        .and_then(|s| s.strip_prefix("/dev/ublkb"))
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("device {} is not /dev/ublkbN", dev.display()),
+            )
+        })
+}
+
+/// How a frontend starts.
+#[derive(Clone, Copy, Debug)]
+pub struct FrontendOptions {
+    /// Hardware queues of a new device, each served by one thread pinned to its CPU. One queue
+    /// per CPU is faster at depth but slower at queue depth 1, where the queue thread shares a
+    /// CPU with the submitter.
+    pub queues: u16,
+    /// Take over the device of a daemon that died, with the requests it had in flight.
+    pub recover: bool,
+}
+
+impl Default for FrontendOptions {
+    fn default() -> FrontendOptions {
+        FrontendOptions {
+            queues: 2,
+            recover: false,
+        }
+    }
+}
+
+/// A started ublk device and the threads that serve its queues.
+#[derive(Debug)]
+pub struct Frontend {
+    id: u32,
+    cdev: Option<std::fs::File>,
+    queues: Vec<JoinHandle<io::Result<()>>>,
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(io::Error::other)?
+}
+
+impl Frontend {
+    /// Adds device `id` (or recovers it), serves its queues from `vol` on runtime `rt`, and
+    /// starts it.
+    pub async fn start(rt: Handle, vol: Arc<Volume>, id: u32, opts: FrontendOptions) -> io::Result<Frontend> {
+        blocking(move || Frontend::start_blocking(rt, vol, id, opts)).await
+    }
+
+    fn start_blocking(rt: Handle, vol: Arc<Volume>, id: u32, opts: FrontendOptions) -> io::Result<Frontend> {
+        let mut c = Ctrl::open()?;
+        let (mut queues, mut depth) = (opts.queues.max(1), DEPTH);
+        if opts.recover {
+            let t0 = Instant::now();
+            let info = loop {
+                let i = c.info(id)?;
+                if i.state == ctrl::STATE_QUIESCED || t0.elapsed() > QUIESCE_WAIT {
+                    break i;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            if info.state != ctrl::STATE_QUIESCED {
+                return Err(io::Error::other(format!(
+                    "ublk device {id} is in state {}, not quiesced",
+                    info.state
+                )));
+            }
+            (queues, depth) = (info.queues, info.depth);
+            c.cmd(ctrl::CMD_START_USER_RECOVERY, id, 0, None)?;
+        } else {
+            let flags = ctrl::F_USER_RECOVERY
+                | ctrl::F_USER_RECOVERY_REISSUE
+                | ctrl::F_CMD_IOCTL_ENCODE
+                | (c.features() & ctrl::F_NO_AUTO_PART_SCAN);
+            c.add(&NewDevice {
+                id,
+                queues,
+                depth,
+                max_io: queue::MAX_IO as u32,
+                flags,
+            })?;
+        }
+        let mut fe = Frontend {
+            id,
+            cdev: None,
+            queues: Vec::new(),
+        };
+        let started = (|| {
+            if !opts.recover {
+                c.set_params(id, vol.size(), queue::MAX_IO as u32)?;
+            }
+            let name = format!("ublkc{id}");
+            let devt = std::fs::read_to_string(format!("/sys/class/ublk-char/{name}/dev"))?;
+            let cdev = open_usable(&Path::new("/dev").join(&name), true, Some(devt.trim()))?;
+            let fd = cdev.as_raw_fd();
+            fe.cdev = Some(cdev);
+            let (tx, rx) = mpsc::channel();
+            for q in 0..queues {
+                let queue = Queue {
+                    cdev: fd,
+                    q,
+                    depth,
+                    vol: vol.clone(),
+                    rt: rt.clone(),
+                };
+                let tx = tx.clone();
+                fe.queues.push(
+                    std::thread::Builder::new()
+                        .name(format!("ublk-q{q}"))
+                        .spawn(move || queue.run(tx))?,
+                );
+            }
+            for _ in 0..queues {
+                rx.recv().map_err(io::Error::other)??;
+            }
+            let nr = if opts.recover {
+                ctrl::CMD_END_USER_RECOVERY
+            } else {
+                ctrl::CMD_START_DEV
+            };
+            c.cmd(nr, id, std::process::id() as u64, None)
+        })();
+        match started {
+            Ok(()) => Ok(fe),
+            Err(e) if opts.recover => {
+                join(std::mem::take(&mut fe.queues));
+                Err(e)
+            }
+            Err(e) => {
+                if let Err(se) = c.cmd(ctrl::CMD_STOP_DEV, id, 0, None) {
+                    eprintln!("stop ublk device {id}: {se}");
+                }
+                join(std::mem::take(&mut fe.queues));
+                fe.cdev = None;
+                if let Err(de) = c.cmd(ctrl::CMD_DEL_DEV, id, 0, None) {
+                    eprintln!("delete ublk device {id}: {de}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Waits until the device stops, which ends every queue.
+    pub async fn stopped(&mut self) {
+        let queues = std::mem::take(&mut self.queues);
+        let _ = tokio::task::spawn_blocking(move || join(queues)).await;
+    }
+
+    /// Stops and deletes the device this frontend started, when the start of what sits on it
+    /// failed.
+    pub async fn abort(mut self) -> io::Result<()> {
+        let id = self.id;
+        blocking(move || Ctrl::open()?.cmd(ctrl::CMD_STOP_DEV, id, 0, None)).await?;
+        self.stopped().await;
+        drop(self.cdev.take());
+        blocking(move || Ctrl::open()?.cmd(ctrl::CMD_DEL_DEV, id, 0, None)).await
+    }
+}
+
+impl Drop for Frontend {
+    fn drop(&mut self) {
+        if !self.queues.is_empty()
+            && let Some(f) = self.cdev.take()
+        {
+            let _ = std::os::fd::IntoRawFd::into_raw_fd(f);
+        }
+    }
+}
+
+fn join(queues: Vec<JoinHandle<io::Result<()>>>) {
+    for (q, t) in queues.into_iter().enumerate() {
+        match t.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("ublk queue {q}: {e}"),
+            Err(_) => eprintln!("ublk queue {q} panicked"),
+        }
+    }
+}
+
+/// Whether the daemon of device `id` died: ublk holds its I/O (quiesced) or fails it.
+pub async fn daemon_dead(id: u32) -> io::Result<bool> {
+    blocking(move || {
+        let s = Ctrl::open()?.info(id)?.state;
+        Ok(s == ctrl::STATE_QUIESCED || s == ctrl::STATE_FAIL_IO)
+    })
+    .await
+}
+
+/// Stops device `id`, which ends its queues and fails the I/O ublk holds for a dead daemon.
+pub async fn stop(id: u32) -> io::Result<()> {
+    blocking(move || Ctrl::open()?.cmd(ctrl::CMD_STOP_DEV, id, 0, None)).await
+}
+
+/// Deletes device `id`. It waits until the daemon lets go of the device, which it does once
+/// the branch is published.
+pub async fn delete(id: u32) -> io::Result<()> {
+    blocking(move || Ctrl::open()?.cmd(ctrl::CMD_DEL_DEV, id, 0, None)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_ids_come_from_the_block_device_name() {
+        assert_eq!(device_id(Path::new("/dev/ublkb12")).unwrap(), 12);
+        assert!(device_id(Path::new("/dev/loop0")).is_err());
+    }
+}
