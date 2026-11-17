@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,9 +15,14 @@ use futures::TryStreamExt;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
 };
 use pando_engine::ports::{Object, ObjectInfo, Store, StoreError, Version};
+
+/// The longest one request may take. A segment PUT shares the uplink with the other PUTs in
+/// flight, so on a slow link it takes minutes.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Where the store is and how to sign in. Credentials come from the caller, never from a file
 /// this crate reads.
@@ -60,6 +65,7 @@ impl S3Store {
             .with_access_key_id(&c.access_key_id)
             .with_secret_access_key(&c.secret_access_key)
             .with_allow_http(c.allow_http)
+            .with_client_options(ClientOptions::new().with_timeout(REQUEST_TIMEOUT))
             .with_conditional_put(S3ConditionalPut::ETagMatch);
         if let Some(e) = &c.endpoint {
             b = b.with_endpoint(e);
