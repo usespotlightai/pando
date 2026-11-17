@@ -192,7 +192,7 @@ class Download(Workspace):
         has one, else from the bucket while keeping a copy."""
         cache = self.dir / "base.zst"
         if cache.exists():
-            run("bash", "-o", "pipefail", "-c", f"{into} < {cache}")
+            run("bash", "-o", "pipefail", "-c", f"< {cache} {into}")
             return
         run("bash", "-o", "pipefail", "-c",
             f"aws s3 cp --quiet s3://{self.bucket}/{self.key} - | tee {cache}.part | {into}")

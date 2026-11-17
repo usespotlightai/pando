@@ -146,7 +146,7 @@ class Results:
         self.path = RESULTS / f"{name}.csv"
         new = not self.path.exists()
         self.f = open(self.path, "a", newline="")
-        self.w = csv.DictWriter(self.f, RESULT_FIELDS)
+        self.w = csv.DictWriter(self.f, RESULT_FIELDS, lineterminator="\n")
         if new:
             self.w.writeheader()
 
