@@ -8,6 +8,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use io_uring::{IoUring, opcode, squeue, types};
@@ -110,6 +111,32 @@ fn try_read(vol: &Volume, r: Request, buf: &mut [u8]) -> Option<i32> {
         Ok(false) => None,
         Err(e) => Some(result(Err(e), 0)),
     }
+}
+
+/// Where a request's result goes: the queue's channel, and its eventfd, written only when
+/// no wakeup is pending already.
+#[derive(Clone)]
+struct Results {
+    tx: mpsc::Sender<(u16, i32)>,
+    efd: Arc<OwnedFd>,
+    pending: Arc<AtomicBool>,
+}
+
+impl Results {
+    fn send(&self, tag: u16, res: i32) {
+        let _ = self.tx.send((tag, res));
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            sys::eventfd_signal(&self.efd);
+        }
+    }
+}
+
+/// Serves request `tag` on the engine runtime and sends its result.
+async fn run(vol: Arc<Volume>, out: Results, tag: u16, req: Request, buf: TagBuf) {
+    // SAFETY: the tag stays ours until the queue commits the result sent here.
+    let data = req.has_data().then(|| unsafe { buf.slice() });
+    let res = handle(&vol, req, data).await;
+    out.send(tag, res);
 }
 
 /// What a queue thread needs.
@@ -227,9 +254,35 @@ impl Queue {
         served
     }
 
+    /// Hands `started` to the engine runtime with one wakeup: one task runs the first request
+    /// and spawns the rest from inside the runtime, onto its worker's own queue.
+    fn start(&self, started: &mut Vec<(u16, Request, TagBuf)>, out: &Results) {
+        if started.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(started);
+        let (vol, out) = (self.vol.clone(), out.clone());
+        self.rt.spawn(async move {
+            let mut batch = batch.into_iter();
+            let first = batch.next();
+            for (tag, req, buf) in batch {
+                tokio::spawn(run(vol.clone(), out.clone(), tag, req, buf));
+            }
+            if let Some((tag, req, buf)) = first {
+                run(vol, out, tag, req, buf).await;
+            }
+        });
+    }
+
     fn serve(&self, r: &mut Ring, descs: &Mapping, efd: Arc<OwnedFd>, counter: *mut u8) -> io::Result<()> {
         let _rt = self.rt.enter();
         let (tx, rx) = mpsc::channel::<(u16, i32)>();
+        let out = Results {
+            tx,
+            efd: efd.clone(),
+            pending: Arc::default(),
+        };
+        let mut started = Vec::with_capacity(self.depth as usize);
         let (mut active, mut inflight) = (self.depth as usize, 0usize);
         let mut batch = Vec::with_capacity(2 * self.depth as usize);
         let mut failed = None;
@@ -243,6 +296,7 @@ impl Queue {
             let new = batch.iter().filter(|(u, res)| *u != EFD_TAG && *res == 0).count();
             for &(user, res) in &batch {
                 if user == EFD_TAG {
+                    out.pending.store(false, Ordering::Release);
                     while let Ok((tag, res)) = rx.try_recv() {
                         inflight -= 1;
                         if let Err(e) = r.io_cmd(IO_COMMIT_AND_FETCH, tag, res) {
@@ -294,15 +348,9 @@ impl Queue {
                     }
                 }
                 inflight += 1;
-                let (vol, tx, efd) = (self.vol.clone(), tx.clone(), efd.clone());
-                self.rt.spawn(async move {
-                    // SAFETY: the tag stays ours until the queue commits the result sent here.
-                    let data = req.has_data().then(|| unsafe { buf.slice() });
-                    let res = handle(&vol, req, data).await;
-                    let _ = tx.send((tag, res));
-                    sys::eventfd_signal(&efd);
-                });
+                started.push((tag, req, buf));
             }
+            self.start(&mut started, &out);
         }
         for _ in 0..inflight {
             let _ = rx.recv();
