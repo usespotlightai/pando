@@ -386,6 +386,24 @@ impl Handoff {
         r
     }
 
+    /// Grows the image to `size` bytes, then the loop device over it and the device-mapper
+    /// device over that, between snapshots. The volume must have grown first.
+    pub(crate) async fn grow(&self, size: u64) -> Result<()> {
+        let _s = self.snaps.lock().await;
+        if self.file.size().await? < size {
+            self.file.set_len(size).await?;
+        }
+        let lp = self
+            .loop_dev
+            .lock()
+            .expect("loop lock")
+            .clone()
+            .ok_or_else(|| crate::Error::Corrupt(format!("{}: no loop device", self.image.display())))?;
+        let devices = self.env.devices.as_ref();
+        devices.refresh_loop(&lp).await?;
+        resize_table(devices, &self.dm, &lp, size).await
+    }
+
     /// After a checkpoint published everything: removes the image, its clones and its owner.
     pub(crate) async fn remove(&self, v: &Volume) {
         self.remove_retired(v).await;
@@ -396,12 +414,33 @@ impl Handoff {
     }
 }
 
+/// Makes device `dm` map `size` bytes of `target`, the device it maps already, without a gap
+/// for the file system above.
+pub(crate) async fn resize_table(
+    devices: &dyn DeviceSwitch,
+    dm: &str,
+    target: &Path,
+    size: u64,
+) -> Result<()> {
+    devices.load(dm, target, size).await?;
+    if let Err(e) = devices.suspend(dm).await {
+        let _ = devices.clear_inactive(dm).await;
+        return Err(e.into());
+    }
+    if let Err(e) = devices.resume(dm).await {
+        let _ = devices.clear_inactive(dm).await;
+        let _ = devices.resume(dm).await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Sets `v` to upload recipes of the blocks of `root`'s base image, and of learned chunks.
 async fn use_dedup(env: &HostEnv, bases: &Bases, v: &Volume, root: pando_format::Entry) {
     if !env.dedup {
         return;
     }
-    let base = bases.blocks_for(v.tree(), root).await.ok().flatten();
+    let base = bases.blocks_for(&v.tree(), root).await.ok().flatten();
     if base.is_some() || env.learned.is_some() {
         v.set_dedup(Some(Arc::new(Dedup {
             base,
@@ -431,9 +470,9 @@ pub(crate) async fn hand_off(
         let built = build(
             bases,
             &cache,
-            v.tree(),
+            v.opened_tree(),
             opened,
-            size,
+            v.opened_size(),
             BuildOptions {
                 parallel: BUILD_PARALLEL,
                 serve: true,
@@ -446,7 +485,13 @@ pub(crate) async fn hand_off(
         }
     }
     let file = match shared {
-        Some(_) => fs.open(&image, Open::ReadWrite).await?,
+        Some(_) => {
+            let f = fs.open(&image, Open::ReadWrite).await?;
+            if f.size().await? != size {
+                f.set_len(size).await?;
+            }
+            f
+        }
         None => {
             let _ = fs.remove(&image).await;
             let f = fs.open(&image, Open::Create).await?;
@@ -482,7 +527,7 @@ async fn copy_and_switch(h: &Arc<Handoff>, v: &Arc<Volume>, shared: Option<&Base
     let idxs = match shared {
         Some(bases) => {
             use_dedup(&h.env, bases, v, v.opened()).await;
-            v.changed_since(&v.opened()).await?
+            v.changed_since_opened().await?
         }
         None => v.used_chunks().await?,
     };

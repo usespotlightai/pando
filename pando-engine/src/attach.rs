@@ -6,19 +6,21 @@
 //! image: the attach rejoins it when the device still serves it, else adopts what it holds.
 //! Once the branch is local, the handoff moves the device to an image. A detach takes back what
 //! the kernel wrote to the image, publishes everything, saves the recording and removes the
-//! image.
+//! image. A grow raises the branch's size while it serves: the volume first, then each device
+//! above it.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 
 use crate::base::{Bases, BuildOptions, BuildReport, build};
 use crate::cache::{BaseKey, Cache};
 use crate::dedup::learned::{LearnedIndex, Learner};
-use crate::handoff::{self, Handoff, HandoffReport, HostEnv, SnapshotOptions};
+use crate::handoff::{self, Handoff, HandoffReport, HostEnv, SnapshotOptions, resize_table};
 use crate::ports::DeviceSwitch;
 use crate::{Ports, Result, Volume, ext4, recording};
 
@@ -97,6 +99,9 @@ pub struct Attachment {
     touched: watch::Sender<bool>,
     warmed: watch::Sender<bool>,
     handoff: Mutex<Option<Arc<Handoff>>>,
+    /// Held by a grow and by a handoff, so a handoff never sizes an image or a table from a
+    /// size a grow is changing.
+    resize: AsyncMutex<()>,
     learner: Mutex<Option<Arc<Learner>>>,
     base_ready: bool,
 }
@@ -132,6 +137,7 @@ impl Attachment {
             touched,
             warmed: watch::Sender::new(false),
             handoff: Mutex::default(),
+            resize: AsyncMutex::default(),
             learner: Mutex::default(),
             base_ready: false,
         };
@@ -139,8 +145,12 @@ impl Attachment {
             if bases.has(&opened.hash).await {
                 a.base_ready = true;
             } else {
-                let (cache, tree, after) = (cache.clone(), v.tree().clone(), Some(a.touched.subscribe()));
-                let size = v.size();
+                let (cache, tree, after) = (
+                    cache.clone(),
+                    v.opened_tree().clone(),
+                    Some(a.touched.subscribe()),
+                );
+                let size = v.opened_size();
                 *a.build.lock().expect("build lock") = Some(tokio::spawn(async move {
                     let opts = BuildOptions {
                         parallel: BUILD_PARALLEL,
@@ -181,7 +191,9 @@ impl Attachment {
         if self.base_ready
             && let Some(bases) = &self.bases
         {
-            bases.load_nodes(v.tree(), &bases.path(&v.opened().hash)).await?;
+            bases
+                .load_nodes(v.opened_tree(), &bases.path(&v.opened().hash))
+                .await?;
             v.use_base(bases).await?;
         }
         Ok(())
@@ -241,7 +253,7 @@ impl Attachment {
             if self.opts.prefetch == 0 || !self.opts.metadata || v.opened().is_empty() {
                 return None;
             }
-            ext4::prefetch(&self.cache, v.tree(), &v.opened(), self.opts.prefetch)
+            ext4::prefetch(&self.cache, v.opened_tree(), &v.opened(), self.opts.prefetch)
                 .await
                 .ok()
         };
@@ -254,7 +266,8 @@ impl Attachment {
         };
         r.base = built;
         if built.is_none() && self.opts.hydrate > 0 {
-            r.hydrated_frames = v.tree().hydrate(&v.root(), self.opts.hydrate).await?;
+            let (tree, root) = v.tree_and_root();
+            r.hydrated_frames = tree.hydrate(&root, self.opts.hydrate).await?;
         }
         self.warmed.send_replace(true);
         Ok(r)
@@ -268,6 +281,7 @@ impl Attachment {
             ));
         };
         let _ = self.warmed.subscribe().wait_for(|w| *w).await;
+        let _resize = self.resize.lock().await;
         let _hold = self.cache.hold_writeback();
         let learned = self.learn().await;
         let env = self.env(learned);
@@ -275,6 +289,36 @@ impl Attachment {
         let (h, report) = handoff::hand_off(&env, &self.volume, &dm, image, self.snapshot_options()).await?;
         *self.handoff.lock().expect("handoff lock") = Some(h);
         Ok(report)
+    }
+
+    /// Grows the branch to `size` bytes while it serves, waiting for a handoff in progress.
+    /// The volume grows first, so it serves the new bytes before any device asks for them;
+    /// then `frontend`, which grows the device the volume serves; then the device-mapper
+    /// device and, after a handoff, the image and its loop device under it. A grow to the
+    /// current size only brings the devices up to it, so a failed grow can be repeated.
+    pub async fn grow(&self, size: u64, frontend: impl Future<Output = std::io::Result<()>>) -> Result<()> {
+        let _resize = self.resize.lock().await;
+        self.volume.grow(size).await?;
+        frontend.await?;
+        let Some(dm) = &self.opts.device else {
+            return Ok(());
+        };
+        let switched = self
+            .handoff
+            .lock()
+            .expect("handoff lock")
+            .clone()
+            .filter(|h| h.switched());
+        if let Some(h) = switched {
+            return h.grow(size).await;
+        }
+        let Some(devices) = &self.devices else {
+            return Ok(());
+        };
+        let Some(target) = devices.live_target(dm).await? else {
+            return Ok(());
+        };
+        resize_table(devices.as_ref(), dm, &target, size).await
     }
 
     /// Loads the chunks earlier runs on this host uploaded, and starts keeping what this branch
@@ -383,6 +427,9 @@ impl DeviceSwitch for NoDevices {
     async fn attach_loop(&self, _: &Path) -> std::io::Result<PathBuf> {
         Err(no_devices())
     }
+    async fn refresh_loop(&self, _: &Path) -> std::io::Result<()> {
+        Err(no_devices())
+    }
     async fn loop_image(&self, _: &Path) -> std::io::Result<Option<PathBuf>> {
         Ok(None)
     }
@@ -466,6 +513,89 @@ mod tests {
         let f = a.finish().await.unwrap();
         assert_eq!(f.absorbed, 1);
         (w, h)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_grow_reaches_every_device_before_and_after_the_handoff() {
+        let (ports, _, fs) = sim::ports(12);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let w = Arc::new(Cache::open(&ports, Path::new("/w")).await.unwrap());
+        let v = Volume::open(&ports, w, Path::new("/wv"), "main").await.unwrap();
+        v.write_at(&vec![5; SIZE as usize], 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        v.close().await;
+        crate::branch::copy(&ports, "main", "fork", None).await.unwrap();
+
+        let devices = SimDevices::new((*fs).clone());
+        let cache = Arc::new(Cache::open(&ports, Path::new("/c")).await.unwrap());
+        let a = Attachment::open(
+            &ports,
+            Some(Arc::new(devices.clone())),
+            cache,
+            Path::new("/v"),
+            "fork",
+            opts(),
+        )
+        .await
+        .unwrap();
+        devices.add_block(Path::new(FRONT), Arc::new(Front(a.volume().clone())));
+        devices.create("dm0", Path::new(FRONT), SIZE).await.unwrap();
+        let block = |b: u8| vec![b; 4096];
+
+        let mid: u64 = 32 << 20;
+        assert!(devices.write("dm0", &block(1), SIZE).await.is_err());
+        let grown = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let g = grown.clone();
+        a.grow(mid, async move {
+            g.store(mid, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(grown.load(std::sync::atomic::Ordering::Relaxed), mid);
+        assert_eq!((devices.size("dm0"), a.volume().size()), (Some(mid), mid));
+        assert_eq!(a.volume().tree().depth(), 2, "the grow added a tree level");
+        devices.write("dm0", &block(0x11), mid - 4096).await.unwrap();
+
+        a.warm().await.unwrap();
+        let h = a.hand_off().await.unwrap();
+        assert!(h.shared, "the image starts from the base of the smaller root");
+        devices.write("dm0", &block(0x22), 20 << 20).await.unwrap();
+
+        let big: u64 = 64 << 20;
+        assert!(devices.write("dm0", &block(1), mid).await.is_err());
+        a.grow(big, async { Ok(()) }).await.unwrap();
+        assert_eq!(devices.size("dm0"), Some(big));
+        devices.write("dm0", &block(0x33), big - 4096).await.unwrap();
+        a.grow(big, async { Ok(()) }).await.unwrap();
+        assert!(
+            a.grow(mid, async { Ok(()) }).await.is_err(),
+            "a branch never shrinks"
+        );
+
+        devices.remove("dm0").await.unwrap();
+        devices.remove_block(Path::new(FRONT));
+        a.finish().await.unwrap();
+
+        let c = Arc::new(Cache::open(&ports, Path::new("/fresh")).await.unwrap());
+        let v = Volume::open(&ports, c, Path::new("/fv"), "fork").await.unwrap();
+        assert_eq!(v.size(), big);
+        let read = |off: u64| {
+            let v = &v;
+            async move {
+                let mut b = vec![0; 4096];
+                v.read_at(&mut b, off).await.unwrap();
+                b
+            }
+        };
+        assert_eq!(read(0).await, block(5));
+        assert_eq!(read(SIZE - 4096).await, block(5));
+        assert_eq!(read(SIZE).await, block(0));
+        assert_eq!(read(mid - 4096).await, block(0x11));
+        assert_eq!(read(20 << 20).await, block(0x22));
+        assert_eq!(read(big - 4096).await, block(0x33));
+        assert_eq!(read(40 << 20).await, block(0));
+        v.close().await;
     }
 
     #[tokio::test(start_paused = true)]

@@ -20,7 +20,8 @@ pub trait SimBlock: Send + Sync {
 #[derive(Debug)]
 struct Dev {
     live: PathBuf,
-    inactive: Option<PathBuf>,
+    size: u64,
+    inactive: Option<(PathBuf, u64)>,
     io: Arc<RwLock<()>>,
     held: Option<Arc<OwnedRwLockWriteGuard<()>>>,
 }
@@ -28,14 +29,16 @@ struct Dev {
 #[derive(Default)]
 struct State {
     devs: HashMap<String, Dev>,
-    loops: HashMap<PathBuf, PathBuf>,
+    /// Each loop device's image and size.
+    loops: HashMap<PathBuf, (PathBuf, u64)>,
     written: HashMap<PathBuf, u64>,
     blocks: HashMap<PathBuf, Arc<dyn SimBlock>>,
     next_loop: u32,
 }
 
 /// Device-mapper devices over block devices and loop devices over [`SimFs`] files. Reads and
-/// writes through a device go to its live table's target and wait while it is suspended.
+/// writes through a device go to its live table's target and wait while it is suspended; past
+/// the size of the table or of the loop device they fail.
 #[derive(Clone)]
 pub struct SimDevices {
     fs: SimFs,
@@ -50,6 +53,13 @@ impl std::fmt::Debug for SimDevices {
 
 fn no_device(name: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("no device {name}"))
+}
+
+fn beyond(name: &str, end: u64, size: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("I/O to byte {end} of {name}, which has {size}"),
+    )
 }
 
 enum Target {
@@ -78,29 +88,43 @@ impl SimDevices {
         self.lock().blocks.remove(path);
     }
 
-    fn route(&self, name: &str) -> io::Result<(Arc<RwLock<()>>, PathBuf)> {
+    fn route(&self, name: &str) -> io::Result<(Arc<RwLock<()>>, PathBuf, u64)> {
         let s = self.lock();
         let d = s.devs.get(name).ok_or_else(|| no_device(name))?;
-        Ok((d.io.clone(), d.live.clone()))
+        Ok((d.io.clone(), d.live.clone(), d.size))
     }
 
-    fn target(&self, live: &Path) -> io::Result<Target> {
-        let s = self.lock();
-        if let Some(b) = s.blocks.get(live) {
-            return Ok(Target::Block(b.clone()));
+    /// The target of the live table of `name`, for I/O that ends at byte `end`.
+    fn target(&self, name: &str, end: u64) -> io::Result<(PathBuf, Target)> {
+        let (_, live, size) = self.route(name)?;
+        if end > size {
+            return Err(beyond(name, end, size));
         }
-        s.loops
-            .get(live)
-            .map(|p| Target::Image(p.clone()))
-            .ok_or_else(|| no_device(&live.display().to_string()))
+        let s = self.lock();
+        if let Some(b) = s.blocks.get(&live) {
+            return Ok((live, Target::Block(b.clone())));
+        }
+        let (image, cap) = s
+            .loops
+            .get(&live)
+            .cloned()
+            .ok_or_else(|| no_device(&live.display().to_string()))?;
+        if end > cap {
+            return Err(beyond(&live.display().to_string(), end, cap));
+        }
+        Ok((live, Target::Image(image)))
+    }
+
+    /// The size of the live table of device `name`.
+    pub fn size(&self, name: &str) -> Option<u64> {
+        self.lock().devs.get(name).map(|d| d.size)
     }
 
     /// Reads through device `name`.
     pub async fn read(&self, name: &str, buf: &mut [u8], off: u64) -> io::Result<()> {
-        let (io, _) = self.route(name)?;
+        let (io, _, _) = self.route(name)?;
         let _g = io.read().await;
-        let (_, live) = self.route(name)?;
-        match self.target(&live)? {
+        match self.target(name, off + buf.len() as u64)?.1 {
             Target::Block(b) => b.read(buf, off).await,
             Target::Image(p) => {
                 let got = self
@@ -118,10 +142,10 @@ impl SimDevices {
 
     /// Writes through device `name`; it completes once the target has it.
     pub async fn write(&self, name: &str, b: &[u8], off: u64) -> io::Result<()> {
-        let (io, _) = self.route(name)?;
+        let (io, _, _) = self.route(name)?;
         let _g = io.read().await;
-        let (_, live) = self.route(name)?;
-        match self.target(&live)? {
+        let (live, target) = self.target(name, off + b.len() as u64)?;
+        match target {
             Target::Block(t) => t.write(b, off).await,
             Target::Image(p) => {
                 self.fs
@@ -146,13 +170,14 @@ impl SimDevices {
 
 #[async_trait]
 impl DeviceSwitch for SimDevices {
-    async fn create(&self, name: &str, target: &Path, _size: u64) -> io::Result<()> {
+    async fn create(&self, name: &str, target: &Path, size: u64) -> io::Result<()> {
         let mut s = self.lock();
         if s.devs.contains_key(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, name.to_owned()));
         }
         let dev = Dev {
             live: target.to_owned(),
+            size,
             inactive: None,
             io: Arc::default(),
             held: None,
@@ -173,10 +198,10 @@ impl DeviceSwitch for SimDevices {
         Ok(self.lock().devs.get(name).map(|d| d.live.clone()))
     }
 
-    async fn load(&self, name: &str, target: &Path, _size: u64) -> io::Result<()> {
+    async fn load(&self, name: &str, target: &Path, size: u64) -> io::Result<()> {
         let mut s = self.lock();
         let d = s.devs.get_mut(name).ok_or_else(|| no_device(name))?;
-        d.inactive = Some(target.to_owned());
+        d.inactive = Some((target.to_owned(), size));
         Ok(())
     }
 
@@ -188,7 +213,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn suspend(&self, name: &str) -> io::Result<()> {
-        let (io, _) = self.route(name)?;
+        let (io, _, _) = self.route(name)?;
         if self.is_suspended(name) {
             return Ok(());
         }
@@ -202,24 +227,39 @@ impl DeviceSwitch for SimDevices {
     async fn resume(&self, name: &str) -> io::Result<()> {
         let mut s = self.lock();
         let d = s.devs.get_mut(name).ok_or_else(|| no_device(name))?;
-        if let Some(t) = d.inactive.take() {
+        if let Some((t, size)) = d.inactive.take() {
             d.live = t;
+            d.size = size;
         }
         d.held = None;
         Ok(())
     }
 
     async fn attach_loop(&self, image: &Path) -> io::Result<PathBuf> {
-        self.fs.open(image, Open::Read).await?;
+        let cap = self.fs.open(image, Open::Read).await?.size().await?;
         let mut s = self.lock();
         s.next_loop += 1;
         let dev = PathBuf::from(format!("/dev/loop{}", s.next_loop));
-        s.loops.insert(dev.clone(), image.to_owned());
+        s.loops.insert(dev.clone(), (image.to_owned(), cap));
         Ok(dev)
     }
 
+    async fn refresh_loop(&self, device: &Path) -> io::Result<()> {
+        let image = self
+            .lock()
+            .loops
+            .get(device)
+            .map(|(p, _)| p.clone())
+            .ok_or_else(|| no_device(&device.display().to_string()))?;
+        let cap = self.fs.open(&image, Open::Read).await?.size().await?;
+        if let Some(l) = self.lock().loops.get_mut(device) {
+            l.1 = cap;
+        }
+        Ok(())
+    }
+
     async fn loop_image(&self, device: &Path) -> io::Result<Option<PathBuf>> {
-        Ok(self.lock().loops.get(device).cloned())
+        Ok(self.lock().loops.get(device).map(|(p, _)| p.clone()))
     }
 
     async fn bytes_written(&self, device: &Path) -> io::Result<u64> {

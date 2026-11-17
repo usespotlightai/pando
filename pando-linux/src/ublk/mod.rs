@@ -222,6 +222,12 @@ pub async fn daemon_dead(id: u32) -> io::Result<bool> {
     .await
 }
 
+/// Sets the size of started device `id` to `size` bytes, a multiple of 4 KiB. The volume it
+/// serves must already be that large. Needs Linux 6.16 or later.
+pub async fn resize(id: u32, size: u64) -> io::Result<()> {
+    blocking(move || Ctrl::open()?.update_size(id, size)).await
+}
+
 /// Stops device `id`, which ends its queues and fails the I/O ublk holds for a dead daemon.
 pub async fn stop(id: u32) -> io::Result<()> {
     blocking(move || Ctrl::open()?.cmd(ctrl::CMD_STOP_DEV, id, 0, None)).await

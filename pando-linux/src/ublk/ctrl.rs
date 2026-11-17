@@ -18,10 +18,12 @@ pub(crate) const CMD_SET_PARAMS: u32 = 0x08;
 pub(crate) const CMD_START_USER_RECOVERY: u32 = 0x10;
 pub(crate) const CMD_END_USER_RECOVERY: u32 = 0x11;
 pub(crate) const CMD_GET_FEATURES: u32 = 0x13;
+pub(crate) const CMD_UPDATE_SIZE: u32 = 0x15;
 
 pub(crate) const F_USER_RECOVERY: u64 = 1 << 3;
 pub(crate) const F_USER_RECOVERY_REISSUE: u64 = 1 << 4;
 pub(crate) const F_CMD_IOCTL_ENCODE: u64 = 1 << 6;
+pub(crate) const F_UPDATE_SIZE: u64 = 1 << 10;
 pub(crate) const F_NO_AUTO_PART_SCAN: u64 = 1 << 18;
 
 pub(crate) const STATE_QUIESCED: u16 = 2;
@@ -186,6 +188,18 @@ impl Ctrl {
         let mut b = encode_params(size, max_io);
         self.cmd(CMD_SET_PARAMS, id, 0, Some(&mut b))
     }
+
+    /// Sets the size of started device `id` to `size` bytes, a multiple of 512. Linux 6.16
+    /// and later.
+    pub(crate) fn update_size(&mut self, id: u32, size: u64) -> io::Result<()> {
+        if self.features() & F_UPDATE_SIZE == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this kernel cannot resize a ublk device; it needs Linux 6.16 or later",
+            ));
+        }
+        self.cmd(CMD_UPDATE_SIZE, id, size >> 9, None)
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +211,7 @@ mod tests {
         assert_eq!(op(CMD_ADD_DEV), 0xc0207504);
         assert_eq!(op(CMD_GET_DEV_INFO), 0x80207502);
         assert_eq!(op(CMD_GET_FEATURES), 0x80207513);
+        assert_eq!(op(CMD_UPDATE_SIZE), 0xc0207515);
     }
 
     #[test]

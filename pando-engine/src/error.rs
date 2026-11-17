@@ -22,6 +22,9 @@ pub enum Error {
     /// A write past the end of the volume.
     #[error("write beyond the end of the volume")]
     BeyondEnd,
+    /// A grow to a size below the branch's size: branches only grow.
+    #[error("the branch has {size} bytes and cannot shrink to {to}")]
+    Shrink { size: u64, to: u64 },
     #[error("{0}")]
     Corrupt(String),
     #[error("segment {0} already exists")]

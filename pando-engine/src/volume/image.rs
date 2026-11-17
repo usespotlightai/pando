@@ -13,6 +13,7 @@ use crate::Result;
 use crate::dedup::PreparedChunks;
 use crate::flight::bounded;
 use crate::ports::{CpuClass, LocalFile, LocalImage, on_cpu};
+use crate::tree::Tree;
 
 /// Chunks a copy or an absorb reads at once.
 pub(crate) const ABSORB_PARALLEL: usize = 16;
@@ -52,37 +53,33 @@ impl Volume {
         self.inner.mem.lock().expect("mem lock").track = None;
     }
 
-    fn uncommitted(&self) -> (BTreeSet<u64>, Entry) {
+    /// The chunks written but not committed, the current root, the root the branch opened
+    /// at as a root of the same tree, and that tree.
+    fn uncommitted(&self) -> (BTreeSet<u64>, Entry, Entry, Arc<Tree>) {
         let m = self.inner.mem.lock().expect("mem lock");
         let mut out: BTreeSet<u64> = m.dirty.keys().copied().collect();
         if let Some(f) = &m.flushing {
             out.extend(f.keys());
         }
-        (out, m.root)
+        (out, m.root, m.opened_now, m.tree.clone())
     }
 
-    /// The chunks that differ now from root `base`: committed changes and writes not committed
-    /// yet, in index order.
-    pub(crate) async fn changed_since(&self, base: &Entry) -> Result<Vec<u64>> {
-        let (mut out, root) = self.uncommitted();
-        let changed = self
-            .inner
-            .tree
-            .changed_leaves(base, &root, ABSORB_PARALLEL)
-            .await?;
+    /// The chunks that differ now from the root the branch opened at: committed changes and
+    /// writes not committed yet, in index order.
+    pub(crate) async fn changed_since_opened(&self) -> Result<Vec<u64>> {
+        let (mut out, root, opened, tree) = self.uncommitted();
+        let changed = tree.changed_leaves(&opened, &root, ABSORB_PARALLEL).await?;
         out.extend(changed.into_iter().map(|(idx, _)| idx));
         Ok(out.into_iter().collect())
     }
 
     /// The chunks that hold data now, in index order.
     pub(crate) async fn used_chunks(&self) -> Result<Vec<u64>> {
-        let (mut out, root) = self.uncommitted();
-        self.inner
-            .tree
-            .leaves(&root, |idx, _| {
-                out.insert(idx);
-            })
-            .await?;
+        let (mut out, root, _, tree) = self.uncommitted();
+        tree.leaves(&root, |idx, _| {
+            out.insert(idx);
+        })
+        .await?;
         Ok(out.into_iter().collect())
     }
 
@@ -94,7 +91,7 @@ impl Volume {
         idxs: &[u64],
         overwrite: bool,
     ) -> Result<usize> {
-        let size = self.inner.size;
+        let size = self.size();
         let mut futs = Vec::with_capacity(idxs.len());
         for &idx in idxs.iter().filter(|i| **i * CHUNK < size) {
             futs.push(async move {
@@ -126,8 +123,11 @@ impl Volume {
         path: &Path,
         idxs: &[u64],
     ) -> Result<usize> {
-        let size = self.inner.size;
-        let root = self.inner.root();
+        let (size, tree, root) = {
+            let m = self.inner.mem.lock().expect("mem lock");
+            (m.size, m.tree.clone(), m.root)
+        };
+        let tree = &tree;
         let mut futs = Vec::with_capacity(idxs.len());
         for &idx in idxs.iter().filter(|i| **i * CHUNK < size) {
             futs.push(async move {
@@ -137,7 +137,7 @@ impl Volume {
                 let full = got.len() == CHUNK_SIZE;
                 let mut buf = got.to_vec();
                 buf.resize(CHUNK_SIZE, 0);
-                let e = self.inner.tree.lookup(&root, idx, true).await?;
+                let e = tree.lookup(&root, idx, true).await?;
                 let (buf, h) = on_cpu(self.inner.cpu.as_ref(), CpuClass::Background, move || {
                     let h = (!is_zero(&buf)).then(|| Hash::of(&buf));
                     (buf, h)
@@ -176,14 +176,12 @@ impl Volume {
         f: &Arc<dyn LocalFile>,
         path: &Path,
     ) -> Result<usize> {
-        let (_, root) = self.uncommitted();
+        let (_, root, _, tree) = self.uncommitted();
         let mut cand = BTreeSet::new();
-        self.inner
-            .tree
-            .leaves(&root, |idx, _| {
-                cand.insert(idx);
-            })
-            .await?;
+        tree.leaves(&root, |idx, _| {
+            cand.insert(idx);
+        })
+        .await?;
         for x in image.extents(path).await? {
             if x.len > 0 {
                 cand.extend(x.logical / CHUNK..=(x.logical + x.len - 1) / CHUNK);

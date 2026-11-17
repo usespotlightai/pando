@@ -22,6 +22,8 @@ pub trait DeviceSwitch: Send + Sync + fmt::Debug {
     async fn resume(&self, name: &str) -> io::Result<()>;
     /// Binds a free loop device to `image` and returns the loop device.
     async fn attach_loop(&self, image: &Path) -> io::Result<PathBuf>;
+    /// Makes loop device `device` as large as its image is now.
+    async fn refresh_loop(&self, device: &Path) -> io::Result<()>;
     /// The image a loop device is bound to.
     async fn loop_image(&self, device: &Path) -> io::Result<Option<PathBuf>>;
     /// The bytes written to a device since it was created.
