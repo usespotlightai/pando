@@ -94,8 +94,8 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** The fork, cold-start, warm-start and agent-workload charts have results so far; the others fill in
-> as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> **Partly measured.** Every chart has results; SOCI, Nydus, ZeroFS, Amazon S3 Files and Archil
+> are not set up yet and fill in as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
 > [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
 > `bench/results/`.
 
@@ -260,7 +260,13 @@ repetition one `vitest` run failed, and it passed in the other two.
 
 ### Save
 
-After `npm ci`, time from the last write until another host can open the branch.
+After `npm ci`, time from the last write until another host can open the branch, and the bytes
+`npm ci`'s changes added to the store. Pando's time is unmount and `pando detach`, which uploads
+what changed since its last background snapshot and publishes the branch. JuiceFS uploads each
+file as it closes, so its save is a `sync` that finds nothing left, and the upload cost lands in
+`npm ci` itself: about 15 min on JuiceFS against 8 s on the others. tar uploads the whole
+workspace every time. EBS's bytes are the 512 KiB blocks the snapshot holds beyond the workspace
+snapshot. Three runs each.
 
 <!-- bench:save -->
 <picture>
@@ -273,21 +279,21 @@ After `npm ci`, time from the last write until another host can open the branch.
 
 | time to durable after npm ci | median | range |
 |---|---|---|
-| Pando | — | |
-| tar from S3 | — | |
-| Docker (overlayfs) | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| Pando | 4.94 s | 2.43 s to 7.68 s |
+| tar from S3 | 3.2 s | 3.17 s to 3.2 s |
+| Docker (overlayfs) | 41.1 s | 40.9 s to 41.2 s |
+| EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
+| JuiceFS | 2.76 ms | 2.5 ms to 3.52 ms |
 | ZeroFS (NBD) | — | |
 | Archil | — | |
 
 | uploaded after npm ci | median | range |
 |---|---|---|
-| Pando | — | |
-| tar from S3 | — | |
-| Docker (overlayfs) | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| Pando | 208 MiB | 207 MiB to 214 MiB |
+| tar from S3 | 323 MiB | 323 MiB to 323 MiB |
+| Docker (overlayfs) | 194 MiB | 194 MiB to 194 MiB |
+| EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |
+| JuiceFS | 732 MiB | 665 MiB to 785 MiB |
 | ZeroFS (NBD) | — | |
 | Archil | — | |
 
@@ -296,7 +302,12 @@ After `npm ci`, time from the last write until another host can open the branch.
 
 ### Raw I/O
 
-Direct I/O measured with fio on the device or mount.
+Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs each. Pando
+(ublk) comes out ahead of the local NVMe because its daemon keeps the branch in cache files read
+and written through the host's page cache: direct I/O skips the page cache of the device, not of
+the daemon, so these rows mostly measure memory. After handoff, reads go through device-mapper
+and a loop device to the image on the NVMe; writes are slow there, about 21 MB/s sequential,
+for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s.
 
 <!-- bench:fio -->
 <picture>
@@ -309,47 +320,47 @@ Direct I/O measured with fio on the device or mount.
 
 | 4 KiB random read, QD1 | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 11k | 10.4k to 11.1k |
+| Pando (ublk) | 109k | 108k to 110k |
+| Pando (after handoff) | 6.72k | 5.99k to 7.24k |
+| EBS gp3 | 1.54k | 1.54k to 1.6k |
+| JuiceFS | 6.37k | 5.98k to 6.58k |
 | ZeroFS (NBD) | — | |
 
 | 4 KiB random read, 4 x QD32 | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 269k | 269k to 269k |
+| Pando (ublk) | 814k | 813k to 817k |
+| Pando (after handoff) | 237k | 233k to 265k |
+| EBS gp3 | 2.99k | 2.99k to 3k |
+| JuiceFS | 76.7k | 76.4k to 77.3k |
 | ZeroFS (NBD) | — | |
 
 | 4 KiB random write, 4 x QD32 | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 134k | 134k to 134k |
+| Pando (ublk) | 467k | 455k to 481k |
+| Pando (after handoff) | 2.47k | 2.14k to 5.09k |
+| EBS gp3 | 2.99k | 2.99k to 3k |
+| JuiceFS | 484 | 456 to 493 |
 | ZeroFS (NBD) | — | |
 
 | 1 MiB sequential read | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
+| Pando (ublk) | 6,430 MB/s | 6,419 MB/s to 6,461 MB/s |
+| Pando (after handoff) | 1,849 MB/s | 1,826 MB/s to 1,856 MB/s |
+| EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
+| JuiceFS | 1,611 MB/s | 1,576 MB/s to 1,660 MB/s |
 | ZeroFS (NBD) | — | |
 
 | 1 MiB sequential write | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 908 MB/s | 908 MB/s to 908 MB/s |
+| Pando (ublk) | 1,689 MB/s | 1,523 MB/s to 1,806 MB/s |
+| Pando (after handoff) | 21 MB/s | 16 MB/s to 24 MB/s |
+| EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
+| JuiceFS | 1,328 MB/s | 1,317 MB/s to 1,330 MB/s |
 | ZeroFS (NBD) | — | |
 
 </details>
@@ -357,10 +368,13 @@ Direct I/O measured with fio on the device or mount.
 
 ### Crash
 
-The storage daemon is killed with `kill -9` during writes, then the branch is opened on a fresh host.
+The storage daemon is killed with `kill -9` while a writer writes and fsyncs 256 KiB files, and is
+restarted at once (`pando attach --recover`, or a new JuiceFS mount). The branch is then opened
+with a new cache and state directory, sharing nothing with the first, its file system checked
+and every acknowledged file read back. Medians of three runs.
 
 | System | Failed writes | Stall | fsck | Files correct |
 |---|---|---|---|---|
-| Pando | — | — | — | — |
-| JuiceFS | — | — | — | — |
+| Pando | 0 | 0.12 s | clean | all acknowledged (1,403 to 1,438 per run) |
+| JuiceFS | 2 | 0.23 s | clean | all acknowledged (264 to 270 per run) |
 | ZeroFS | — | — | — | — |

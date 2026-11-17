@@ -1,0 +1,76 @@
+system,workspace,measure,rep,value,unit,notes
+local NVMe,small,fio.randread_qd1,1,11052.2,IOPS,rep 1
+local NVMe,small,fio.randread_qd32,1,268804,IOPS,rep 1
+local NVMe,small,fio.randwrite_qd32,1,134257,IOPS,rep 1
+local NVMe,small,fio.seqread,1,1910.44,MB/s,rep 1
+local NVMe,small,fio.seqwrite,1,907.763,MB/s,rep 1
+local NVMe,small,fio.randread_qd1,2,10967.1,IOPS,rep 2
+local NVMe,small,fio.randread_qd32,2,268804,IOPS,rep 2
+local NVMe,small,fio.randwrite_qd32,2,134257,IOPS,rep 2
+local NVMe,small,fio.seqread,2,1910.44,MB/s,rep 2
+local NVMe,small,fio.seqwrite,2,907.763,MB/s,rep 2
+local NVMe,small,fio.randread_qd1,3,10406,IOPS,rep 3
+local NVMe,small,fio.randread_qd32,3,268804,IOPS,rep 3
+local NVMe,small,fio.randwrite_qd32,3,134257,IOPS,rep 3
+local NVMe,small,fio.seqread,3,1910.44,MB/s,rep 3
+local NVMe,small,fio.seqwrite,3,907.763,MB/s,rep 3
+Pando (ublk),small,fio.randread_qd1,1,108525,IOPS,rep 1
+Pando (ublk),small,fio.randread_qd32,1,812722,IOPS,rep 1
+Pando (ublk),small,fio.randwrite_qd32,1,480729,IOPS,rep 1
+Pando (ublk),small,fio.seqread,1,6430.22,MB/s,rep 1
+Pando (ublk),small,fio.seqwrite,1,1806.13,MB/s,rep 1
+Pando (ublk),small,fio.randread_qd1,2,109738,IOPS,rep 2
+Pando (ublk),small,fio.randread_qd32,2,816973,IOPS,rep 2
+Pando (ublk),small,fio.randwrite_qd32,2,455361,IOPS,rep 2
+Pando (ublk),small,fio.seqread,2,6418.58,MB/s,rep 2
+Pando (ublk),small,fio.seqwrite,2,1688.82,MB/s,rep 2
+Pando (ublk),small,fio.randread_qd1,3,107817,IOPS,rep 3
+Pando (ublk),small,fio.randread_qd32,3,813544,IOPS,rep 3
+Pando (ublk),small,fio.randwrite_qd32,3,467322,IOPS,rep 3
+Pando (ublk),small,fio.seqread,3,6460.52,MB/s,rep 3
+Pando (ublk),small,fio.seqwrite,3,1523.45,MB/s,rep 3
+Pando (after handoff),small,fio.randread_qd1,1,5989.7,IOPS,rep 1
+Pando (after handoff),small,fio.randread_qd32,1,265070,IOPS,rep 1
+Pando (after handoff),small,fio.randwrite_qd32,1,5093.12,IOPS,rep 1
+Pando (after handoff),small,fio.seqread,1,1855.99,MB/s,rep 1
+Pando (after handoff),small,fio.seqwrite,1,24.0353,MB/s,rep 1
+Pando (after handoff),small,fio.randread_qd1,2,6719.36,IOPS,rep 2
+Pando (after handoff),small,fio.randread_qd32,2,233458,IOPS,rep 2
+Pando (after handoff),small,fio.randwrite_qd32,2,2143.15,IOPS,rep 2
+Pando (after handoff),small,fio.seqread,2,1825.64,MB/s,rep 2
+Pando (after handoff),small,fio.seqwrite,2,15.7307,MB/s,rep 2
+Pando (after handoff),small,fio.randread_qd1,3,7240.54,IOPS,rep 3
+Pando (after handoff),small,fio.randread_qd32,3,236814,IOPS,rep 3
+Pando (after handoff),small,fio.randwrite_qd32,3,2472.83,IOPS,rep 3
+Pando (after handoff),small,fio.seqread,3,1848.86,MB/s,rep 3
+Pando (after handoff),small,fio.seqwrite,3,20.8169,MB/s,rep 3
+EBS gp3,small,fio.randread_qd1,1,1535.07,IOPS,rep 1
+EBS gp3,small,fio.randread_qd32,1,2994.51,IOPS,rep 1
+EBS gp3,small,fio.randwrite_qd32,1,2994.76,IOPS,rep 1
+EBS gp3,small,fio.seqread,1,131.144,MB/s,rep 1
+EBS gp3,small,fio.seqwrite,1,131.144,MB/s,rep 1
+EBS gp3,small,fio.randread_qd1,2,1537.37,IOPS,rep 2
+EBS gp3,small,fio.randread_qd32,2,2994.51,IOPS,rep 2
+EBS gp3,small,fio.randwrite_qd32,2,3002.69,IOPS,rep 2
+EBS gp3,small,fio.seqread,2,131.144,MB/s,rep 2
+EBS gp3,small,fio.seqwrite,2,131.144,MB/s,rep 2
+EBS gp3,small,fio.randread_qd1,3,1603.57,IOPS,rep 3
+EBS gp3,small,fio.randread_qd32,3,2997.4,IOPS,rep 3
+EBS gp3,small,fio.randwrite_qd32,3,2993.41,IOPS,rep 3
+EBS gp3,small,fio.seqread,3,131.144,MB/s,rep 3
+EBS gp3,small,fio.seqwrite,3,131.144,MB/s,rep 3
+JuiceFS,small,fio.randread_qd1,1,6371.23,IOPS,rep 1
+JuiceFS,small,fio.randread_qd32,1,77261,IOPS,rep 1
+JuiceFS,small,fio.randwrite_qd32,1,493.288,IOPS,rep 1
+JuiceFS,small,fio.seqread,1,1659.55,MB/s,rep 1
+JuiceFS,small,fio.seqwrite,1,1330,MB/s,rep 1
+JuiceFS,small,fio.randread_qd1,2,6583.87,IOPS,rep 2
+JuiceFS,small,fio.randread_qd32,2,76681.9,IOPS,rep 2
+JuiceFS,small,fio.randwrite_qd32,2,484.349,IOPS,rep 2
+JuiceFS,small,fio.seqread,2,1575.98,MB/s,rep 2
+JuiceFS,small,fio.seqwrite,2,1328.11,MB/s,rep 2
+JuiceFS,small,fio.randread_qd1,3,5977.75,IOPS,rep 3
+JuiceFS,small,fio.randread_qd32,3,76357.3,IOPS,rep 3
+JuiceFS,small,fio.randwrite_qd32,3,456.322,IOPS,rep 3
+JuiceFS,small,fio.seqread,3,1611.37,MB/s,rep 3
+JuiceFS,small,fio.seqwrite,3,1317.16,MB/s,rep 3

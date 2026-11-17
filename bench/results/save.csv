@@ -1,0 +1,46 @@
+system,workspace,measure,rep,value,unit,notes
+Pando,small,save.npm_ci,1,7.88145,s,"rep 1, exit 0"
+Pando,small,save.time,1,7.68257,s,rep 1
+Pando,small,save.uploaded,1,2.24781e+08,B,rep 1
+Pando,small,save.npm_ci,2,7.68085,s,"rep 2, exit 0"
+Pando,small,save.time,2,4.94184,s,rep 2
+Pando,small,save.uploaded,2,2.16995e+08,B,rep 2
+Pando,small,save.npm_ci,3,7.58031,s,"rep 3, exit 0"
+Pando,small,save.time,3,2.43177,s,rep 3
+Pando,small,save.uploaded,3,2.1851e+08,B,rep 3
+tar from S3,small,save.npm_ci,1,7.93094,s,"rep 1, exit 0"
+tar from S3,small,save.time,1,3.19701,s,rep 1
+tar from S3,small,save.uploaded,1,3.39025e+08,B,rep 1
+tar from S3,small,save.npm_ci,2,7.87926,s,"rep 2, exit 0"
+tar from S3,small,save.time,2,3.17243,s,rep 2
+tar from S3,small,save.uploaded,2,3.39019e+08,B,rep 2
+tar from S3,small,save.npm_ci,3,8.13162,s,"rep 3, exit 0"
+tar from S3,small,save.time,3,3.20343,s,rep 3
+tar from S3,small,save.uploaded,3,3.38911e+08,B,rep 3
+Docker (overlayfs),small,save.npm_ci,1,7.68049,s,"rep 1, exit 0"
+Docker (overlayfs),small,save.time,1,41.0584,s,rep 1
+Docker (overlayfs),small,save.uploaded,1,2.0332e+08,B,rep 1
+Docker (overlayfs),small,save.npm_ci,2,7.93115,s,"rep 2, exit 0"
+Docker (overlayfs),small,save.time,2,40.879,s,rep 2
+Docker (overlayfs),small,save.uploaded,2,2.03321e+08,B,rep 2
+Docker (overlayfs),small,save.npm_ci,3,7.92999,s,"rep 3, exit 0"
+Docker (overlayfs),small,save.time,3,41.1546,s,rep 3
+Docker (overlayfs),small,save.uploaded,3,2.0332e+08,B,rep 3
+EBS snapshot to volume,small,save.npm_ci,1,17.9447,s,"rep 1, exit 0"
+EBS snapshot to volume,small,save.time,1,102.13,s,rep 1
+EBS snapshot to volume,small,save.uploaded,1,1.1225e+09,B,rep 1
+EBS snapshot to volume,small,save.npm_ci,2,24.218,s,"rep 2, exit 0"
+EBS snapshot to volume,small,save.time,2,83.7725,s,rep 2
+EBS snapshot to volume,small,save.uploaded,2,1.12512e+09,B,rep 2
+EBS snapshot to volume,small,save.npm_ci,3,21.6112,s,"rep 3, exit 0"
+EBS snapshot to volume,small,save.time,3,93.8958,s,rep 3
+EBS snapshot to volume,small,save.uploaded,3,1.12512e+09,B,rep 3
+JuiceFS,small,save.npm_ci,1,568.663,s,"rep 1, exit 0"
+JuiceFS,small,save.time,1,0.00351612,s,rep 1
+JuiceFS,small,save.uploaded,1,8.23023e+08,B,rep 1
+JuiceFS,small,save.npm_ci,2,572.914,s,"rep 2, exit 0"
+JuiceFS,small,save.time,2,0.00249781,s,rep 2
+JuiceFS,small,save.uploaded,2,6.96791e+08,B,rep 2
+JuiceFS,small,save.npm_ci,3,562.087,s,"rep 3, exit 0"
+JuiceFS,small,save.time,3,0.00276354,s,rep 3
+JuiceFS,small,save.uploaded,3,7.67977e+08,B,rep 3

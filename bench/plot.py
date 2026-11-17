@@ -134,6 +134,8 @@ def fmt(v, kind):
     if kind == "ratio":
         return f"{v:.2f}x"
     if kind == "iops":
+        if v >= 1e6:
+            return f"{v / 1e6:.3g}M"
         return f"{v / 1e3:.3g}k" if v >= 1e3 else f"{v:.0f}"
     return f"{v:,.0f} MB/s"
 
