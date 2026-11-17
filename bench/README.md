@@ -78,6 +78,7 @@ base where it would in production, and every branch is opened on the bench host:
 | System | Base kept in | Opening a branch |
 |---|---|---|
 | Pando | the bucket, after `pando import` | `pando branch`, `pando attach` as a ublk device, mount |
+| Pando (handoff) | the bucket, after `pando import`; on a warm host also the host's base image (`pando base`) | as Pando, with `--dm` and `--images`: the device switches to a local image, a reflink clone of the base image, once the branch is local |
 | tar from S3 | a zstd tar in the bucket | download and extract to the local NVMe |
 | image download from S3 | a zstd ext4 image in the bucket | download, decompress, loop-mount |
 | Docker (overlayfs) | an image in ECR: Ubuntu with git, plus the workspace | `docker pull`, `docker run` |
@@ -92,7 +93,10 @@ base where it would in production, and every branch is opened on the bench host:
   prefetches them on the next mount, so its first repetition, with no recording yet, is slower
   than the rest.
 - **warm** first opens a sibling branch and runs `git status` in it, so the system's cache,
-  image or base is on the host, then drops the page cache and measures the same way.
+  image or base is on the host, then drops the page cache and measures the same way. Pando
+  (handoff) also builds the host's base image of the root, as `pando follow` would.
+- Commands run in their own process group, killed when the command ends, so nothing they leave
+  behind holds the mount when the branch closes.
 - **replay** opens a fresh branch on a warm host, drops the page cache and runs the 14 commands
   of the agent workload, each timed. `replay.total` is the sum as a ratio to native ext4 in the
   same run, on a 64 GiB ext4 file system of its own on the local NVMe (`/native`).

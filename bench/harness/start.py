@@ -17,6 +17,7 @@ branches on this host. Commands run as root with the workspace's Node.js on PATH
 import csv
 import os
 import shutil
+import signal
 import statistics
 import subprocess
 import time
@@ -77,8 +78,16 @@ def imds(path):
 
 
 def unmount(path):
+    """Unmounts path, killing what still holds it after 10 s. Raises if it stays mounted."""
+    for _ in range(20):
+        if not os.path.ismount(path):
+            return
+        subprocess.run(["umount", str(path)], stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+    run("fuser", "-km", path, check=False)
+    time.sleep(1)
     if os.path.ismount(path):
-        run("umount", path, check=False)
+        run("umount", path)
 
 
 class Workspace:
@@ -104,13 +113,23 @@ class Workspace:
         raise NotImplementedError
 
     def exec(self, i, cwd, cmd):
-        """Runs a shell command in branch i; returns its exit code."""
-        p = subprocess.run(["bash", "-c", f"{cmd} >/dev/null 2>&1"], cwd=self.root(i) / cwd,
-                           env=dict(os.environ, **shell_env()), timeout=CMD_TIMEOUT)
-        return p.returncode
+        """Runs a shell command in branch i, then kills what it left running; returns its exit code."""
+        p = subprocess.Popen(["bash", "-c", f"{cmd} >/dev/null 2>&1"], cwd=self.root(i) / cwd,
+                             env=dict(os.environ, **shell_env()), start_new_session=True)
+        try:
+            return p.wait(timeout=CMD_TIMEOUT)
+        finally:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
 
     def close(self, i):
         pass
+
+    def warmed(self):
+        """Brings the host to the state it reaches after running a branch of the base."""
 
     def teardown(self):
         pass
@@ -456,6 +475,7 @@ class Pando(Workspace):
     name = "Pando"
     prefix = "pando-bench-start"
     dir = DIR / "pando"
+    handoff = False
 
     def unavailable(self):
         return fork.Pando().unavailable()
@@ -482,31 +502,45 @@ class Pando(Workspace):
     def root(self, i):
         return self.dir / f"m{i}"
 
+    def _dm(self, i):
+        return f"pando-bench-b{i}"
+
     def empty(self):
-        shutil.rmtree(self.dir / "cache", ignore_errors=True)
-        shutil.rmtree(self.dir / "state", ignore_errors=True)
+        for d in ("cache", "state", "images"):
+            shutil.rmtree(self.dir / d, ignore_errors=True)
+
+    def warmed(self):
+        if self.handoff:
+            self._pando("base", "base", "--dir", self.dir / "images" / "bases", capture=True)
+
+    def _mounted(self, i):
+        return f"/dev/mapper/{self._dm(i)}" if self.handoff else self._device(i)
 
     def open(self, i):
         self._pando("branch", "base", f"b{i}", capture=True)
         out = open(self.dir / "attach.log", "a")
-        p = subprocess.Popen(self._args() + ["attach", f"b{i}", "--device", self._device(i),
-                                             "--state", str(self.dir / "state")],
+        args = ["attach", f"b{i}", "--device", self._device(i), "--state", str(self.dir / "state")]
+        if self.handoff:
+            args += ["--dm", self._dm(i), "--images", str(self.dir / "images")]
+        p = subprocess.Popen(self._args() + args,
                              env=dict(os.environ, **self.keys), stdout=subprocess.PIPE, stderr=out, text=True)
         self.procs[i] = (p, out)
         for line in p.stdout:
             out.write(line)
             if line.startswith("attached "):
+                out.flush()
                 break
         else:
             raise SystemExit(f"pando attach b{i} exited with {p.wait()}")
         self.root(i).mkdir(exist_ok=True)
-        run("mount", self._device(i), self.root(i))
+        run("mount", self._mounted(i), self.root(i))
 
     def close(self, i):
         unmount(self.root(i))
         p, out = self.procs.pop(i, (None, None))
         if os.path.exists(self._device(i)):
-            self._pando("detach", "--device", self._device(i), capture=True, check=False)
+            dm = ["--dm", self._dm(i)] if self.handoff else []
+            self._pando("detach", "--device", self._device(i), *dm, capture=True, check=False)
         if p:
             out.write(p.stdout.read())
             if p.wait(timeout=600) != 0:
@@ -521,10 +555,21 @@ class Pando(Workspace):
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
-SYSTEMS = {"native": Native, "pando": Pando, "tar": Tar, "image": Image, "docker": Docker, "ebs": Ebs,
+class PandoHandoff(Pando):
+    """Pando as the fast-start path runs it: the ublk device under a device-mapper device that
+    switches to a local image once the branch is local, the image a reflink clone of the host's
+    base image of the branch's root. A warm host has built that base image."""
+
+    name = "Pando (handoff)"
+    prefix = "pando-bench-handoff"
+    dir = DIR / "pando-handoff"
+    handoff = True
+
+
+SYSTEMS = {"native": Native, "pando": Pando, "pando-handoff": PandoHandoff, "tar": Tar, "image": Image, "docker": Docker, "ebs": Ebs,
            "juicefs": JuiceFS, "reflink": Reflink}
-STARTS = ["pando", "tar", "image", "docker", "ebs", "juicefs", "reflink"]
-REPLAYS = ["native", "pando", "image", "docker", "ebs", "juicefs"]
+STARTS = ["pando", "pando-handoff", "tar", "image", "docker", "ebs", "juicefs", "reflink"]
+REPLAYS = ["native", "pando", "pando-handoff", "image", "docker", "ebs", "juicefs"]
 
 
 def timed_call(f, *args):
@@ -552,6 +597,7 @@ def warm_up(s):
     s.open(0)
     s.exec(0, ".", "git status")
     s.close(0)
+    s.warmed()
 
 
 def replay_once(s, i, rep, out):

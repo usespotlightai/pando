@@ -1,32 +1,49 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="388" viewBox="0 0 760 388" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="432" viewBox="0 0 760 432" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img">
   <title>Warm start: host that ran a sibling branch</title>
   <desc>Bar chart of the time to the first git status on a host that already ran a branch of the same base</desc>
   <text x="0" y="20" font-size="16" font-weight="600" fill="#f0f6fc">Warm start: host that ran a sibling branch</text>
-  <text x="0" y="52" font-size="13" fill="#9198a1">fork, mount and git status done (lower is better)</text>
-  <line x1="212" y1="62" x2="212" y2="374" stroke="#3d444d" stroke-width="1"/>
-  <text x="202" y="79.0" font-size="12" fill="#f0f6fc" text-anchor="end" font-weight="600">Pando</text>
-  <text x="220" y="79.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="105.0" font-size="12" fill="#f0f6fc" text-anchor="end">tar from S3</text>
-  <text x="220" y="105.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="131.0" font-size="12" fill="#f0f6fc" text-anchor="end">image download from S3</text>
-  <text x="220" y="131.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="157.0" font-size="12" fill="#f0f6fc" text-anchor="end">Docker (overlayfs)</text>
-  <text x="220" y="157.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="183.0" font-size="12" fill="#f0f6fc" text-anchor="end">SOCI lazy pull</text>
-  <text x="220" y="183.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="209.0" font-size="12" fill="#f0f6fc" text-anchor="end">Nydus lazy pull</text>
-  <text x="220" y="209.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
+  <text x="0" y="52" font-size="13" fill="#9198a1">fork, mount and git status done (lower is better, log scale)</text>
+  <line x1="212.0" y1="62" x2="212.0" y2="400" stroke="#21262d" stroke-width="1"/>
+  <text x="212.0" y="414" font-size="11" fill="#9198a1" text-anchor="middle">100 ms</text>
+  <line x1="366.7" y1="62" x2="366.7" y2="400" stroke="#21262d" stroke-width="1"/>
+  <text x="366.7" y="414" font-size="11" fill="#9198a1" text-anchor="middle">1 s</text>
+  <line x1="521.3" y1="62" x2="521.3" y2="400" stroke="#21262d" stroke-width="1"/>
+  <text x="521.3" y="414" font-size="11" fill="#9198a1" text-anchor="middle">10 s</text>
+  <line x1="676.0" y1="62" x2="676.0" y2="400" stroke="#21262d" stroke-width="1"/>
+  <text x="676.0" y="414" font-size="11" fill="#9198a1" text-anchor="middle">100 s</text>
+  <line x1="212" y1="62" x2="212" y2="400" stroke="#3d444d" stroke-width="1"/>
+  <text x="202" y="79.0" font-size="12" fill="#f0f6fc" text-anchor="end">XFS reflink (local)</text>
+  <path d="M212,68.0 h112.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-112.1 z" fill="#656c76"><title>XFS reflink (local): 563 ms (range 410 ms to 613 ms)</title></path>
+  <text x="334.1" y="79.0" font-size="12" fill="#9198a1">563 ms</text>
+  <text x="202" y="105.0" font-size="12" fill="#f0f6fc" text-anchor="end">Docker (overlayfs)</text>
+  <path d="M212,94.0 h166.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-166.8 z" fill="#656c76"><title>Docker (overlayfs): 1.27 s (range 1.23 s to 1.31 s)</title></path>
+  <text x="388.8" y="105.0" font-size="12" fill="#9198a1">1.27 s</text>
+  <text x="202" y="131.0" font-size="12" fill="#f0f6fc" text-anchor="end" font-weight="600">Pando</text>
+  <path d="M212,120.0 h168.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-168.0 z" fill="#4493f8"><title>Pando: 1.29 s (range 1.04 s to 1.35 s)</title></path>
+  <text x="390.0" y="131.0" font-size="12" fill="#9198a1">1.29 s</text>
+  <text x="202" y="157.0" font-size="12" fill="#f0f6fc" text-anchor="end" font-weight="600">Pando (handoff)</text>
+  <path d="M212,146.0 h190.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-190.0 z" fill="#4493f8"><title>Pando (handoff): 1.8 s (range 1.77 s to 1.87 s)</title></path>
+  <text x="412.0" y="157.0" font-size="12" fill="#9198a1">1.8 s</text>
+  <text x="202" y="183.0" font-size="12" fill="#f0f6fc" text-anchor="end">tar from S3</text>
+  <path d="M212,172.0 h212.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-212.6 z" fill="#656c76"><title>tar from S3: 2.51 s (range 2.5 s to 2.52 s)</title></path>
+  <text x="434.6" y="183.0" font-size="12" fill="#9198a1">2.51 s</text>
+  <text x="202" y="209.0" font-size="12" fill="#f0f6fc" text-anchor="end">image download from S3</text>
+  <path d="M212,198.0 h219.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-219.9 z" fill="#656c76"><title>image download from S3: 2.8 s (range 2.8 s to 3.12 s)</title></path>
+  <text x="441.9" y="209.0" font-size="12" fill="#9198a1">2.8 s</text>
   <text x="202" y="235.0" font-size="12" fill="#f0f6fc" text-anchor="end">EBS snapshot to volume</text>
-  <text x="220" y="235.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
+  <path d="M212,224.0 h312.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-312.0 z" fill="#656c76"><title>EBS snapshot to volume: 11 s (range 10.5 s to 11.4 s)</title></path>
+  <text x="534.0" y="235.0" font-size="12" fill="#9198a1">11 s</text>
   <text x="202" y="261.0" font-size="12" fill="#f0f6fc" text-anchor="end">JuiceFS</text>
-  <text x="220" y="261.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="287.0" font-size="12" fill="#f0f6fc" text-anchor="end">ZeroFS (NBD)</text>
+  <path d="M212,250.0 h347.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-347.7 z" fill="#656c76"><title>JuiceFS: 18.8 s (range 18.4 s to 19.1 s)</title></path>
+  <text x="569.7" y="261.0" font-size="12" fill="#9198a1">18.8 s</text>
+  <text x="202" y="287.0" font-size="12" fill="#f0f6fc" text-anchor="end">SOCI lazy pull</text>
   <text x="220" y="287.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="313.0" font-size="12" fill="#f0f6fc" text-anchor="end">Amazon S3 Files</text>
+  <text x="202" y="313.0" font-size="12" fill="#f0f6fc" text-anchor="end">Nydus lazy pull</text>
   <text x="220" y="313.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="339.0" font-size="12" fill="#f0f6fc" text-anchor="end">Archil</text>
+  <text x="202" y="339.0" font-size="12" fill="#f0f6fc" text-anchor="end">ZeroFS (NBD)</text>
   <text x="220" y="339.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="202" y="365.0" font-size="12" fill="#f0f6fc" text-anchor="end">XFS reflink (local)</text>
+  <text x="202" y="365.0" font-size="12" fill="#f0f6fc" text-anchor="end">Amazon S3 Files</text>
   <text x="220" y="365.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
-  <text x="760" y="20" font-size="12" fill="#9198a1" text-anchor="end">placeholder: no results yet</text>
+  <text x="202" y="391.0" font-size="12" fill="#f0f6fc" text-anchor="end">Archil</text>
+  <text x="220" y="391.0" font-size="12" font-style="italic" fill="#9198a1">not measured yet</text>
 </svg>

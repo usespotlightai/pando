@@ -34,6 +34,7 @@ THEMES = {
 }
 FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
 HIGHLIGHT = "Pando"
+HANDOFF = "Pando (handoff)"
 
 # Storage stand-ins, named as in bench/README.md.
 NATIVE = "native ext4 (NVMe)"
@@ -49,7 +50,7 @@ S3F = "Amazon S3 Files"
 ARCHIL = "Archil"
 REFLINK = "XFS reflink (local)"
 
-REMOTE = [HIGHLIGHT, TAR, IMAGE, OCI, SOCI, NYDUS, EBS, JFS, ZFS0, S3F, ARCHIL]
+REMOTE = [HIGHLIGHT, HANDOFF, TAR, IMAGE, OCI, SOCI, NYDUS, EBS, JFS, ZFS0, S3F, ARCHIL]
 FORKABLE = [HIGHLIGHT, OCI, EBS, JFS, ZFS0, ARCHIL, REFLINK]
 LOCAL_ONLY = {REFLINK: "local only"}
 
@@ -85,7 +86,7 @@ CHARTS = {
         title="Agent workload: 14 commands, vs native ext4",
         alt="Bar chart of each system's total time for the agent command replay as a ratio to native ext4",
         panels=[panel("replay.total", "total time as a ratio to native (1.00x)", "x", scale="linear",
-                      systems=[NATIVE, HIGHLIGHT, IMAGE, OCI, NYDUS, EBS, JFS, ZFS0, S3F, ARCHIL], ref=1.0)]),
+                      systems=[NATIVE, HIGHLIGHT, HANDOFF, IMAGE, OCI, NYDUS, EBS, JFS, ZFS0, S3F, ARCHIL], ref=1.0)]),
     "save": dict(
         title="Save: last write to readable on another host",
         alt="Bar chart of the time and bytes each system needs to make a branch durable after npm ci",

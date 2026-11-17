@@ -1,0 +1,121 @@
+system,workspace,measure,rep,value,unit,notes
+Pando,small,warm.git_status,1,1.22285,s,rep 1
+Pando,small,warm.open,1,0.757823,s,rep 1
+Pando,small,warm.status,1,0.465032,s,rep 1
+Pando,small,warm.git_status,2,1.3532,s,rep 2
+Pando,small,warm.open,2,0.887358,s,rep 2
+Pando,small,warm.status,2,0.46584,s,rep 2
+Pando,small,warm.git_status,3,1.03993,s,rep 3
+Pando,small,warm.open,3,0.774728,s,rep 3
+Pando,small,warm.status,3,0.265198,s,rep 3
+Pando,small,warm.git_status,4,1.30409,s,rep 4
+Pando,small,warm.open,4,0.8384,s,rep 4
+Pando,small,warm.status,4,0.465689,s,rep 4
+Pando,small,warm.git_status,5,1.29367,s,rep 5
+Pando,small,warm.open,5,0.827785,s,rep 5
+Pando,small,warm.status,5,0.465886,s,rep 5
+image download from S3,small,warm.git_status,1,3.11918,s,rep 1
+image download from S3,small,warm.open,1,2.70403,s,rep 1
+image download from S3,small,warm.status,1,0.415154,s,rep 1
+image download from S3,small,warm.git_status,2,2.80359,s,rep 2
+image download from S3,small,warm.open,2,2.38876,s,rep 2
+image download from S3,small,warm.status,2,0.414833,s,rep 2
+image download from S3,small,warm.git_status,3,2.79705,s,rep 3
+image download from S3,small,warm.open,3,2.38203,s,rep 3
+image download from S3,small,warm.status,3,0.41502,s,rep 3
+image download from S3,small,warm.git_status,4,2.80231,s,rep 4
+image download from S3,small,warm.open,4,2.38723,s,rep 4
+image download from S3,small,warm.status,4,0.415077,s,rep 4
+image download from S3,small,warm.git_status,5,2.86413,s,rep 5
+image download from S3,small,warm.open,5,2.39909,s,rep 5
+image download from S3,small,warm.status,5,0.465039,s,rep 5
+Docker (overlayfs),small,warm.git_status,1,1.30248,s,rep 1
+Docker (overlayfs),small,warm.open,1,0.586395,s,rep 1
+Docker (overlayfs),small,warm.status,1,0.716087,s,rep 1
+Docker (overlayfs),small,warm.git_status,2,1.31395,s,rep 2
+Docker (overlayfs),small,warm.open,2,0.598563,s,rep 2
+Docker (overlayfs),small,warm.status,2,0.715391,s,rep 2
+Docker (overlayfs),small,warm.git_status,3,1.27223,s,rep 3
+Docker (overlayfs),small,warm.open,3,0.60695,s,rep 3
+Docker (overlayfs),small,warm.status,3,0.66528,s,rep 3
+Docker (overlayfs),small,warm.git_status,4,1.24828,s,rep 4
+Docker (overlayfs),small,warm.open,4,0.582836,s,rep 4
+Docker (overlayfs),small,warm.status,4,0.665442,s,rep 4
+Docker (overlayfs),small,warm.git_status,5,1.22924,s,rep 5
+Docker (overlayfs),small,warm.open,5,0.563913,s,rep 5
+Docker (overlayfs),small,warm.status,5,0.665326,s,rep 5
+EBS snapshot to volume,small,warm.git_status,1,10.5915,s,rep 1
+EBS snapshot to volume,small,warm.open,1,5.61659,s,rep 1
+EBS snapshot to volume,small,warm.status,1,4.97493,s,rep 1
+EBS snapshot to volume,small,warm.git_status,2,11.047,s,rep 2
+EBS snapshot to volume,small,warm.open,2,5.61995,s,rep 2
+EBS snapshot to volume,small,warm.status,2,5.42709,s,rep 2
+EBS snapshot to volume,small,warm.git_status,3,11.0656,s,rep 3
+EBS snapshot to volume,small,warm.open,3,5.63904,s,rep 3
+EBS snapshot to volume,small,warm.status,3,5.42657,s,rep 3
+EBS snapshot to volume,small,warm.git_status,4,10.482,s,rep 4
+EBS snapshot to volume,small,warm.open,4,5.50456,s,rep 4
+EBS snapshot to volume,small,warm.status,4,4.97741,s,rep 4
+EBS snapshot to volume,small,warm.git_status,5,11.3557,s,rep 5
+EBS snapshot to volume,small,warm.open,5,5.57912,s,rep 5
+EBS snapshot to volume,small,warm.status,5,5.77661,s,rep 5
+JuiceFS,small,warm.git_status,1,18.4109,s,rep 1
+JuiceFS,small,warm.open,1,12.5332,s,rep 1
+JuiceFS,small,warm.status,1,5.8777,s,rep 1
+JuiceFS,small,warm.git_status,2,18.6168,s,rep 2
+JuiceFS,small,warm.open,2,12.8385,s,rep 2
+JuiceFS,small,warm.status,2,5.77832,s,rep 2
+JuiceFS,small,warm.git_status,3,18.7865,s,rep 3
+JuiceFS,small,warm.open,3,12.9554,s,rep 3
+JuiceFS,small,warm.status,3,5.83103,s,rep 3
+JuiceFS,small,warm.git_status,4,19.1124,s,rep 4
+JuiceFS,small,warm.open,4,13.1346,s,rep 4
+JuiceFS,small,warm.status,4,5.97777,s,rep 4
+JuiceFS,small,warm.git_status,5,18.9714,s,rep 5
+JuiceFS,small,warm.open,5,13.1413,s,rep 5
+JuiceFS,small,warm.status,5,5.83011,s,rep 5
+XFS reflink (local),small,warm.git_status,1,0.562931,s,rep 1
+XFS reflink (local),small,warm.open,1,0.0475648,s,rep 1
+XFS reflink (local),small,warm.status,1,0.515366,s,rep 1
+XFS reflink (local),small,warm.git_status,2,0.563476,s,rep 2
+XFS reflink (local),small,warm.open,2,0.0478742,s,rep 2
+XFS reflink (local),small,warm.status,2,0.515602,s,rep 2
+XFS reflink (local),small,warm.git_status,3,0.612804,s,rep 3
+XFS reflink (local),small,warm.open,3,0.0467837,s,rep 3
+XFS reflink (local),small,warm.status,3,0.56602,s,rep 3
+XFS reflink (local),small,warm.git_status,4,0.410165,s,rep 4
+XFS reflink (local),small,warm.open,4,0.0447466,s,rep 4
+XFS reflink (local),small,warm.status,4,0.365418,s,rep 4
+XFS reflink (local),small,warm.git_status,5,0.557612,s,rep 5
+XFS reflink (local),small,warm.open,5,0.0416801,s,rep 5
+XFS reflink (local),small,warm.status,5,0.515932,s,rep 5
+tar from S3,small,warm.git_status,1,2.51827,s,rep 1
+tar from S3,small,warm.open,1,2.35369,s,rep 1
+tar from S3,small,warm.status,1,0.164585,s,rep 1
+tar from S3,small,warm.git_status,2,2.51299,s,rep 2
+tar from S3,small,warm.open,2,2.34849,s,rep 2
+tar from S3,small,warm.status,2,0.164499,s,rep 2
+tar from S3,small,warm.git_status,3,2.50426,s,rep 3
+tar from S3,small,warm.open,3,2.33958,s,rep 3
+tar from S3,small,warm.status,3,0.164676,s,rep 3
+tar from S3,small,warm.git_status,4,2.50029,s,rep 4
+tar from S3,small,warm.open,4,2.33562,s,rep 4
+tar from S3,small,warm.status,4,0.164676,s,rep 4
+tar from S3,small,warm.git_status,5,2.52259,s,rep 5
+tar from S3,small,warm.open,5,2.35801,s,rep 5
+tar from S3,small,warm.status,5,0.164573,s,rep 5
+Pando (handoff),small,warm.git_status,1,1.86858,s,rep 1
+Pando (handoff),small,warm.open,1,0.801174,s,rep 1
+Pando (handoff),small,warm.status,1,1.06741,s,rep 1
+Pando (handoff),small,warm.git_status,2,1.76672,s,rep 2
+Pando (handoff),small,warm.open,2,0.799858,s,rep 2
+Pando (handoff),small,warm.status,2,0.966866,s,rep 2
+Pando (handoff),small,warm.git_status,3,1.77613,s,rep 3
+Pando (handoff),small,warm.open,3,0.759425,s,rep 3
+Pando (handoff),small,warm.status,3,1.0167,s,rep 3
+Pando (handoff),small,warm.git_status,4,1.85036,s,rep 4
+Pando (handoff),small,warm.open,4,0.782979,s,rep 4
+Pando (handoff),small,warm.status,4,1.06739,s,rep 4
+Pando (handoff),small,warm.git_status,5,1.79591,s,rep 5
+Pando (handoff),small,warm.open,5,0.77894,s,rep 5
+Pando (handoff),small,warm.status,5,1.01697,s,rep 5

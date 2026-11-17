@@ -89,3 +89,18 @@ JuiceFS,small,cold.status,4,217.912,s,rep 4
 JuiceFS,small,cold.git_status,5,233.169,s,rep 5
 JuiceFS,small,cold.open,5,13.4658,s,rep 5
 JuiceFS,small,cold.status,5,219.704,s,rep 5
+Pando (handoff),small,cold.git_status,1,2.25118,s,rep 1
+Pando (handoff),small,cold.open,1,0.832803,s,rep 1
+Pando (handoff),small,cold.status,1,1.41838,s,rep 1
+Pando (handoff),small,cold.git_status,2,1.20555,s,rep 2
+Pando (handoff),small,cold.open,2,0.639716,s,rep 2
+Pando (handoff),small,cold.status,2,0.565839,s,rep 2
+Pando (handoff),small,cold.git_status,3,1.18607,s,rep 3
+Pando (handoff),small,cold.open,3,0.670368,s,rep 3
+Pando (handoff),small,cold.status,3,0.515704,s,rep 3
+Pando (handoff),small,cold.git_status,4,0.934495,s,rep 4
+Pando (handoff),small,cold.open,4,0.669186,s,rep 4
+Pando (handoff),small,cold.status,4,0.265309,s,rep 4
+Pando (handoff),small,cold.git_status,5,1.15589,s,rep 5
+Pando (handoff),small,cold.open,5,0.589585,s,rep 5
+Pando (handoff),small,cold.status,5,0.56631,s,rep 5

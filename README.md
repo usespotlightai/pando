@@ -94,14 +94,15 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** The fork and cold-start charts have results so far; the others fill in
+> **Partly measured.** The fork, cold-start and warm-start charts have results so far; the others fill in
 > as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
 > [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
 > `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
 1.4 GB and 129k files. All systems use the same VM and bucket. Results show medians of 5 runs,
-with Pando in blue.
+with Pando in blue. "Pando" serves the branch over ublk until it is detached; "Pando (handoff)"
+adds `--dm` and `--images`, so the device switches to a local image once the branch is local.
 
 ### Fork
 
@@ -170,6 +171,7 @@ reads it recorded in the bucket.
 | fork, mount and git status done | median | range |
 |---|---|---|
 | Pando | 1.19 s | 1.15 s to 2.6 s |
+| Pando (handoff) | 1.19 s | 934 ms to 2.25 s |
 | tar from S3 | 4.44 s | 4.41 s to 4.48 s |
 | image download from S3 | 4.72 s | 4.69 s to 4.79 s |
 | Docker (overlayfs) | 26.9 s | 26.8 s to 27.3 s |
@@ -187,7 +189,12 @@ reads it recorded in the bucket.
 
 ### Warm start
 
-Time to start on a host that has already run a branch of the same base.
+Time to start on a host that has already run a branch of the same base. Each system has its
+base on the host: Docker's image is pulled, tar and the image download have their file cached,
+and Pando (handoff) has the host's base image of the root. The page cache is dropped before each
+run. Pando (handoff) switches to the image as soon as the branch opens, so `git status` reads
+through device-mapper and a loop device over a reflink clone and takes about 1 s, against 0.47 s
+over ublk.
 
 <!-- bench:warm -->
 <picture>
@@ -200,18 +207,19 @@ Time to start on a host that has already run a branch of the same base.
 
 | fork, mount and git status done | median | range |
 |---|---|---|
-| Pando | — | |
-| tar from S3 | — | |
-| image download from S3 | — | |
-| Docker (overlayfs) | — | |
+| Pando | 1.29 s | 1.04 s to 1.35 s |
+| Pando (handoff) | 1.8 s | 1.77 s to 1.87 s |
+| tar from S3 | 2.51 s | 2.5 s to 2.52 s |
+| image download from S3 | 2.8 s | 2.8 s to 3.12 s |
+| Docker (overlayfs) | 1.27 s | 1.23 s to 1.31 s |
 | SOCI lazy pull | — | |
 | Nydus lazy pull | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| EBS snapshot to volume | 11 s | 10.5 s to 11.4 s |
+| JuiceFS | 18.8 s | 18.4 s to 19.1 s |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
 | Archil | — | |
-| XFS reflink (local) | — | |
+| XFS reflink (local) | 563 ms | 410 ms to 613 ms |
 
 </details>
 <!-- /bench:warm -->
@@ -234,6 +242,7 @@ Time to run the 14 command types agents use most often in Spotlight sandboxes (`
 |---|---|---|
 | native ext4 (NVMe) | — | |
 | Pando | — | |
+| Pando (handoff) | — | |
 | image download from S3 | — | |
 | Docker (overlayfs) | — | |
 | Nydus lazy pull | — | |
