@@ -18,7 +18,8 @@ detach, attach's publish times (save.flush, save.wait, and save.pack and save.re
 upload pass); the bytes the device took during npm ci (save.run_written) and during the unmount
 (save.unmount_written); the page cache's dirty bytes before the unmount (save.dirty); and the
 upload passes and segment bytes before the detach (save.passes_before, save.bytes_before) and
-during it (save.passes, save.bytes).
+during it (save.passes, save.bytes); and the reads that waited for the store while the branch
+was attached (save.stalls, save.stall in seconds, save.fetched_bytes).
 """
 
 import json
@@ -134,6 +135,7 @@ class JuiceFSSaver(Saver):
 
 SYSTEMS = {
     "pando": (start.Pando, PandoSaver),
+    "pando-uncapped": (start.PandoUncapped, PandoSaver),
     "tar": (start.Tar, TarSaver),
     "docker": (start.Docker, DockerSaver),
     "ebs": (start.Ebs, EbsSaver),
@@ -164,9 +166,9 @@ def save_once(s, saver, i, rep, out):
 
 
 def split_unit(key):
-    if key.startswith("passes"):
+    if key.startswith("passes") or key == "stalls":
         return "n"
-    if key.startswith("bytes") or key.endswith("written") or key == "dirty":
+    if "bytes" in key or key.endswith("written") or key == "dirty":
         return "B"
     return "s"
 

@@ -1,0 +1,221 @@
+system,workspace,measure,rep,value,unit,notes
+Pando,small,save.npm_ci,1,11.0355,s,"rep 1, exit 0"
+Pando,small,save.time,1,0.901577,s,rep 1
+Pando,small,save.uploaded,1,2.57723e+08,B,rep 1
+Pando,small,save.dirty,1,9.88119e+07,B,rep 1
+Pando,small,save.run_written,1,1.14301e+09,B,rep 1
+Pando,small,save.unmount,1,0.557809,s,rep 1
+Pando,small,save.unmount_written,1,4.83574e+07,B,rep 1
+Pando,small,save.detach,1,0.343295,s,rep 1
+Pando,small,save.absorb,1,0,s,rep 1
+Pando,small,save.flush,1,0,s,rep 1
+Pando,small,save.wait,1,0.17,s,rep 1
+Pando,small,save.pack,1,0.1015,s,rep 1
+Pando,small,save.ref,1,0.0375,s,rep 1
+Pando,small,save.after,1,0.097,s,rep 1
+Pando,small,save.passes_before,1,19,n,rep 1
+Pando,small,save.bytes_before,1,2.16498e+08,B,rep 1
+Pando,small,save.passes,1,2,n,rep 1
+Pando,small,save.bytes,1,1.55277e+06,B,rep 1
+Pando,small,save.stalls,1,818,n,rep 1
+Pando,small,save.stall,1,25.361,s,rep 1
+Pando,small,save.fetched_bytes,1,9.00023e+07,B,rep 1
+Pando,small,save.exit,1,7.2979e-05,s,rep 1
+Pando,small,save.npm_ci,2,8.58351,s,"rep 2, exit 0"
+Pando,small,save.time,2,0.783796,s,rep 2
+Pando,small,save.uploaded,2,2.54375e+08,B,rep 2
+Pando,small,save.dirty,2,1.21561e+08,B,rep 2
+Pando,small,save.run_written,2,1.16479e+09,B,rep 2
+Pando,small,save.unmount,2,0.42675,s,rep 2
+Pando,small,save.unmount_written,2,2.01564e+07,B,rep 2
+Pando,small,save.detach,2,0.356537,s,rep 2
+Pando,small,save.absorb,2,0,s,rep 2
+Pando,small,save.flush,2,0,s,rep 2
+Pando,small,save.wait,2,0.1069,s,rep 2
+Pando,small,save.pack,2,0.0904,s,rep 2
+Pando,small,save.ref,2,0.0338,s,rep 2
+Pando,small,save.after,2,0.0976,s,rep 2
+Pando,small,save.passes_before,2,18,n,rep 2
+Pando,small,save.bytes_before,2,2.15462e+08,B,rep 2
+Pando,small,save.passes,2,1,n,rep 2
+Pando,small,save.bytes,2,2.3526e+06,B,rep 2
+Pando,small,save.stalls,2,112,n,rep 2
+Pando,small,save.stall,2,3.3731,s,rep 2
+Pando,small,save.fetched_bytes,2,1.35273e+07,B,rep 2
+Pando,small,save.exit,2,9.3222e-05,s,rep 2
+Pando,small,save.npm_ci,3,8.38303,s,"rep 3, exit 0"
+Pando,small,save.time,3,0.735078,s,rep 3
+Pando,small,save.uploaded,3,2.55196e+08,B,rep 3
+Pando,small,save.dirty,3,1.0759e+08,B,rep 3
+Pando,small,save.run_written,3,1.16519e+09,B,rep 3
+Pando,small,save.unmount,3,0.393898,s,rep 3
+Pando,small,save.unmount_written,3,1.72564e+07,B,rep 3
+Pando,small,save.detach,3,0.340696,s,rep 3
+Pando,small,save.absorb,3,0,s,rep 3
+Pando,small,save.flush,3,0,s,rep 3
+Pando,small,save.wait,3,0.1559,s,rep 3
+Pando,small,save.pack,3,0.0846,s,rep 3
+Pando,small,save.ref,3,0.0486,s,rep 3
+Pando,small,save.after,3,0.1082,s,rep 3
+Pando,small,save.passes_before,3,18,n,rep 3
+Pando,small,save.bytes_before,3,2.15417e+08,B,rep 3
+Pando,small,save.passes,3,2,n,rep 3
+Pando,small,save.bytes,3,1.46062e+06,B,rep 3
+Pando,small,save.stalls,3,45,n,rep 3
+Pando,small,save.stall,3,2.9466,s,rep 3
+Pando,small,save.fetched_bytes,3,4.94492e+06,B,rep 3
+Pando,small,save.exit,3,6.5586e-05,s,rep 3
+Pando,small,save.npm_ci,4,8.3817,s,"rep 4, exit 0"
+Pando,small,save.time,4,0.806887,s,rep 4
+Pando,small,save.uploaded,4,2.58116e+08,B,rep 4
+Pando,small,save.dirty,4,9.28072e+07,B,rep 4
+Pando,small,save.run_written,4,1.14187e+09,B,rep 4
+Pando,small,save.unmount,4,0.468924,s,rep 4
+Pando,small,save.unmount_written,4,4.50314e+07,B,rep 4
+Pando,small,save.detach,4,0.337489,s,rep 4
+Pando,small,save.absorb,4,0,s,rep 4
+Pando,small,save.flush,4,0,s,rep 4
+Pando,small,save.wait,4,0.1236,s,rep 4
+Pando,small,save.pack,4,0.08,s,rep 4
+Pando,small,save.ref,4,0.0464,s,rep 4
+Pando,small,save.after,4,0.1046,s,rep 4
+Pando,small,save.passes_before,4,19,n,rep 4
+Pando,small,save.bytes_before,4,2.17021e+08,B,rep 4
+Pando,small,save.passes,4,1,n,rep 4
+Pando,small,save.bytes,4,800028,B,rep 4
+Pando,small,save.stalls,4,9,n,rep 4
+Pando,small,save.stall,4,0.3465,s,rep 4
+Pando,small,save.fetched_bytes,4,1.75444e+06,B,rep 4
+Pando,small,save.exit,4,7.4959e-05,s,rep 4
+Pando,small,save.npm_ci,5,8.5313,s,"rep 5, exit 0"
+Pando,small,save.time,5,0.780518,s,rep 5
+Pando,small,save.uploaded,5,2.60448e+08,B,rep 5
+Pando,small,save.dirty,5,7.97164e+07,B,rep 5
+Pando,small,save.run_written,5,1.16096e+09,B,rep 5
+Pando,small,save.unmount,5,0.44906,s,rep 5
+Pando,small,save.unmount_written,5,2.80904e+07,B,rep 5
+Pando,small,save.detach,5,0.330957,s,rep 5
+Pando,small,save.absorb,5,0,s,rep 5
+Pando,small,save.flush,5,0,s,rep 5
+Pando,small,save.wait,5,0.1379,s,rep 5
+Pando,small,save.pack,5,0.0817,s,rep 5
+Pando,small,save.ref,5,0.0386,s,rep 5
+Pando,small,save.after,5,0.1016,s,rep 5
+Pando,small,save.passes_before,5,19,n,rep 5
+Pando,small,save.bytes_before,5,2.15671e+08,B,rep 5
+Pando,small,save.passes,5,2,n,rep 5
+Pando,small,save.bytes,5,2.98624e+06,B,rep 5
+Pando,small,save.stalls,5,138,n,rep 5
+Pando,small,save.stall,5,4.5666,s,rep 5
+Pando,small,save.fetched_bytes,5,1.31271e+07,B,rep 5
+Pando,small,save.exit,5,6.7283e-05,s,rep 5
+Pando (kernel dirty limits),small,save.npm_ci,1,7.83087,s,"rep 1, exit 0"
+Pando (kernel dirty limits),small,save.time,1,8.29195,s,rep 1
+Pando (kernel dirty limits),small,save.uploaded,1,2.22712e+08,B,rep 1
+Pando (kernel dirty limits),small,save.dirty,1,1.03128e+09,B,rep 1
+Pando (kernel dirty limits),small,save.run_written,1,1.03985e+08,B,rep 1
+Pando (kernel dirty limits),small,save.unmount,1,7.84976,s,rep 1
+Pando (kernel dirty limits),small,save.unmount_written,1,1.04603e+09,B,rep 1
+Pando (kernel dirty limits),small,save.detach,1,0.441716,s,rep 1
+Pando (kernel dirty limits),small,save.absorb,1,0,s,rep 1
+Pando (kernel dirty limits),small,save.flush,1,0,s,rep 1
+Pando (kernel dirty limits),small,save.wait,1,0.2115,s,rep 1
+Pando (kernel dirty limits),small,save.pack,1,0.0771,s,rep 1
+Pando (kernel dirty limits),small,save.ref,1,0.045,s,rep 1
+Pando (kernel dirty limits),small,save.after,1,0.095,s,rep 1
+Pando (kernel dirty limits),small,save.passes_before,1,12,n,rep 1
+Pando (kernel dirty limits),small,save.bytes_before,1,2.03006e+08,B,rep 1
+Pando (kernel dirty limits),small,save.passes,1,2,n,rep 1
+Pando (kernel dirty limits),small,save.bytes,1,2.12913e+06,B,rep 1
+Pando (kernel dirty limits),small,save.stalls,1,935,n,rep 1
+Pando (kernel dirty limits),small,save.stall,1,31.3137,s,rep 1
+Pando (kernel dirty limits),small,save.fetched_bytes,1,9.07174e+07,B,rep 1
+Pando (kernel dirty limits),small,save.exit,1,7.2924e-05,s,rep 1
+Pando (kernel dirty limits),small,save.npm_ci,2,7.58042,s,"rep 2, exit 0"
+Pando (kernel dirty limits),small,save.time,2,2.42215,s,rep 2
+Pando (kernel dirty limits),small,save.uploaded,2,2.2066e+08,B,rep 2
+Pando (kernel dirty limits),small,save.dirty,2,8.94013e+08,B,rep 2
+Pando (kernel dirty limits),small,save.run_written,2,2.40026e+08,B,rep 2
+Pando (kernel dirty limits),small,save.unmount,2,2.08089,s,rep 2
+Pando (kernel dirty limits),small,save.unmount_written,2,9.13134e+08,B,rep 2
+Pando (kernel dirty limits),small,save.detach,2,0.340705,s,rep 2
+Pando (kernel dirty limits),small,save.absorb,2,0,s,rep 2
+Pando (kernel dirty limits),small,save.flush,2,0,s,rep 2
+Pando (kernel dirty limits),small,save.wait,2,0.1022,s,rep 2
+Pando (kernel dirty limits),small,save.pack,2,0.0998,s,rep 2
+Pando (kernel dirty limits),small,save.ref,2,0.0475,s,rep 2
+Pando (kernel dirty limits),small,save.after,2,0.1137,s,rep 2
+Pando (kernel dirty limits),small,save.passes_before,2,12,n,rep 2
+Pando (kernel dirty limits),small,save.bytes_before,2,2.03576e+08,B,rep 2
+Pando (kernel dirty limits),small,save.passes,2,1,n,rep 2
+Pando (kernel dirty limits),small,save.bytes,2,2.04726e+06,B,rep 2
+Pando (kernel dirty limits),small,save.stalls,2,23,n,rep 2
+Pando (kernel dirty limits),small,save.stall,2,0.8002,s,rep 2
+Pando (kernel dirty limits),small,save.fetched_bytes,2,3.35686e+06,B,rep 2
+Pando (kernel dirty limits),small,save.exit,2,6.9039e-05,s,rep 2
+Pando (kernel dirty limits),small,save.npm_ci,3,7.58012,s,"rep 3, exit 0"
+Pando (kernel dirty limits),small,save.time,3,3.05296,s,rep 3
+Pando (kernel dirty limits),small,save.uploaded,3,2.20819e+08,B,rep 3
+Pando (kernel dirty limits),small,save.dirty,3,1.01254e+09,B,rep 3
+Pando (kernel dirty limits),small,save.run_written,3,1.43835e+08,B,rep 3
+Pando (kernel dirty limits),small,save.unmount,3,2.61068,s,rep 3
+Pando (kernel dirty limits),small,save.unmount_written,3,1.00791e+09,B,rep 3
+Pando (kernel dirty limits),small,save.detach,3,0.441743,s,rep 3
+Pando (kernel dirty limits),small,save.absorb,3,0,s,rep 3
+Pando (kernel dirty limits),small,save.flush,3,0,s,rep 3
+Pando (kernel dirty limits),small,save.wait,3,0.2027,s,rep 3
+Pando (kernel dirty limits),small,save.pack,3,0.083,s,rep 3
+Pando (kernel dirty limits),small,save.ref,3,0.0495,s,rep 3
+Pando (kernel dirty limits),small,save.after,3,0.1258,s,rep 3
+Pando (kernel dirty limits),small,save.passes_before,3,11,n,rep 3
+Pando (kernel dirty limits),small,save.bytes_before,3,2.04857e+08,B,rep 3
+Pando (kernel dirty limits),small,save.passes,3,2,n,rep 3
+Pando (kernel dirty limits),small,save.bytes,3,671611,B,rep 3
+Pando (kernel dirty limits),small,save.stalls,3,147,n,rep 3
+Pando (kernel dirty limits),small,save.stall,3,5.3545,s,rep 3
+Pando (kernel dirty limits),small,save.fetched_bytes,3,1.40179e+07,B,rep 3
+Pando (kernel dirty limits),small,save.exit,3,6.4688e-05,s,rep 3
+Pando (kernel dirty limits),small,save.npm_ci,4,7.68075,s,"rep 4, exit 0"
+Pando (kernel dirty limits),small,save.time,4,2.39297,s,rep 4
+Pando (kernel dirty limits),small,save.uploaded,4,2.17512e+08,B,rep 4
+Pando (kernel dirty limits),small,save.dirty,4,1.0126e+09,B,rep 4
+Pando (kernel dirty limits),small,save.run_written,4,1.50807e+08,B,rep 4
+Pando (kernel dirty limits),small,save.unmount,4,1.85048,s,rep 4
+Pando (kernel dirty limits),small,save.unmount_written,4,1.00064e+09,B,rep 4
+Pando (kernel dirty limits),small,save.detach,4,0.541987,s,rep 4
+Pando (kernel dirty limits),small,save.absorb,4,0,s,rep 4
+Pando (kernel dirty limits),small,save.flush,4,0,s,rep 4
+Pando (kernel dirty limits),small,save.wait,4,0.2719,s,rep 4
+Pando (kernel dirty limits),small,save.pack,4,0.0816,s,rep 4
+Pando (kernel dirty limits),small,save.ref,4,0.0464,s,rep 4
+Pando (kernel dirty limits),small,save.after,4,0.1476,s,rep 4
+Pando (kernel dirty limits),small,save.passes_before,4,10,n,rep 4
+Pando (kernel dirty limits),small,save.bytes_before,4,1.87692e+08,B,rep 4
+Pando (kernel dirty limits),small,save.passes,4,2,n,rep 4
+Pando (kernel dirty limits),small,save.bytes,4,1.7865e+07,B,rep 4
+Pando (kernel dirty limits),small,save.stalls,4,4,n,rep 4
+Pando (kernel dirty limits),small,save.stall,4,0.173,s,rep 4
+Pando (kernel dirty limits),small,save.fetched_bytes,4,597008,B,rep 4
+Pando (kernel dirty limits),small,save.exit,4,7.0588e-05,s,rep 4
+Pando (kernel dirty limits),small,save.npm_ci,5,7.73096,s,"rep 5, exit 0"
+Pando (kernel dirty limits),small,save.time,5,2.30517,s,rep 5
+Pando (kernel dirty limits),small,save.uploaded,5,2.17202e+08,B,rep 5
+Pando (kernel dirty limits),small,save.dirty,5,9.34371e+08,B,rep 5
+Pando (kernel dirty limits),small,save.run_written,5,2.03436e+08,B,rep 5
+Pando (kernel dirty limits),small,save.unmount,5,1.76942,s,rep 5
+Pando (kernel dirty limits),small,save.unmount_written,5,9.49297e+08,B,rep 5
+Pando (kernel dirty limits),small,save.detach,5,0.535254,s,rep 5
+Pando (kernel dirty limits),small,save.absorb,5,0,s,rep 5
+Pando (kernel dirty limits),small,save.flush,5,0,s,rep 5
+Pando (kernel dirty limits),small,save.wait,5,0.3394,s,rep 5
+Pando (kernel dirty limits),small,save.pack,5,0.0852,s,rep 5
+Pando (kernel dirty limits),small,save.ref,5,0.0437,s,rep 5
+Pando (kernel dirty limits),small,save.after,5,0.1134,s,rep 5
+Pando (kernel dirty limits),small,save.passes_before,5,10,n,rep 5
+Pando (kernel dirty limits),small,save.bytes_before,5,1.86716e+08,B,rep 5
+Pando (kernel dirty limits),small,save.passes,5,2,n,rep 5
+Pando (kernel dirty limits),small,save.bytes,5,1.83141e+07,B,rep 5
+Pando (kernel dirty limits),small,save.stalls,5,8,n,rep 5
+Pando (kernel dirty limits),small,save.stall,5,0.3529,s,rep 5
+Pando (kernel dirty limits),small,save.fetched_bytes,5,569966,B,rep 5
+Pando (kernel dirty limits),small,save.exit,5,8.3213e-05,s,rep 5

@@ -477,6 +477,7 @@ class Pando(Workspace):
     prefix = "pando-bench-start"
     dir = DIR / "pando"
     handoff = False
+    attach_args = ()
 
     def unavailable(self):
         return fork.Pando().unavailable()
@@ -519,7 +520,7 @@ class Pando(Workspace):
 
     def open(self, i):
         self._pando("branch", "base", f"b{i}", capture=True)
-        self.attach(i, f"b{i}")
+        self.attach(i, f"b{i}", *self.attach_args)
         self.root(i).mkdir(exist_ok=True)
         run("mount", self._mounted(i), self.root(i))
 
@@ -603,6 +604,15 @@ def dirty_bytes():
     """Dirty and writeback bytes in the page cache, host-wide."""
     fields = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
     return sum(int(fields[k].split()[0]) * 1024 for k in ("Dirty", "Writeback"))
+
+
+class PandoUncapped(Pando):
+    """Pando with the kernel's own dirty limits on its device instead of Pando's cap."""
+
+    name = "Pando (kernel dirty limits)"
+    prefix = "pando-bench-uncapped"
+    dir = DIR / "pando-uncapped"
+    attach_args = ("--dirty-limit", "0")
 
 
 class PandoHandoff(Pando):

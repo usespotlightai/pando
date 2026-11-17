@@ -57,6 +57,11 @@ pub(crate) struct AttachArgs {
     /// Hardware queues of a new device, one thread each.
     #[arg(long, default_value_t = 2)]
     pub(crate) queues: u16,
+    /// Cap the page cache's dirty data on the device the file system sits on at this many
+    /// bytes, so writes reach the branch while it runs and a detach has little left to take
+    /// (0: the kernel's limits).
+    #[arg(long, default_value_t = 64 << 20)]
+    pub(crate) dirty_limit: u64,
 }
 
 /// Which device `detach` stops.
@@ -166,6 +171,7 @@ mod linux {
             hydrate: a.hydrate,
             rejoin: a.recover,
         };
+        let stats = cache.clone();
         let att =
             Arc::new(Attachment::open(ports, Some(switch.clone()), cache, &a.state, &a.name, opts).await?);
         let fopts = FrontendOptions {
@@ -175,7 +181,7 @@ mod linux {
         let mut fe = match Frontend::start(Handle::current(), att.volume().clone(), id, fopts).await {
             Ok(fe) => fe,
             Err(e) => {
-                if let Err(fe) = finish(att, &a.name).await {
+                if let Err(fe) = finish(att, &a.name, &stats).await {
                     eprintln!("{fe:#}");
                 }
                 return Err(e).with_context(|| format!("start {}", a.device.display()));
@@ -187,10 +193,18 @@ mod linux {
             if let Err(ae) = fe.abort().await {
                 eprintln!("stop {}: {ae}", a.device.display());
             }
-            if let Err(fe) = finish(att, &a.name).await {
+            if let Err(fe) = finish(att, &a.name, &stats).await {
                 eprintln!("{fe:#}");
             }
             return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
+        }
+        let mounted =
+            a.dm.as_deref()
+                .map_or_else(|| a.device.clone(), |dm| Path::new("/dev/mapper").join(dm));
+        if a.dirty_limit > 0
+            && let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await
+        {
+            eprintln!("{}: the dirty limit is off: {e}", mounted.display());
         }
         println!(
             "attached {} as {} in {:.1?}{}",
@@ -236,7 +250,7 @@ mod linux {
             let _ = c.await;
             let _ = std::fs::remove_file(control_path(id));
         }
-        let published = finish(att, &a.name).await;
+        let published = finish(att, &a.name, &stats).await;
         drop(fe);
         published
     }
@@ -372,7 +386,7 @@ mod linux {
     }
 
     /// Publishes the branch and frees it; the device no longer writes to its image.
-    async fn finish(att: Arc<Attachment>, name: &str) -> Result<()> {
+    async fn finish(att: Arc<Attachment>, name: &str, cache: &Cache) -> Result<()> {
         let t0 = Instant::now();
         let att = Arc::into_inner(att).with_context(|| format!("{name}: the attachment is still in use"))?;
         if let Some(s) = att.snapshots() {
@@ -383,9 +397,12 @@ mod linux {
         println!("published {name} in {total:.1?}: {r:?}");
         let c = &r.checkpoint;
         let last = c.last.unwrap_or_default();
+        let s = cache.stats();
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
         println!(
             "publish times {name}: total={:.4} absorb={:.4} flush={:.4} wait={:.4} pack={:.4} ref={:.4} \
-             after={:.4} passes_before={} bytes_before={} passes={} bytes={}",
+             after={:.4} passes_before={} bytes_before={} passes={} bytes={} stalls={} stall={:.4} \
+             fetched_bytes={}",
             total.as_secs_f64(),
             r.absorb.as_secs_f64(),
             c.flush.as_secs_f64(),
@@ -397,6 +414,9 @@ mod linux {
             c.bytes_before,
             c.passes,
             c.bytes,
+            load(&s.stalls),
+            load(&s.stall_nanos) as f64 / 1e9,
+            load(&s.bytes_fetched),
         );
         Ok(())
     }
