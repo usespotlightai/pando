@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code, reason = "handoff, hydrate, base builds and GC use these next")]
 
+mod attach;
 pub mod base;
 pub mod branch;
 mod cache;
@@ -37,8 +38,10 @@ pub mod sim;
 mod tree;
 mod volume;
 
+pub use attach::{AttachOptions, Attachment, FinishReport, SnapshotCounts, WarmReport};
 pub use cache::{Cache, CacheStats};
 pub use error::{Error, Result};
+pub use handoff::HandoffReport;
 pub use import::{ImportReport, import};
 pub use packer::PackStats;
 pub use ports::Ports;

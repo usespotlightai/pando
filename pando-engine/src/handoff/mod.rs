@@ -67,17 +67,19 @@ pub(crate) struct SnapshotOptions {
     pub(crate) burst: u64,
 }
 
+/// What a handoff did before the device moved to the image.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct HandoffReport {
+pub struct HandoffReport {
     /// The image started as a clone of the base image.
-    pub(crate) shared: bool,
-    pub(crate) copied: usize,
-    pub(crate) rounds: usize,
+    pub shared: bool,
+    pub copied: usize,
+    /// Rounds of copying what was written during the copy.
+    pub rounds: usize,
     /// Chunks copied while the device was suspended.
-    pub(crate) last: usize,
-    pub(crate) paused: Duration,
+    pub last: usize,
+    pub paused: Duration,
     /// Bytes reads took from the base image before the switch.
-    pub(crate) from_base: u64,
+    pub from_base: u64,
 }
 
 /// What the background snapshots did.
@@ -146,15 +148,17 @@ fn base36(mut n: u128) -> String {
     String::from_utf8(out).expect("ascii digits")
 }
 
-/// A new image name for branch `name` in `dir`. Each attach gets its own: after a crash, cache
-/// records may still name the files of the previous attach, so a new one never overwrites them.
+/// A new image name for branch `name` in `dir`. Each attach gets its own, from the time and a
+/// random number: after a crash, cache records may still name the files of an earlier attach,
+/// so a new one never reuses them.
 pub(crate) fn image_path(ports: &Ports, dir: &Path, name: &str) -> PathBuf {
     let now = ports
         .clock
         .wall()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    dir.join(format!("{name}.{}.img", base36(now.as_nanos())))
+    let id = base36(now.as_nanos() << 32 | u128::from(ports.rng.next_u32()));
+    dir.join(format!("{name}.{id}.img"))
 }
 
 impl Handoff {

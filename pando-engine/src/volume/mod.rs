@@ -274,6 +274,11 @@ impl Volume {
         &self.inner.name
     }
 
+    /// The branch this one was copied from.
+    pub fn copied_from(&self) -> Option<&str> {
+        self.inner.from.as_deref()
+    }
+
     pub(crate) fn tree(&self) -> &Arc<Tree> {
         &self.inner.tree
     }
