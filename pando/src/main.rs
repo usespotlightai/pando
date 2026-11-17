@@ -122,9 +122,10 @@ async fn main() -> Result<()> {
             let t0 = Instant::now();
             let r = pando_engine::import(&ports, &cache().await?, &name, &image).await?;
             println!(
-                "imported {name}: {} MiB device, {} chunks with data, {} segments ({} MiB) in {:.1?}",
+                "imported {name}: {} MiB device, {} chunks with data ({} of ext4 metadata), {} segments ({} MiB) in {:.1?}",
                 r.size >> 20,
                 r.chunks,
+                r.metadata,
                 r.upload.segments,
                 r.upload.bytes >> 20,
                 t0.elapsed()

@@ -23,6 +23,7 @@ pub mod branch;
 mod cache;
 mod dedup;
 mod error;
+mod ext4;
 mod flight;
 mod gate;
 pub mod gc;

@@ -20,7 +20,7 @@ use crate::cache::{BaseKey, Cache};
 use crate::dedup::learned::{LearnedIndex, Learner};
 use crate::handoff::{self, Handoff, HandoffReport, HostEnv, SnapshotOptions};
 use crate::ports::DeviceSwitch;
-use crate::{Ports, Result, Volume, recording};
+use crate::{Ports, Result, Volume, ext4, recording};
 
 const BUILD_PARALLEL: usize = 16;
 
@@ -44,6 +44,9 @@ pub struct AttachOptions {
     pub prefetch: usize,
     /// Record this mount's first reads for the next one.
     pub record: bool,
+    /// Also fetch the metadata of an ext4 file system on the branch with the `prefetch`
+    /// fetches: bitmaps, the used inode tables and directory blocks.
+    pub metadata: bool,
     /// After the first reads, fetch every chunk with this many parallel fetches; zero does not.
     pub hydrate: usize,
     /// Take over a device whose writer died while the kernel served it from an image.
@@ -56,6 +59,8 @@ pub struct WarmReport {
     /// The base image was on this host: no warming.
     pub base_ready: bool,
     pub recorded_frames: usize,
+    /// Frames fetched for the ext4 metadata; `None` when the branch holds no ext4 it can read.
+    pub metadata_frames: Option<usize>,
     pub base: Option<BuildReport>,
     pub hydrated_frames: usize,
 }
@@ -222,12 +227,25 @@ impl Attachment {
             return Ok(r);
         }
         let v = &self.volume;
-        if self.opts.prefetch > 0 && self.opts.record {
-            let rec = recording::load(&self.cache, &v.opened()).await;
-            if !rec.entries.is_empty() {
-                r.recorded_frames = recording::prefetch(&self.cache, &rec, self.opts.prefetch).await;
+        let recorded = async {
+            if self.opts.prefetch == 0 || !self.opts.record {
+                return 0;
             }
-        }
+            let rec = recording::load(&self.cache, &v.opened()).await;
+            if rec.entries.is_empty() {
+                return 0;
+            }
+            recording::prefetch(&self.cache, &rec, self.opts.prefetch).await
+        };
+        let metadata = async {
+            if self.opts.prefetch == 0 || !self.opts.metadata || v.opened().is_empty() {
+                return None;
+            }
+            ext4::prefetch(&self.cache, v.tree(), &v.opened(), self.opts.prefetch)
+                .await
+                .ok()
+        };
+        (r.recorded_frames, r.metadata_frames) = futures::join!(recorded, metadata);
         self.touched.send_replace(true);
         let build = self.build.lock().expect("build lock").take();
         let built = match build {

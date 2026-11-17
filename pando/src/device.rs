@@ -40,6 +40,9 @@ pub(crate) struct AttachArgs {
     /// Parallel fetches for the recording of earlier first reads (0: none).
     #[arg(long, default_value_t = 32)]
     pub(crate) prefetch: usize,
+    /// Also fetch the metadata of an ext4 file system on the branch with the --prefetch fetches.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub(crate) metadata: bool,
     /// Record this mount's first reads for the next mount.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub(crate) record: bool,
@@ -121,6 +124,7 @@ mod linux {
             snapshot_bytes: a.snapshot_bytes,
             prefetch: a.prefetch,
             record: a.record,
+            metadata: a.metadata,
             hydrate: a.hydrate,
             rejoin: a.recover,
         };
