@@ -162,10 +162,12 @@ labelled "X-style", not "X".
 | overlayfs, btrfs snapshot, ZFS clone, qcow2 overlay | local copy-on-write | snapshot / clone | local only: no `cold` or `save` across hosts |
 | [ZeroFS](https://www.zerofs.net) | S3 as NFS, 9P or NBD block devices | read-only checkpoints; a writable copy is a full copy | closest design to Pando (a block device with ext4 on top, on S3) |
 | Amazon S3 Files | NFS mount of an S3 bucket (GA April 2026) | none (copy objects) | writes reach the bucket after about a minute |
-| [Archil](https://archil.com) | managed S3-backed POSIX disk for agents | branches / checkpoints | mounts on our VM; branching on our own bucket is an enterprise feature |
 
 The following are excluded:
 
+- Archil is a managed service rather than storage a sandbox builder runs, and branching on your
+  own bucket is an enterprise feature, so its branch and save rows could not be measured on equal
+  terms.
 - Mountpoint for Amazon S3 and goofys cannot modify existing files in place, and Mountpoint cannot
   rename them, so `git` fails on them. s3fs supports both only by rewriting whole objects, which
   makes `git` and `npm ci` impractically slow. Daytona uses FUSE mounts of object storage for
@@ -220,8 +222,7 @@ Things to know:
 - **Pando's credentials.** Pando reads `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` and cannot
   use the instance role yet. Until it can, pass keys through `PANDO_ENV_FILE`; Terraform does not
   create long-lived keys, so none end up in its state or in the instance user data.
-- **Not created here.** Amazon S3 Files and Archil are set up in their own consoles, against the
-  bench bucket.
+- **Not created here.** Amazon S3 Files is set up in its own console, against the bench bucket.
 - **Fast Snapshot Restore** is billed per snapshot and availability zone for every hour it is
   on. The harness should turn it on only for its own rows and off again afterwards.
 
