@@ -116,6 +116,8 @@ base where it would in production, and every branch is opened on the bench host:
   with the publish's own flush, upload wait, pack and ref times, the bytes the device took
   during `npm ci` and during the unmount, the page cache's dirty bytes before the unmount, and
   what the uploads put before and during the detach (`save.*` rows in `save.csv`).
+  `pando-capped` is Pando attached with `--dirty-limit` at 64 MiB, so the kernel writes the
+  branch back while `npm ci` runs.
 
 - **fio** opens a fresh branch on a warm host, lays out one 1 GiB file and runs each job for 20 s
   after a 2 s ramp with direct I/O, page cache dropped before each job. Pando (after handoff)

@@ -606,13 +606,13 @@ def dirty_bytes():
     return sum(int(fields[k].split()[0]) * 1024 for k in ("Dirty", "Writeback"))
 
 
-class PandoUncapped(Pando):
-    """Pando with the kernel's own dirty limits on its device instead of Pando's cap."""
+class PandoCapped(Pando):
+    """Pando with its device's dirty page cache capped at 64 MiB (`--dirty-limit`)."""
 
-    name = "Pando (kernel dirty limits)"
-    prefix = "pando-bench-uncapped"
-    dir = DIR / "pando-uncapped"
-    attach_args = ("--dirty-limit", "0")
+    name = "Pando (64 MiB dirty cap)"
+    prefix = "pando-bench-capped"
+    dir = DIR / "pando-capped"
+    attach_args = ("--dirty-limit", str(64 << 20))
 
 
 class PandoHandoff(Pando):

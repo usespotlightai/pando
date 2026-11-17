@@ -135,7 +135,7 @@ class JuiceFSSaver(Saver):
 
 SYSTEMS = {
     "pando": (start.Pando, PandoSaver),
-    "pando-uncapped": (start.PandoUncapped, PandoSaver),
+    "pando-capped": (start.PandoCapped, PandoSaver),
     "tar": (start.Tar, TarSaver),
     "docker": (start.Docker, DockerSaver),
     "ebs": (start.Ebs, EbsSaver),

@@ -4,9 +4,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The sysfs directory of the writeback limits of block device `dev`, a path that may go
-/// through a symlink such as `/dev/mapper/NAME`.
-fn bdi_dir(dev: &Path) -> io::Result<PathBuf> {
+const SYS_BLOCK: &str = "/sys/class/block";
+
+/// The sysfs directory, under `sys_block`, of the writeback limits of block device `dev`, a
+/// path that may go through a symlink such as `/dev/mapper/NAME`.
+fn bdi_dir(sys_block: &Path, dev: &Path) -> io::Result<PathBuf> {
     let real = fs::canonicalize(dev)?;
     let name = real.file_name().ok_or_else(|| {
         io::Error::new(
@@ -14,29 +16,80 @@ fn bdi_dir(dev: &Path) -> io::Result<PathBuf> {
             format!("{} names no block device", dev.display()),
         )
     })?;
-    Ok(Path::new("/sys/class/block").join(name).join("bdi"))
+    Ok(sys_block.join(name).join("bdi"))
+}
+
+fn write(path: &Path, value: &str) -> io::Result<()> {
+    fs::write(path, value).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+fn limit_dirty_in(sys_block: &Path, dev: &Path, bytes: u64) -> io::Result<()> {
+    let dir = bdi_dir(sys_block, dev)?;
+    write(&dir.join("strict_limit"), "1")?;
+    write(&dir.join("max_bytes"), &bytes.to_string())
 }
 
 pub(crate) fn limit_dirty(dev: &Path, bytes: u64) -> io::Result<()> {
-    let dir = bdi_dir(dev)?;
-    fs::write(dir.join("max_bytes"), bytes.to_string())?;
-    fs::write(dir.join("strict_limit"), "1")
+    limit_dirty_in(Path::new(SYS_BLOCK), dev, bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    struct Fixture {
+        dir: PathBuf,
+        sys_block: PathBuf,
+        link: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Fixture {
+            let dir = std::env::temp_dir().join(format!("pando-bdi-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let sys_block = dir.join("sys");
+            fs::create_dir_all(sys_block.join("dm-7").join("bdi")).unwrap();
+            let dev = dir.join("dm-7");
+            fs::write(&dev, b"").unwrap();
+            let link = dir.join("branch");
+            std::os::unix::fs::symlink(&dev, &link).unwrap();
+            Fixture { dir, sys_block, link }
+        }
+
+        fn read(&self, file: &str) -> String {
+            fs::read_to_string(self.sys_block.join("dm-7/bdi").join(file)).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[test]
     fn a_device_s_limits_are_under_its_block_class_name() {
-        let dir = std::env::temp_dir().join(format!("pando-bdi-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let dev = dir.join("dm-7");
-        fs::write(&dev, b"").unwrap();
-        let link = dir.join("branch");
-        let _ = fs::remove_file(&link);
-        std::os::unix::fs::symlink(&dev, &link).unwrap();
-        assert_eq!(bdi_dir(&link).unwrap(), Path::new("/sys/class/block/dm-7/bdi"));
-        fs::remove_dir_all(&dir).unwrap();
+        let f = Fixture::new("dir");
+        assert_eq!(
+            bdi_dir(Path::new(SYS_BLOCK), &f.link).unwrap(),
+            Path::new("/sys/class/block/dm-7/bdi")
+        );
+    }
+
+    #[test]
+    fn a_limit_turns_on_the_strict_limit_and_sets_the_bytes() {
+        let f = Fixture::new("set");
+        limit_dirty_in(&f.sys_block, &f.link, 64 << 20).unwrap();
+        assert_eq!(f.read("strict_limit"), "1");
+        assert_eq!(f.read("max_bytes"), (64u64 << 20).to_string());
+    }
+
+    #[test]
+    fn a_failed_write_names_its_file() {
+        let f = Fixture::new("fail");
+        fs::create_dir(f.sys_block.join("dm-7/bdi/max_bytes")).unwrap();
+        let e = limit_dirty_in(&f.sys_block, &f.link, 1 << 20).unwrap_err();
+        assert!(e.to_string().contains("max_bytes"), "{e}");
+        assert_eq!(f.read("strict_limit"), "1");
     }
 }

@@ -58,9 +58,9 @@ pub(crate) struct AttachArgs {
     #[arg(long, default_value_t = 2)]
     pub(crate) queues: u16,
     /// Cap the page cache's dirty data on the device the file system sits on at this many
-    /// bytes, so writes reach the branch while it runs and a detach has little left to take
-    /// (0: the kernel's limits).
-    #[arg(long, default_value_t = 64 << 20)]
+    /// bytes, so writes reach the branch while it runs and a detach has little left to take;
+    /// writers wait at the cap (0: the kernel's limits).
+    #[arg(long, default_value_t = 0)]
     pub(crate) dirty_limit: u64,
 }
 
@@ -200,7 +200,7 @@ mod linux {
         }
         let mounted =
             a.dm.as_deref()
-                .map_or_else(|| a.device.clone(), |dm| Path::new("/dev/mapper").join(dm));
+                .map_or_else(|| a.device.clone(), pando_linux::mapper_path);
         if a.dirty_limit > 0
             && let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await
         {
