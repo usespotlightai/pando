@@ -152,10 +152,7 @@ impl Frontend {
         })();
         match started {
             Ok(()) => Ok(fe),
-            Err(e) if opts.recover => {
-                join(std::mem::take(&mut fe.queues));
-                Err(e)
-            }
+            Err(e) if opts.recover => Err(e),
             Err(e) => {
                 if let Err(se) = c.cmd(ctrl::CMD_STOP_DEV, id, 0, None) {
                     eprintln!("stop ublk device {id}: {se}");
@@ -191,6 +188,8 @@ impl Frontend {
     }
 }
 
+/// A failed recovery keeps the device, which still holds the mounts, so its queues may wait
+/// forever; while one runs, the character device stays open under it.
 impl Drop for Frontend {
     fn drop(&mut self) {
         if !self.queues.is_empty()
