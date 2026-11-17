@@ -134,6 +134,19 @@ impl Window {
         let from = (at - self.start) as usize;
         Ok(self.buf.slice(from..(from + len).min(self.buf.len())))
     }
+
+    /// [`Self::read`] for a few bytes: from the page cache when it holds them, so a scan of
+    /// headers does not read the objects between them.
+    async fn read_small(&mut self, f: &dyn LocalFile, at: u64, len: usize) -> io::Result<Bytes> {
+        let end = self.start + self.buf.len() as u64;
+        if at < self.start || at + len as u64 > end {
+            let mut b = vec![0; len];
+            if f.read_at_nowait(&mut b, at)? == Some(len) {
+                return Ok(Bytes::from(b));
+            }
+        }
+        self.read(f, at, len).await
+    }
 }
 
 fn header(h: Hash, len: u32) -> Bytes {
@@ -199,7 +212,7 @@ impl ObjectLog {
         let mut w = Window::default();
         let mut off = 0u64;
         while off + HEADER as u64 <= size {
-            let hdr = w.read(self.file.as_ref(), off, HEADER).await?;
+            let hdr = w.read_small(self.file.as_ref(), off, HEADER).await?;
             if hdr.len() < HEADER {
                 break;
             }
@@ -218,7 +231,7 @@ impl ObjectLog {
                 continue;
             }
             if n & REF_FLAG != 0 {
-                let payload = w.read(self.file.as_ref(), body, plen as usize).await?;
+                let payload = w.read_small(self.file.as_ref(), body, plen as usize).await?;
                 let Some(loc) = self.read_ref(off, &payload) else {
                     break;
                 };
