@@ -1,0 +1,89 @@
+name: kernel
+
+# The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
+# container (tests/kernel). fio verify and the crash checks run on every push to main; xfstests
+# and the dm-log-writes tests run each night, since the quick group takes hours. Start any of
+# them by hand from the Actions tab.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "Tests to run, from tests/kernel"
+        type: string
+        default: "fio-verify crash"
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pick the tests
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          ASKED: ${{ inputs.tests }}
+        run: |
+          case $EVENT in
+            schedule) tests="xfstests log-writes" ;;
+            workflow_dispatch) tests=$ASKED ;;
+            *) tests="fio-verify crash" ;;
+          esac
+          case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel only" >&2; exit 2 ;; esac
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+
+      - name: Kernel modules
+        run: |
+          uname -r
+          modules=(ublk_drv dm_mod loop dm_log_writes dm_thin_pool)
+          if ! sudo modprobe -a "${modules[@]}"; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a "${modules[@]}"
+          fi
+          ls -l /dev/ublk-control
+          sudo dmsetup targets
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build pando
+        run: cargo build --release -p pando
+
+      - name: Run the tests
+        env:
+          KERNEL_TESTS: ${{ steps.pick.outputs.tests }}
+          PANDO: target/release/pando
+          RESULTS: ${{ runner.temp }}/kernel-results
+          DATA: /mnt/pando-tests
+        run: |
+          sudo mkdir -p "$DATA"
+          read -ra tests <<< "$KERNEL_TESTS"
+          tests/kernel/host.sh "${tests[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: kernel-results-${{ github.run_id }}
+          path: ${{ runner.temp }}/kernel-results
+          if-no-files-found: warn

@@ -1,0 +1,1 @@
+ext4/054 the device has 4 KiB logical blocks, so ext4 with 1 KiB blocks cannot be made on it

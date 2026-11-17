@@ -1,0 +1,119 @@
+name: ci
+
+# Format, lints, tests, dependency checks and the store conformance tests (against the AWS
+# emulator) on every pull request and every push to main. On main only: the crash and restart
+# scenarios over more seeds. The tests that need a Linux kernel are in kernel.yml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-features
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  scenarios:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Crash and restart over 400 seeds, from a seed that changes with each run
+        env:
+          PANDO_DST_SEEDS: "400"
+          RUN_NUMBER: ${{ github.run_number }}
+        run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios
+
+  store:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install the AWS emulator (package signed by AWS)
+        run: |
+          u=https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest
+          f=aws-emulator_amd64.deb
+          curl -fsSLO "$u/$f" && curl -fsSLO "$u/$f.sig"
+          curl -fsSLo aws.asc https://downloads.aws.com/keys/gpg/current.asc
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          gpg -q --import aws.asc
+          gpg --with-colons --fingerprint ssm-publishing@amazon.com | grep -q '^fpr:*98BCF336A3BE53B734E967C52E5BF49BD940F624:'
+          gpg -q --verify "$f.sig" "$f"
+          sudo apt-get install -y -qq "./$f"
+          aws-emulator -v
+
+      - name: Store conformance against the AWS emulator
+        env:
+          EMULATOR_TELEMETRY: "off"
+          S3_BUCKET: pando
+          S3_REGION: us-east-1
+          S3_ENDPOINT: https://127.0.0.1:9297
+          S3_ACCESS_KEY_ID: emulator
+          S3_SECRET_ACCESS_KEY: emulator
+        run: |
+          cargo test -p pando-dst --test store_conformance --no-run
+          aws-emulator -a off -t off --idle-timeout 1800 > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          for _ in $(seq 300); do grep -q "emulator server information" "$RUNNER_TEMP/emulator.log" && break; sleep 0.1; done
+          export SSL_CERT_FILE=$HOME/.aws/emulator/9297/ca.pem
+          curl -fsS --cacert "$SSL_CERT_FILE" --aws-sigv4 "aws:amz:$S3_REGION:s3" \
+            --user "$S3_ACCESS_KEY_ID:$S3_SECRET_ACCESS_KEY" -X PUT "$S3_ENDPOINT/$S3_BUCKET"
+          cargo test -p pando-dst --test store_conformance -- --ignored

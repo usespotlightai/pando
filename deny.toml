@@ -3,14 +3,20 @@ all-features = true
 
 [advisories]
 version = 2
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono, unmaintained, only through object_store" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime, unmaintained, only through object_store" },
+]
 
 [licenses]
 version = 2
-allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0"]
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "CDLA-Permissive-2.0", "BSL-1.0"]
+private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"
-wildcard-dependencies = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
