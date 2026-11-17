@@ -33,13 +33,19 @@ pub(crate) fn users(dev: &Path, over: Option<&str>) -> io::Result<Vec<String>> {
 /// The mounts of device `devt` (`major:minor`) and the devices stacked on it, except the
 /// device-mapper device named `over`, and whether `over` is stacked on it.
 pub(crate) fn mounts_and_holders(devt: &str, over: Option<&str>) -> io::Result<(Vec<String>, bool)> {
-    let mut found: Vec<String> = mount_points(&fs::read_to_string("/proc/self/mountinfo")?, devt)
+    mounts_and_holders_in(Path::new("/"), devt, over)
+}
+
+/// [`mounts_and_holders`] with `/proc` and `/sys` under `root`.
+fn mounts_and_holders_in(root: &Path, devt: &str, over: Option<&str>) -> io::Result<(Vec<String>, bool)> {
+    let mountinfo = fs::read_to_string(root.join("proc/self/mountinfo"))?;
+    let mut found: Vec<String> = mount_points(&mountinfo, devt)
         .into_iter()
         .map(|p| format!("mounted at {p}"))
         .collect();
     let mut under_over = false;
-    for h in holders(&Path::new("/sys/dev/block").join(devt).join("holders"))? {
-        let dm_name = fs::read_to_string(Path::new("/sys/class/block").join(&h).join("dm/name"))
+    for h in holders(&root.join("sys/dev/block").join(devt).join("holders"))? {
+        let dm_name = fs::read_to_string(root.join("sys/class/block").join(&h).join("dm/name"))
             .ok()
             .map(|s| s.trim().to_owned());
         match dm_name {
@@ -149,6 +155,58 @@ mod tests {
         fs::write(d.path().join("dm-3"), "").unwrap();
         fs::write(d.path().join("dm-1"), "").unwrap();
         assert_eq!(holders(d.path()).unwrap(), ["dm-1", "dm-3"]);
+    }
+
+    fn fake_root(holders: &[(&str, Option<&str>)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("proc/self")).unwrap();
+        fs::write(root.path().join("proc/self/mountinfo"), MOUNTINFO).unwrap();
+        let dir = root.path().join("sys/dev/block/259:1/holders");
+        fs::create_dir_all(&dir).unwrap();
+        for (kname, dm_name) in holders {
+            fs::write(dir.join(kname), "").unwrap();
+            if let Some(n) = dm_name {
+                let dm = root.path().join("sys/class/block").join(kname).join("dm");
+                fs::create_dir_all(&dm).unwrap();
+                fs::write(dm.join("name"), format!("{n}\n")).unwrap();
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn mounts_and_stacked_devices_are_users() {
+        let root = fake_root(&[("dm-3", Some("pando-b1")), ("md0", None)]);
+        let (found, under_over) = mounts_and_holders_in(root.path(), "259:1", None).unwrap();
+        assert_eq!(
+            found,
+            [
+                "mounted at /mnt/ublk one",
+                "mounted at /srv/bind",
+                "under /dev/mapper/pando-b1",
+                "under /dev/md0"
+            ]
+        );
+        assert!(!under_over);
+    }
+
+    #[test]
+    fn the_device_mapper_device_over_it_is_not_a_user() {
+        let root = fake_root(&[("dm-3", Some("pando-b1"))]);
+        let (found, under_over) = mounts_and_holders_in(root.path(), "259:1", Some("pando-b1")).unwrap();
+        assert_eq!(found, ["mounted at /mnt/ublk one", "mounted at /srv/bind"]);
+        assert!(under_over);
+        let (found, under_over) = mounts_and_holders_in(root.path(), "259:1", Some("pando-b2")).unwrap();
+        assert!(found.contains(&"under /dev/mapper/pando-b1".to_owned()));
+        assert!(!under_over);
+    }
+
+    #[test]
+    fn an_unused_device_has_no_users() {
+        let root = fake_root(&[]);
+        let (found, under_over) = mounts_and_holders_in(root.path(), "259:7", Some("pando-b1")).unwrap();
+        assert!(found.is_empty());
+        assert!(!under_over);
     }
 
     #[test]

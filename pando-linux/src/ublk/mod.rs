@@ -26,7 +26,7 @@ const DEPTH: u16 = 64;
 /// How long a recovery waits for the kernel to quiesce the device of a dead daemon.
 const QUIESCE_WAIT: Duration = Duration::from_secs(10);
 /// How long a delete waits for the kernel to free a stopped device its daemon let go of.
-pub const RELEASE_WAIT: Duration = Duration::from_secs(10);
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
 
 /// The number of `/dev/ublkbN`.
 pub fn device_id(dev: &Path) -> io::Result<u32> {
@@ -227,13 +227,25 @@ pub async fn stop(id: u32) -> io::Result<()> {
     blocking(move || Ctrl::open()?.cmd(ctrl::CMD_STOP_DEV, id, 0, None)).await
 }
 
-/// Deletes stopped device `id`. It waits until the daemon lets go of the device, which it does
-/// once the branch is published, and then at most [`RELEASE_WAIT`] for the kernel to free the
-/// device. A mount or an open file that still holds the stopped device fails the delete; the
-/// kernel frees the device once they let go of it.
-pub async fn delete(id: u32) -> io::Result<()> {
+/// Deletes stopped device `id`. It waits at most `publish_wait` for the daemon to let go of the
+/// device, which it does once its branch is published, and then at most 10 s for the kernel to
+/// free the device. A mount or an open file that still holds the stopped device fails the
+/// delete; the kernel frees the device once they let go of it.
+pub async fn delete(id: u32, publish_wait: Duration) -> io::Result<()> {
     blocking(move || {
-        wait_released(&Path::new("/dev").join(format!("ublkc{id}")))?;
+        wait_released(&Path::new("/dev").join(format!("ublkc{id}")), publish_wait).map_err(|e| {
+            if e.kind() == io::ErrorKind::TimedOut {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "the daemon of ublk device {id} still holds it after {publish_wait:?}; it \
+                         may still be publishing its branch"
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
         within(RELEASE_WAIT, move || {
             Ctrl::open()?.cmd(ctrl::CMD_DEL_DEV, id, 0, None)
         })
@@ -242,8 +254,9 @@ pub async fn delete(id: u32) -> io::Result<()> {
                 io::Error::new(
                     e.kind(),
                     format!(
-                        "deleted ublk device {id}, but {e}: a mount or an open file still holds \
-                         /dev/ublkb{id}, and the kernel frees it once they let go of it"
+                        "the daemon of ublk device {id} let go of it, which a live daemon does after \
+                         its publish, but the delete did not finish within {RELEASE_WAIT:?}: a mount or an open file \
+                         still holds /dev/ublkb{id}, and the kernel frees it once they let go of it"
                     ),
                 )
             } else {
@@ -254,9 +267,10 @@ pub async fn delete(id: u32) -> io::Result<()> {
     .await
 }
 
-/// Waits until no daemon holds the ublk character device `cdev`, which only one process may
-/// open at a time.
-fn wait_released(cdev: &Path) -> io::Result<()> {
+/// Waits at most `wait` until no daemon holds the ublk character device `cdev`, which only one
+/// process may open at a time.
+fn wait_released(cdev: &Path, wait: Duration) -> io::Result<()> {
+    let t0 = Instant::now();
     loop {
         match std::fs::OpenOptions::new()
             .read(true)
@@ -265,6 +279,12 @@ fn wait_released(cdev: &Path) -> io::Result<()> {
             .open(cdev)
         {
             Ok(_) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) && t0.elapsed() >= wait => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{} is still open after {wait:?}", cdev.display()),
+                ));
+            }
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => std::thread::sleep(Duration::from_millis(100)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
@@ -329,6 +349,6 @@ mod tests {
 
     #[test]
     fn a_missing_character_device_is_released() {
-        wait_released(Path::new("/dev/ublkc987654")).unwrap();
+        wait_released(Path::new("/dev/ublkc987654"), Duration::ZERO).unwrap();
     }
 }
