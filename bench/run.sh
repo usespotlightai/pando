@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Runs on a bench host (see bench/infra), as root, from a copy of the repository.
-#   bench/run.sh smoke    checks that the host is ready for the benchmarks
+#   bench/run.sh smoke         checks that the host is ready for the benchmarks
+#   bench/run.sh workspace     builds the workspace image (once per host)
+#   bench/run.sh fork [args]   the fork measure (python3 bench/harness fork --help)
 # Results go to $PANDO_BENCH_RESULTS (default /data/results). Pando's store keys, when the
 # workflow passed them, are in the file named by PANDO_ENV_FILE and are never printed.
 #
-# The measures in bench/README.md are not implemented yet; only `smoke` exists.
+# Of the measures in bench/README.md, only `fork` is implemented so far.
 set -euo pipefail
 
 set -a
@@ -71,9 +73,9 @@ registry_login() {
 
 smoke() {
   host_facts
-  check "kernel module ublk_drv" grep -q '^ublk_drv ' /proc/modules
-  check "kernel module nbd" grep -q '^nbd ' /proc/modules
-  check "kernel module dm_mod" grep -qE '^dm_mod ' /proc/modules
+  for m in ublk_drv nbd dm_mod; do
+    check "kernel module $m" test -d "/sys/module/$m"
+  done
   check "/data is XFS with reflink" sh -c 'findmnt -n -o FSTYPE /data | grep -qx xfs && xfs_info /data | grep -q "reflink=1"'
   check "reflink copy on /data" sh -c 'f=/data/.reflink-$$; head -c 1M /dev/urandom >$f && cp --reflink=always $f $f.2; r=$?; rm -f $f $f.2; exit $r'
   check "bucket via the host role" bucket_round_trip
@@ -90,5 +92,6 @@ smoke() {
 
 case ${1:-} in
   smoke) smoke | tee "$results/smoke-$PANDO_BENCH_HOST.txt"; exit "${PIPESTATUS[0]}" ;;
-  *) echo "usage: bench/run.sh smoke" >&2; exit 2 ;;
+  workspace | fork) python3 "$(dirname "$0")/harness" "$@" ;;
+  *) echo "usage: bench/run.sh smoke | workspace | fork [args]" >&2; exit 2 ;;
 esac

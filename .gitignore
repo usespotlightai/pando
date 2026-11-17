@@ -11,3 +11,4 @@
 /bench/infra/bootstrap/*.tfstate.*
 /bench/infra/backend_override.tf
 /bench/infra/*.auto.tfvars.json
+__pycache__/

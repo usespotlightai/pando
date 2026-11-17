@@ -6,6 +6,7 @@ packages:
   - btrfs-progs
   - docker.io
   - fio
+  - fuse3
   - git
   - jq
   - mdadm
@@ -27,6 +28,17 @@ write_files:
       PANDO_BENCH_REGISTRY=${registry}
       PANDO_BENCH_EBS_VOLUME=${ebs_volume}
       PANDO_BENCH_DATA=/data
+
+  # Docker keeps its images and containers on the instance-store NVMe, like every other system,
+  # with the overlay2 driver: the containerd image store would put them in /var/lib/containerd.
+  - path: /etc/docker/daemon.json
+    content: |
+      {"data-root": "/data/docker", "features": {"containerd-snapshotter": false}}
+
+  - path: /etc/systemd/system/docker.service.d/pando-bench.conf
+    content: |
+      [Unit]
+      RequiresMountsFor=/data
 
   - path: /etc/modules-load.d/pando-bench.conf
     content: |
@@ -112,6 +124,8 @@ runcmd:
   - snap install aws-cli --classic
   - systemctl daemon-reload
   - systemctl enable --now pando-bench-data.service
+  # Docker started while its package installed, before /data was mounted.
+  - systemctl restart docker
 %{ if max_hours > 0 ~}
   - systemctl enable --now pando-bench-poweroff.timer
 %{ endif ~}

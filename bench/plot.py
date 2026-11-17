@@ -39,7 +39,7 @@ HIGHLIGHT = "Pando"
 NATIVE = "native ext4 (NVMe)"
 TAR = "tar from S3"
 IMAGE = "image download from S3"
-OCI = "docker pull (overlayfs)"
+OCI = "Docker (overlayfs)"
 SOCI = "SOCI lazy pull"
 NYDUS = "Nydus lazy pull"
 EBS = "EBS snapshot to volume"
@@ -64,8 +64,9 @@ CHARTS = {
         title="Fork: time to a writable branch",
         alt="Bar chart of the time each system takes to make a writable branch of the workspace",
         panels=[
-            panel("fork.p50", "p50 over 1,000 branches", "ms", systems=FORKABLE),
-            panel("fork-bytes.1000", "storage added by 1,000 branches", "MiB", systems=FORKABLE),
+            panel("fork.p50", "p50 over up to 1,000 branches", "s", systems=FORKABLE),
+            panel("fork-bytes.per_branch", "storage added per branch", "B", systems=FORKABLE),
+            panel("fork-bytes.per_edit", "storage added by a 5 MiB edit to a branch", "B", systems=FORKABLE),
         ]),
     "cold": dict(
         title="Cold start: empty host to first git status",

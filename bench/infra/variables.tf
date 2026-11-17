@@ -1,13 +1,13 @@
 variable "region" {
   description = "AWS region for the hosts, the bucket and the registry."
   type        = string
-  default     = "us-east-1"
+  default     = "eu-north-1"
 }
 
 variable "instance_type" {
   description = "Instance type of each bench host. It needs local NVMe instance storage."
   type        = string
-  default     = "m6id.4xlarge"
+  default     = "m8id.4xlarge"
 }
 
 variable "second_host" {
@@ -39,9 +39,9 @@ variable "root_volume_gib" {
 }
 
 variable "ebs_volume_gib" {
-  description = "Size of the gp3 volume attached to host a for the EBS rows."
+  description = "Size of the gp3 volume attached to host a for the EBS rows. It holds the workspace image (about 5 GiB); every EBS branch is a volume of this size."
   type        = number
-  default     = 100
+  default     = 16
 }
 
 variable "max_hours" {

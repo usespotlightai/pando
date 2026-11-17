@@ -33,7 +33,7 @@ provider "aws" {
 variable "region" {
   description = "Region of the state bucket and the bench."
   type        = string
-  default     = "us-east-1"
+  default     = "eu-north-1"
 }
 
 variable "github_repository" {

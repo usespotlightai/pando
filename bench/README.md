@@ -42,14 +42,34 @@ in the following order on a fresh branch:
 
 | ID | Measure | Method |
 |---|---|---|
-| `fork` | time to make a writable branch | p50 / p99 over 1,000 branches of one base; also branch 1 vs branch 1,000 |
-| `fork-bytes` | storage per branch | bytes added after 1,000 branches, and after 20 branches with a 5 MiB edit each |
+| `fork` | time to make a writable branch | p50 / p99 over up to 1,000 branches of one base; also the first branch vs the last |
+| `fork-bytes` | storage per branch | bytes added per branch, and per 5 MiB edit to each of 20 branches |
 | `cold` | time to complete the first command on an empty host | fork, then attach/mount, then finish `git status`; empty cache, nothing on the host |
 | `warm` | time to complete the first command on a host that ran a sibling | same, with the system's cache or base already on the host |
 | `replay` | slowdown while the agent works | the 14 commands, total and per command, as a ratio to native ext4 on local NVMe |
 | `save` | time to durable | from the last write to the branch being readable on another host; also bytes uploaded after `npm ci` |
 | `fio` | raw I/O | 4 KiB random read QD1 and 4 x QD32, 4 KiB random write 4 x QD32, 1 MiB sequential read and write |
 | `crash` | crash survival | `kill -9` of the storage daemon mid-write: failed writes, fsck, file correctness on a fresh host |
+
+`bench/harness` implements `fork` and `fork-bytes` so far (`bench/run.sh fork`, or the `fork`
+choice of the workflow's `measure` input). Each system loads the workspace once, then makes
+branches one after another:
+
+| System | A branch is | Timed until | Branches |
+|---|---|---|---|
+| XFS reflink (local) | `cp --reflink=always` of the ext4 image | the copy returns | 1,000 |
+| Docker (overlayfs) | `docker create` from an image of the workspace | the container exists | 1,000 |
+| JuiceFS | `juicefs clone` of the workspace directory | the clone returns | 100, as each clone copies the metadata of every entry |
+| EBS snapshot to volume | `create-volume` from a snapshot of the workspace | the volume is `available` | 10, as each is a billed volume |
+| Pando | `pando branch` of a branch made by `pando import` of the ext4 image | the command returns | 1,000 |
+
+Storage is what the system holds after the branches minus before them, divided by the number
+of branches: bytes used on the file system for local systems, metadata plus bucket objects for
+JuiceFS, bucket objects for Pando (its local cache is not counted), and the provisioned size for
+EBS, which bills that whatever a volume holds. The edit row writes and fsyncs a 5 MiB file of
+random bytes into each of the first 20 branches. For Pando that means attaching the branch as a
+ublk device, mounting it, writing, unmounting and running `pando detach`, which publishes the
+branch.
 
 Repeat every run 5 times, dropping caches between repetitions, and report the median and range.
 Write raw results to `bench/results/<measure>.csv` with the columns
@@ -98,9 +118,9 @@ The following are excluded:
 
 ## The bench VM
 
-The benchmarks use one AWS host in us-east-1 and a bucket in the same region:
+The benchmarks use one AWS host in eu-north-1 and a bucket in the same region:
 
-- **instance**: `m6id.4xlarge` (16 vCPU, 64 GiB, 950 GB local NVMe), about $0.95/h on demand.
+- **instance**: `m8id.4xlarge` (16 vCPU, 64 GiB, 950 GB local NVMe), about $1.11/h on demand.
   Local NVMe holds each system's cache, the native baseline and reflink images (XFS). An attached
   gp3 EBS volume serves the EBS rows. A second, identical host is started only for the cross-host
   `cold` and `save` measures.
@@ -180,7 +200,7 @@ One-time setup:
    | variable | `AWS_ROLE_ARN` | bootstrap output `role_arn` |
    | variable | `BENCH_STATE_BUCKET` | bootstrap output `state_bucket` |
    | variable | `BENCH_HOST_BOUNDARY` | bootstrap output `host_permissions_boundary` |
-   | variable | `AWS_REGION` | optional, default `us-east-1` |
+   | variable | `AWS_REGION` | optional, default `eu-north-1` |
    | secret | `S3_ACCESS_KEY_ID` | the access key id from step 2 |
    | secret | `S3_SECRET_ACCESS_KEY` | the secret access key from step 2 |
 

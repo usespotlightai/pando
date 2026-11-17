@@ -95,7 +95,7 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 ## Benchmarks
 
 > **Placeholder.** The charts will be populated after the harness runs on the bench VM
-> (AWS `m6id.4xlarge`, us-east-1; see [bench/README.md](bench/README.md)). Run
+> (AWS `m8id.4xlarge`, eu-north-1; see [bench/README.md](bench/README.md)). Run
 > `python3 bench/plot.py` to redraw them from `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
@@ -104,7 +104,8 @@ with Pando in blue.
 
 ### Fork
 
-Time to create a writable branch and storage added by 1,000 branches.
+Time to create a writable branch and storage added by 1,000 branches. These rows are from one
+run so far, not five.
 
 <!-- bench:fork -->
 <picture>
@@ -115,20 +116,30 @@ Time to create a writable branch and storage added by 1,000 branches.
 <details>
 <summary>Numbers</summary>
 
-| p50 over 1,000 branches | median | range |
+| p50 over up to 1,000 branches | median | range |
 |---|---|---|
 | Pando | — | |
-| docker pull (overlayfs) | — | |
+| Docker (overlayfs) | — | |
 | EBS snapshot to volume | — | |
 | JuiceFS | — | |
 | ZeroFS (NBD) | — | |
 | Archil | — | |
 | XFS reflink (local) | — | |
 
-| storage added by 1,000 branches | median | range |
+| storage added per branch | median | range |
 |---|---|---|
 | Pando | — | |
-| docker pull (overlayfs) | — | |
+| Docker (overlayfs) | — | |
+| EBS snapshot to volume | — | |
+| JuiceFS | — | |
+| ZeroFS (NBD) | — | |
+| Archil | — | |
+| XFS reflink (local) | — | |
+
+| storage added by a 5 MiB edit to a branch | median | range |
+|---|---|---|
+| Pando | — | |
+| Docker (overlayfs) | — | |
 | EBS snapshot to volume | — | |
 | JuiceFS | — | |
 | ZeroFS (NBD) | — | |
@@ -156,7 +167,7 @@ Time to fork, mount and finish the first `git status` on a host that has never s
 | Pando | — | |
 | tar from S3 | — | |
 | image download from S3 | — | |
-| docker pull (overlayfs) | — | |
+| Docker (overlayfs) | — | |
 | SOCI lazy pull | — | |
 | Nydus lazy pull | — | |
 | EBS snapshot to volume | — | |
@@ -187,7 +198,7 @@ Time to start on a host that has already run a branch of the same base.
 | Pando | — | |
 | tar from S3 | — | |
 | image download from S3 | — | |
-| docker pull (overlayfs) | — | |
+| Docker (overlayfs) | — | |
 | SOCI lazy pull | — | |
 | Nydus lazy pull | — | |
 | EBS snapshot to volume | — | |
@@ -219,7 +230,7 @@ Time to run the 14 command types agents use most often in Spotlight sandboxes (`
 | native ext4 (NVMe) | — | |
 | Pando | — | |
 | image download from S3 | — | |
-| docker pull (overlayfs) | — | |
+| Docker (overlayfs) | — | |
 | Nydus lazy pull | — | |
 | EBS snapshot to volume | — | |
 | JuiceFS | — | |
@@ -247,7 +258,7 @@ After `npm ci`, time from the last write until another host can open the branch.
 |---|---|---|
 | Pando | — | |
 | tar from S3 | — | |
-| docker pull (overlayfs) | — | |
+| Docker (overlayfs) | — | |
 | EBS snapshot to volume | — | |
 | JuiceFS | — | |
 | ZeroFS (NBD) | — | |
@@ -257,7 +268,7 @@ After `npm ci`, time from the last write until another host can open the branch.
 |---|---|---|
 | Pando | — | |
 | tar from S3 | — | |
-| docker pull (overlayfs) | — | |
+| Docker (overlayfs) | — | |
 | EBS snapshot to volume | — | |
 | JuiceFS | — | |
 | ZeroFS (NBD) | — | |

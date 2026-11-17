@@ -1,0 +1,13 @@
+system,workspace,measure,rep,value,unit,notes
+XFS reflink (local),small,fork.p50,1,0.00100268,s,1000 branches
+XFS reflink (local),small,fork.p99,1,0.0012973,s,1000 branches
+XFS reflink (local),small,fork.first,1,0.00157141,s,1000 branches
+XFS reflink (local),small,fork.last,1,0.00106632,s,1000 branches
+XFS reflink (local),small,fork-bytes.per_branch,1,4722.69,B,1000 branches
+XFS reflink (local),small,fork-bytes.per_edit,1,6.02952e+06,B,"20 branches, 5 MiB each"
+EBS snapshot to volume,small,fork.p50,1,2.59716,s,10 branches
+EBS snapshot to volume,small,fork.p99,1,2.72189,s,10 branches
+EBS snapshot to volume,small,fork.first,1,2.72189,s,10 branches
+EBS snapshot to volume,small,fork.last,1,2.58104,s,10 branches
+EBS snapshot to volume,small,fork-bytes.per_branch,1,1.71799e+10,B,10 branches
+

@@ -8,7 +8,7 @@
   <text x="220" y="79.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
   <text x="202" y="105.0" font-size="12" fill="#1f2328" text-anchor="end">tar from S3</text>
   <text x="220" y="105.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
-  <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end">docker pull (overlayfs)</text>
+  <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end">Docker (overlayfs)</text>
   <text x="220" y="131.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
   <text x="202" y="157.0" font-size="12" fill="#1f2328" text-anchor="end">EBS snapshot to volume</text>
   <text x="220" y="157.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
@@ -24,7 +24,7 @@
   <text x="220" y="297.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
   <text x="202" y="323.0" font-size="12" fill="#1f2328" text-anchor="end">tar from S3</text>
   <text x="220" y="323.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
-  <text x="202" y="349.0" font-size="12" fill="#1f2328" text-anchor="end">docker pull (overlayfs)</text>
+  <text x="202" y="349.0" font-size="12" fill="#1f2328" text-anchor="end">Docker (overlayfs)</text>
   <text x="220" y="349.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
   <text x="202" y="375.0" font-size="12" fill="#1f2328" text-anchor="end">EBS snapshot to volume</text>
   <text x="220" y="375.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>

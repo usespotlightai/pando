@@ -12,6 +12,15 @@ on:
         type: choice
         options: [run, destroy]
         default: run
+      measure:
+        description: "smoke: check the hosts only. fork: smoke, then the fork measure on host a."
+        type: choice
+        options: [smoke, fork]
+        default: smoke
+      fork_systems:
+        description: "fork: comma-separated systems (pando, reflink, docker, juicefs, ebs); empty for all"
+        type: string
+        default: ""
       second_host:
         description: "Also start host b (cross-host cold and save measures)"
         type: boolean
@@ -30,7 +39,7 @@ permissions:
   id-token: write
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-north-1' }}
   TF_IN_AUTOMATION: "1"
   TF_INPUT: "0"
 
@@ -122,7 +131,7 @@ jobs:
               ssh "$ip" 'sudo sh -c "umask 077; cat > /etc/pando-bench.secrets"'
           done < "$RUNNER_TEMP/hosts"
 
-      - name: Run the bench
+      - name: Smoke checks
         if: inputs.action == 'run'
         run: |
           status=0
@@ -130,6 +139,15 @@ jobs:
             ssh -n "$ip" 'cd /data/pando && sudo bench/run.sh smoke' || status=1
           done < "$RUNNER_TEMP/hosts"
           exit $status
+
+      - name: Fork measure (host a)
+        if: inputs.action == 'run' && inputs.measure == 'fork'
+        env:
+          SYSTEMS: ${{ inputs.fork_systems }}
+        run: |
+          case $SYSTEMS in *[!a-z,]*) echo "fork_systems: letters and commas only" >&2; exit 2 ;; esac
+          ip=$(awk '$1 == "a" {print $2}' "$RUNNER_TEMP/hosts")
+          ssh -n "$ip" "cd /data/pando && sudo bench/run.sh workspace && sudo bench/run.sh fork ${SYSTEMS:+--systems $SYSTEMS}"
 
       - name: Collect the results
         if: always() && inputs.action == 'run'
@@ -146,6 +164,18 @@ jobs:
           name: bench-results-${{ github.run_id }}
           path: ${{ runner.temp }}/results
           if-no-files-found: warn
+
+      # The EBS rows make snapshots and volumes outside Terraform; remove what a failed run left.
+      - name: Delete EBS snapshots and volumes the harness made
+        if: always()
+        run: |
+          filters=(Name=tag:Project,Values=pando-bench Name=tag:Origin,Values=harness)
+          for v in $(aws ec2 describe-volumes --filters "${filters[@]}" --query 'Volumes[].VolumeId' --output text); do
+            aws ec2 delete-volume --volume-id "$v" || echo "could not delete volume $v"
+          done
+          for s in $(aws ec2 describe-snapshots --owner-ids self --filters "${filters[@]}" --query 'Snapshots[].SnapshotId' --output text); do
+            aws ec2 delete-snapshot --snapshot-id "$s" || echo "could not delete snapshot $s"
+          done
 
       - name: Destroy everything
         if: always()

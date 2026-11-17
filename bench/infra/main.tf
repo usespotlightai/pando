@@ -154,6 +154,13 @@ resource "aws_iam_role_policy" "host" {
         Condition = { StringEquals = { "aws:ResourceTag/Project" = "pando-bench" } }
       },
       {
+        Sid       = "EbsCreateVolumeFromTaggedSnapshot"
+        Effect    = "Allow"
+        Action    = "ec2:CreateVolume"
+        Resource  = "arn:aws:ec2:${var.region}::snapshot/*"
+        Condition = { StringEquals = { "aws:ResourceTag/Project" = "pando-bench" } }
+      },
+      {
         Sid       = "EbsTagOnCreate"
         Effect    = "Allow"
         Action    = "ec2:CreateTags"
