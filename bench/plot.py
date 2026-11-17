@@ -113,7 +113,8 @@ CHARTS = {
 # Values are converted to a base unit per kind before plotting and formatting.
 TO_BASE = {"us": ("time", 1e-6), "ms": ("time", 1e-3), "s": ("time", 1.0), "min": ("time", 60.0),
            "B": ("bytes", 1), "KiB": ("bytes", 1 << 10), "MiB": ("bytes", 1 << 20), "GiB": ("bytes", 1 << 30),
-           "x": ("ratio", 1.0), "IOPS": ("iops", 1.0), "MB/s": ("mbps", 1.0)}
+           "x": ("ratio", 1.0), "IOPS": ("iops", 1.0), "MB/s": ("mbps", 1.0),
+           "count": ("count", 1.0), "code": ("count", 1.0)}
 
 
 def fmt(v, kind):

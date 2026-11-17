@@ -417,7 +417,7 @@ class JuiceFS(Workspace):
     """
 
     name = "JuiceFS"
-    volume = "pando-bench-start"
+    volume = "pando-bench-juicefs"
     dir = DIR / "juicefs"
     mnt = DIR / "juicefs-mnt"
 
@@ -518,22 +518,30 @@ class Pando(Workspace):
 
     def open(self, i):
         self._pando("branch", "base", f"b{i}", capture=True)
+        self.attach(i, f"b{i}")
+        self.root(i).mkdir(exist_ok=True)
+        run("mount", self._mounted(i), self.root(i))
+
+    def attach(self, i, name, *extra):
+        """Starts `pando attach` of branch name as device i; returns once the device is up."""
         out = open(self.dir / "attach.log", "a")
-        args = ["attach", f"b{i}", "--device", self._device(i), "--state", str(self.dir / "state")]
+        args = ["attach", name, "--device", self._device(i), "--state", str(self.dir / "state"), *extra]
         if self.handoff:
             args += ["--dm", self._dm(i), "--images", str(self.dir / "images")]
         p = subprocess.Popen(self._args() + args,
                              env=dict(os.environ, **self.keys), stdout=subprocess.PIPE, stderr=out, text=True)
         self.procs[i] = (p, out)
+        self.wait_line(i, "attached ")
+
+    def wait_line(self, i, prefix):
+        """Reads device i's attach output up to the first line starting with prefix."""
+        p, out = self.procs[i]
         for line in p.stdout:
             out.write(line)
-            if line.startswith("attached "):
+            if line.startswith(prefix):
                 out.flush()
-                break
-        else:
-            raise SystemExit(f"pando attach b{i} exited with {p.wait()}")
-        self.root(i).mkdir(exist_ok=True)
-        run("mount", self._mounted(i), self.root(i))
+                return line
+        raise SystemExit(f"pando attach of device {i} exited with {p.wait()} before printing {prefix.strip()!r}")
 
     def close(self, i):
         unmount(self.root(i))

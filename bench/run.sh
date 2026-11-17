@@ -4,6 +4,7 @@
 #   bench/run.sh workspace     builds the workspace image (once per host)
 #   bench/run.sh fork [args]   the fork measure (python3 bench/harness fork --help)
 #   bench/run.sh cold | warm | replay [args]   the start and workload measures
+#   bench/run.sh fio | save | crash [args]     raw I/O, saving after npm ci, and crash survival
 # Results go to $PANDO_BENCH_RESULTS (default /data/results). Pando's store keys, when the
 # workflow passed them, are in the file named by PANDO_ENV_FILE and are never printed.
 #
@@ -93,6 +94,6 @@ smoke() {
 
 case ${1:-} in
   smoke) smoke | tee "$results/smoke-$PANDO_BENCH_HOST.txt"; exit "${PIPESTATUS[0]}" ;;
-  workspace | fork | cold | warm | replay) python3 "$(dirname "$0")/harness" "$@" ;;
-  *) echo "usage: bench/run.sh smoke | workspace | fork | cold | warm | replay [args]" >&2; exit 2 ;;
+  workspace | fork | cold | warm | replay | fio | save | crash) python3 "$(dirname "$0")/harness" "$@" ;;
+  *) echo "usage: bench/run.sh smoke | workspace | fork | cold | warm | replay | fio | save | crash [args]" >&2; exit 2 ;;
 esac

@@ -2,7 +2,7 @@
 
 This plan defines how to compare Pando with the storage systems used by AI sandboxes: what to
 measure, which systems to compare and where to run them. `bench/harness` implements `fork`,
-`fork-bytes`, `cold`, `warm` and `replay`; `fio` and `crash` are still to come.
+`fork-bytes`, `cold`, `warm`, `replay`, `save`, `fio` and `crash`.
 
 ## The question
 
@@ -95,13 +95,40 @@ base where it would in production, and every branch is opened on the bench host:
 - **warm** first opens a sibling branch and runs `git status` in it, so the system's cache,
   image or base is on the host, then drops the page cache and measures the same way. Pando
   (handoff) also builds the host's base image of the root, as `pando follow` would.
-- Commands run in their own process group, killed when the command ends, so nothing they leave
-  behind holds the mount when the branch closes.
 - **replay** opens a fresh branch on a warm host, drops the page cache and runs the 14 commands
   of the agent workload, each timed. `replay.total` is the sum as a ratio to native ext4 in the
-  same run, on a 64 GiB ext4 file system of its own on the local NVMe (`/native`).
+  same run, on a 64 GiB ext4 file system of its own on the local NVMe (`/native`). Commands run
+  in their own process group, killed when the command ends, so nothing they leave behind holds
+  the mount when the branch closes.
+- **save** runs `npm ci` in a fresh branch on a warm host, then times the step that makes the
+  branch durable where another host would open it, and counts the bytes `npm ci`'s changes
+  added to the store:
 
-Repeat every run 5 times, dropping caches between repetitions, and report the median and range.
+  | System | Made durable by | Bytes counted |
+  |---|---|---|
+  | Pando | unmount and `pando detach`, which publishes the branch | growth of its bucket prefix since before `npm ci`, snapshots during the run included |
+  | tar from S3 | tar and zstd of the branch, streamed to the bucket | the object |
+  | Docker (overlayfs) | `docker commit` and `docker push` | the pushed image's size beyond the workspace image's |
+  | EBS snapshot to volume | unmount, `create-snapshot`, until it completes | blocks the snapshot holds beyond the workspace snapshot (`ListChangedBlocks`) |
+  | JuiceFS | `sync` of the mount; data uploads as each file closes, metadata is in SQLite on the host | growth of its bucket prefix |
+
+- **fio** opens a fresh branch on a warm host, lays out one 1 GiB file and runs each job for 20 s
+  after a 2 s ramp with direct I/O, page cache dropped before each job. Pando (after handoff)
+  waits until the device has switched to its local image. Local NVMe is the `/native` ext4 file
+  system and EBS gp3 a volume from the workspace snapshot at gp3's baseline (3,000 IOPS,
+  125 MB/s).
+- **crash** has a writer write 256 KiB files into a fresh branch, fsyncing each file and the
+  directory, and log each write as acknowledged or failed (after a failure it tries the next
+  file 50 ms later). Five seconds in, the storage daemon gets `kill -9` and is restarted at
+  once: Pando with `pando attach --recover` on the same device, JuiceFS with a new mount on the
+  same mount point. The writer runs 5 s more once a write succeeds again, and the branch closes
+  as usual. A fresh host is then a new cache and state directory on the same VM, sharing nothing
+  with the first: the file system is checked (`e2fsck -fn` for Pando, `juicefs fsck` for JuiceFS)
+  and every acknowledged file is read back. The stall is the longest gap between acknowledged
+  writes.
+
+Repeat every run 5 times (3 for `replay`, `save`, `fio` and `crash`), dropping caches between
+repetitions, and report the median and range.
 Write raw results to `bench/results/<measure>.csv` with the columns
 `system,workspace,measure,rep,value,unit,notes`. A plot script converts those results to
 `docs/bench/<measure>.svg` for the top-level README to embed.

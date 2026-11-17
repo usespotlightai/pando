@@ -177,6 +177,14 @@ resource "aws_iam_role_policy" "host" {
         Resource  = "*"
         Condition = { StringEquals = { "aws:ResourceTag/Project" = "pando-bench" } }
       },
+      {
+        # The save measure counts the blocks an EBS snapshot stores beyond the workspace snapshot.
+        Sid       = "EbsChangedBlocks"
+        Effect    = "Allow"
+        Action    = "ebs:ListChangedBlocks"
+        Resource  = "arn:aws:ec2:${var.region}::snapshot/*"
+        Condition = { StringEquals = { "aws:ResourceTag/Project" = "pando-bench" } }
+      },
     ]
   })
 }
