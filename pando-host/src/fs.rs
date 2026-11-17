@@ -176,17 +176,8 @@ impl LocalFile for HostFile {
         .await
     }
 
-    fn write_at_nowait(&self, bufs: &[Bytes], offset: u64) -> io::Result<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            let bufs: Vec<&[u8]> = bufs.iter().map(|b| &b[..]).collect();
-            crate::linux::write_nowait(&self.file, &bufs, offset)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (bufs, offset);
-            Ok(0)
-        }
+    fn write_at_now(&self, b: &[u8], offset: u64) -> io::Result<()> {
+        self.file.write_all_at(b, offset)
     }
 
     async fn sync_data(&self) -> io::Result<()> {

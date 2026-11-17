@@ -20,7 +20,9 @@ const SHARDS: usize = 16;
 /// flush removes the generations below it. A generation has one file per shard of chunk
 /// indexes, so writes to different chunks append in parallel and one chunk's records stay in
 /// order. A record is `[chunk index u64][offset in chunk u32][length u32][data]`. Appends to one
-/// shard queue while a write is in flight and go out together in the next one.
+/// shard queue while a write is in flight and go out together in the next one, written on the
+/// calling thread: the page cache takes them without a wait, so a hop to the blocking pool
+/// would cost more than the write.
 #[derive(Debug)]
 pub(crate) struct Journal {
     fs: Arc<dyn LocalFs>,
@@ -31,7 +33,7 @@ pub(crate) struct Journal {
 #[derive(Debug)]
 struct Generation {
     number: u64,
-    shards: Vec<Arc<Shard>>,
+    shards: Vec<Shard>,
 }
 
 #[derive(Debug)]
@@ -40,8 +42,7 @@ struct Shard {
     queue: Mutex<Queue>,
 }
 
-/// The records waiting for a shard's next write. While `writing`, one caller or task writes
-/// them.
+/// The records waiting for a shard's next write. While `writing`, one caller writes them.
 #[derive(Debug, Default)]
 struct Queue {
     end: u64,
@@ -52,7 +53,7 @@ struct Queue {
 
 impl Shard {
     /// Writes the queued records until none are left.
-    async fn drain(&self) {
+    fn drain(&self) {
         loop {
             let (batch, waiters, at) = {
                 let mut q = self.queue.lock().expect("journal queue lock");
@@ -63,41 +64,16 @@ impl Shard {
                 (q.records.split().freeze(), std::mem::take(&mut q.waiters), q.end)
             };
             let n = batch.len() as u64;
-            let done = self.write(batch, at).await.map_err(|e| Arc::new(Error::Io(e)));
+            let done = self
+                .file
+                .write_at_now(&batch, at)
+                .map_err(|e| Arc::new(Error::Io(e)));
             if done.is_ok() {
                 self.queue.lock().expect("journal queue lock").end += n;
             }
             for w in waiters {
                 let _ = w.send(done.clone());
             }
-        }
-    }
-
-    async fn write(&self, batch: Bytes, at: u64) -> std::io::Result<()> {
-        let done = self.file.write_at_nowait(std::slice::from_ref(&batch), at)?;
-        if done < batch.len() {
-            self.file
-                .write_at(vec![batch.slice(done..)], at + done as u64)
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-/// The caller that writes a shard's queue. Dropped before the queue is empty, it hands the
-/// rest to a task, so queued appends never wait for a writer that is gone.
-struct Lead(Option<Arc<Shard>>);
-
-impl Drop for Lead {
-    fn drop(&mut self) {
-        let Some(shard) = self.0.take() else {
-            return;
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                rt.spawn(async move { shard.drain().await });
-            }
-            Err(_) => shard.queue.lock().expect("journal queue lock").writing = false,
         }
     }
 }
@@ -175,13 +151,13 @@ impl Journal {
         for s in 0..SHARDS {
             let file = self.fs.open(&self.path(number, s), Open::Create).await?;
             let end = file.size().await?;
-            shards.push(Arc::new(Shard {
+            shards.push(Shard {
                 file,
                 queue: Mutex::new(Queue {
                     end,
                     ..Queue::default()
                 }),
-            }));
+            });
         }
         *self.current.write().expect("journal lock") = Some(Arc::new(Generation { number, shards }));
         Ok(())
@@ -218,9 +194,7 @@ impl Journal {
             !std::mem::replace(&mut q.writing, true)
         };
         if lead {
-            let mut lead = Lead(Some(shard.clone()));
-            shard.drain().await;
-            lead.0 = None;
+            shard.drain();
         }
         match rx.await {
             Ok(done) => done.map_err(Error::Shared),
