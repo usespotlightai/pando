@@ -63,6 +63,7 @@ pub trait LocalFile: Send + Sync + fmt::Debug {
     fn write_at_now(&self, b: &[u8], offset: u64) -> io::Result<()>;
     async fn sync_data(&self) -> io::Result<()>;
     async fn set_len(&self, len: u64) -> io::Result<()>;
+    /// The length in bytes; for a block device, the size of the device.
     async fn size(&self) -> io::Result<u64>;
     /// Starts writing dirty pages back, without waiting for the disk, so a later sync waits less.
     async fn start_writeback(&self);

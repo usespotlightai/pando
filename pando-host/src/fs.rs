@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::io::{self, Seek, SeekFrom};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -192,7 +192,14 @@ impl LocalFile for HostFile {
 
     async fn size(&self) -> io::Result<u64> {
         let f = self.file.clone();
-        blocking(move || Ok(f.metadata()?.len())).await
+        blocking(move || {
+            let m = f.metadata()?;
+            if m.file_type().is_block_device() {
+                return (&*f).seek(SeekFrom::End(0));
+            }
+            Ok(m.len())
+        })
+        .await
     }
 
     async fn start_writeback(&self) {
@@ -326,5 +333,31 @@ mod tests {
             .collect();
         assert_eq!(names, ["a", "b"]);
         let _held = fs.lock(&dir.path().join("lock")).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_reports_its_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = HostFs.open(&dir.path().join("a"), Open::CreateNew).await.unwrap();
+        f.set_len(5 << 20).await.unwrap();
+        assert_eq!(f.size().await.unwrap(), 5 << 20);
+        f.write_at(vec![Bytes::from_static(b"x")], 6 << 20).await.unwrap();
+        assert_eq!(f.size().await.unwrap(), (6 << 20) + 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a block device named in PANDO_TEST_BLOCK_DEVICE, such as /dev/loop0"]
+    async fn a_block_device_reports_its_size() {
+        let dev = PathBuf::from(std::env::var("PANDO_TEST_BLOCK_DEVICE").unwrap());
+        let name = dev.file_name().unwrap().to_str().unwrap();
+        let sectors: u64 = std::fs::read_to_string(format!("/sys/class/block/{name}/size"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let f = HostFs.open(&dev, Open::Read).await.unwrap();
+        assert_eq!(f.size().await.unwrap(), sectors * 512);
+        assert_eq!(f.read_at(512, 0).await.unwrap().len(), 512);
     }
 }
