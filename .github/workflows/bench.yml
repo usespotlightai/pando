@@ -13,9 +13,9 @@ on:
         options: [run, destroy]
         default: run
       measure:
-        description: "smoke: check the hosts only. Otherwise smoke, then that measure on host a; all: fork, cold, warm and replay."
+        description: "smoke: check the hosts only. Otherwise smoke, then that measure on host a; all: fork, cold, warm, replay, save, fio and crash."
         type: choice
-        options: [smoke, fork, cold, warm, replay, all]
+        options: [smoke, fork, cold, warm, replay, save, fio, crash, all]
         default: smoke
       systems:
         description: "Comma-separated systems for the measure (see bench/README.md); empty for all"
@@ -148,7 +148,7 @@ jobs:
         run: |
           case $SYSTEMS in *[!a-z,]*) echo "systems: letters and commas only" >&2; exit 2 ;; esac
           measures=$MEASURE
-          [ "$MEASURE" = all ] && measures="fork cold warm replay"
+          [ "$MEASURE" = all ] && measures="fork cold warm replay save fio crash"
           ip=$(awk '$1 == "a" {print $2}' "$RUNNER_TEMP/hosts")
           ssh -n "$ip" "cd /data/pando && sudo bench/run.sh workspace"
           status=0
