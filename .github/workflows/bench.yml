@@ -13,12 +13,12 @@ on:
         options: [run, destroy]
         default: run
       measure:
-        description: "smoke: check the hosts only. fork: smoke, then the fork measure on host a."
+        description: "smoke: check the hosts only. Otherwise smoke, then that measure on host a; all: fork, cold, warm and replay."
         type: choice
-        options: [smoke, fork]
+        options: [smoke, fork, cold, warm, replay, all]
         default: smoke
-      fork_systems:
-        description: "fork: comma-separated systems (pando, reflink, docker, juicefs, ebs); empty for all"
+      systems:
+        description: "Comma-separated systems for the measure (see bench/README.md); empty for all"
         type: string
         default: ""
       second_host:
@@ -140,14 +140,22 @@ jobs:
           done < "$RUNNER_TEMP/hosts"
           exit $status
 
-      - name: Fork measure (host a)
-        if: inputs.action == 'run' && inputs.measure == 'fork'
+      - name: Measures (host a)
+        if: inputs.action == 'run' && inputs.measure != 'smoke'
         env:
-          SYSTEMS: ${{ inputs.fork_systems }}
+          MEASURE: ${{ inputs.measure }}
+          SYSTEMS: ${{ inputs.systems }}
         run: |
-          case $SYSTEMS in *[!a-z,]*) echo "fork_systems: letters and commas only" >&2; exit 2 ;; esac
+          case $SYSTEMS in *[!a-z,]*) echo "systems: letters and commas only" >&2; exit 2 ;; esac
+          measures=$MEASURE
+          [ "$MEASURE" = all ] && measures="fork cold warm replay"
           ip=$(awk '$1 == "a" {print $2}' "$RUNNER_TEMP/hosts")
-          ssh -n "$ip" "cd /data/pando && sudo bench/run.sh workspace && sudo bench/run.sh fork ${SYSTEMS:+--systems $SYSTEMS}"
+          ssh -n "$ip" "cd /data/pando && sudo bench/run.sh workspace"
+          status=0
+          for m in $measures; do
+            ssh -n "$ip" "cd /data/pando && sudo bench/run.sh $m ${SYSTEMS:+--systems $SYSTEMS}" || status=1
+          done
+          exit $status
 
       - name: Collect the results
         if: always() && inputs.action == 'run'

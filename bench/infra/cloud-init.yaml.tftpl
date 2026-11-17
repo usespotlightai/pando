@@ -51,8 +51,9 @@ write_files:
     content: |
       options nbd nbds_max=16
 
-  # Instance storage is empty after every stop and start, so this runs at each boot: it puts
-  # XFS (reflink on) on the instance-store NVMe disks, striped when there are several, at /data.
+  # Instance storage is empty after every stop and start, so this runs at each boot. It splits
+  # the instance-store NVMe disks (striped when there are several) with LVM: 64 GiB of ext4 at
+  # /native for the native baseline, and the rest as XFS (reflink on) at /data.
   - path: /usr/local/sbin/pando-bench-data
     permissions: "0755"
     content: |
@@ -71,9 +72,17 @@ write_files:
         mdadm --create /dev/md/pando-data --run --level=0 --raid-devices=$${#disks[@]} "$${disks[@]}"
         dev=/dev/md/pando-data
       fi
-      blkid "$dev" >/dev/null 2>&1 || mkfs.xfs -f -m reflink=1 "$dev"
-      mkdir -p /data
-      mount -o noatime "$dev" /data
+      if ! vgs pando >/dev/null 2>&1; then
+        pvcreate -ff -y "$dev"
+        vgcreate pando "$dev"
+        lvcreate -y -L 64G -n native pando
+        lvcreate -y -l 100%FREE -n data pando
+      fi
+      blkid /dev/pando/data >/dev/null 2>&1 || mkfs.xfs -f -m reflink=1 /dev/pando/data
+      blkid /dev/pando/native >/dev/null 2>&1 || mkfs.ext4 -q -F /dev/pando/native
+      mkdir -p /data /native
+      mount -o noatime /dev/pando/data /data
+      mount -o noatime /dev/pando/native /native
       chown ubuntu:ubuntu /data
 
   - path: /etc/systemd/system/pando-bench-data.service

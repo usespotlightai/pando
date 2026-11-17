@@ -1,7 +1,8 @@
 # Benchmarks
 
 This plan defines how to compare Pando with the storage systems used by AI sandboxes: what to
-measure, which systems to compare and where to run them. The harness has not been written yet.
+measure, which systems to compare and where to run them. `bench/harness` implements `fork`,
+`fork-bytes`, `cold`, `warm` and `replay`; `fio` and `crash` are still to come.
 
 ## The question
 
@@ -51,9 +52,9 @@ in the following order on a fresh branch:
 | `fio` | raw I/O | 4 KiB random read QD1 and 4 x QD32, 4 KiB random write 4 x QD32, 1 MiB sequential read and write |
 | `crash` | crash survival | `kill -9` of the storage daemon mid-write: failed writes, fsck, file correctness on a fresh host |
 
-`bench/harness` implements `fork` and `fork-bytes` so far (`bench/run.sh fork`, or the `fork`
-choice of the workflow's `measure` input). Each system loads the workspace once, then makes
-branches one after another:
+Run a measure with `bench/run.sh <measure>` on the host, or pick it in the workflow's `measure`
+input (`all` runs every implemented one). For `fork`, each system loads the workspace once, then
+makes branches one after another:
 
 | System | A branch is | Timed until | Branches |
 |---|---|---|---|
@@ -70,6 +71,31 @@ EBS, which bills that whatever a volume holds. The edit row writes and fsyncs a 
 random bytes into each of the first 20 branches. For Pando that means attaching the branch as a
 ublk device, mounting it, writing, unmounting and running `pando detach`, which publishes the
 branch.
+
+`bench/run.sh cold`, `warm` and `replay` open fresh branches and use them. Each system keeps its
+base where it would in production, and every branch is opened on the bench host:
+
+| System | Base kept in | Opening a branch |
+|---|---|---|
+| Pando | the bucket, after `pando import` | `pando branch`, `pando attach` as a ublk device, mount |
+| tar from S3 | a zstd tar in the bucket | download and extract to the local NVMe |
+| image download from S3 | a zstd ext4 image in the bucket | download, decompress, loop-mount |
+| Docker (overlayfs) | an image in ECR: Ubuntu with git, plus the workspace | `docker pull`, `docker run` |
+| EBS snapshot to volume | a snapshot of the ext4 image | `create-volume`, `attach-volume`, mount |
+| JuiceFS | the bucket, metadata in SQLite on the host | mount, `juicefs clone` |
+| XFS reflink (local) | the ext4 image on the host | reflink copy, loop-mount (`warm` only) |
+
+- **cold** empties the host first: Pando's cache and branch state, the downloaded tar or image,
+  Docker's images, JuiceFS's data cache. JuiceFS's metadata stays, as it would on a metadata
+  server. The page cache is dropped. The rows are the time to open the branch, the time of the
+  first `git status`, and their sum. Pando records each mount's first reads in the bucket and
+  prefetches them on the next mount, so its first repetition, with no recording yet, is slower
+  than the rest.
+- **warm** first opens a sibling branch and runs `git status` in it, so the system's cache,
+  image or base is on the host, then drops the page cache and measures the same way.
+- **replay** opens a fresh branch on a warm host, drops the page cache and runs the 14 commands
+  of the agent workload, each timed. `replay.total` is the sum as a ratio to native ext4 in the
+  same run, on a 64 GiB ext4 file system of its own on the local NVMe (`/native`).
 
 Repeat every run 5 times, dropping caches between repetitions, and report the median and range.
 Write raw results to `bench/results/<measure>.csv` with the columns
@@ -147,11 +173,12 @@ terraform init
 terraform apply -var 'ssh_public_key=ssh-ed25519 AAAA...' -var 'ssh_cidrs=["203.0.113.4/32"]'
 ```
 
-At boot, each host formats its instance-store NVMe as XFS with reflink and mounts it at `/data`,
-loads `ublk_drv`, `nbd`, `dm_mod` and `loop`, installs Docker, fio, the btrfs, ZFS and qemu tools
-and the AWS CLI, and turns off background package updates. `/etc/pando-bench.env` holds the
-host's name, the region, the bucket, the registry URL and (on host `a`) the EBS volume id; login
-shells load it. Node.js and the systems under test are installed by the harness, not here.
+At boot, each host splits its instance-store NVMe with LVM into 64 GiB of ext4 at `/native` and
+the rest as XFS with reflink at `/data`, loads `ublk_drv`, `nbd`, `dm_mod` and `loop`, installs
+Docker, fio, the btrfs, ZFS and qemu tools and the AWS CLI, and turns off background package
+updates. `/etc/pando-bench.env` holds the host's name, the region, the bucket, the registry URL
+and (on host `a`) the EBS volume id; login shells load it. Node.js and the systems under test are
+installed by the harness, not here.
 
 Things to know:
 
@@ -176,8 +203,7 @@ only when started by hand (Actions > bench > Run workflow), in the `bench` envir
 requests never reach its AWS role or secrets. Each run makes a fresh SSH key and opens SSH to the
 runner's own address only.
 
-Until the measures are written, `bench/run.sh` runs `smoke`, which checks that the host is
-ready: kernel modules, XFS with reflink on `/data`, the bucket through the host role, the
+`bench/run.sh smoke` checks that the host is ready: kernel modules, XFS with reflink on `/data`, the bucket through the host role, the
 registry, Docker, fio, the EBS volume, and Pando's store keys.
 
 One-time setup:
