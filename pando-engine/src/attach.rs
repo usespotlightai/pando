@@ -103,7 +103,8 @@ pub struct Attachment {
 
 impl Attachment {
     /// Opens branch `name`, with its local state in `dir`. `devices` is the host's device switch,
-    /// which a handoff needs.
+    /// which a handoff needs. It returns before the writer generation is taken: uploads wait
+    /// for it, so a branch another writer holds fails at its first upload.
     pub async fn open(
         ports: &Ports,
         devices: Option<Arc<dyn DeviceSwitch>>,
@@ -160,7 +161,6 @@ impl Attachment {
 
     async fn open_rest(&mut self) -> Result<()> {
         let v = self.volume.clone();
-        v.wait_generation().await?;
         if let (Some(images), Some(from)) = (&self.opts.images, v.copied_from()) {
             let _ = Bases::new(&self.ports, &images.join("bases"))
                 .note_follow(from)
