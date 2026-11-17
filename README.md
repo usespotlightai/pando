@@ -94,8 +94,8 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** Only the fork chart has results so far; the others will be filled in
-> as the harness gains their measures on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> **Partly measured.** The fork and cold-start charts have results so far; the others fill in
+> as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
 > [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
 > `bench/results/`.
 
@@ -155,6 +155,8 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 ### Cold start
 
 Time to fork, mount and finish the first `git status` on a host that has never seen the workspace.
+Pando's slowest repetition, 2.6 s, is the first mount of the base; later mounts prefetch the
+reads it recorded in the bucket.
 
 <!-- bench:cold -->
 <picture>
@@ -167,14 +169,14 @@ Time to fork, mount and finish the first `git status` on a host that has never s
 
 | fork, mount and git status done | median | range |
 |---|---|---|
-| Pando | — | |
-| tar from S3 | — | |
-| image download from S3 | — | |
-| Docker (overlayfs) | — | |
+| Pando | 1.19 s | 1.15 s to 2.6 s |
+| tar from S3 | 4.44 s | 4.41 s to 4.48 s |
+| image download from S3 | 4.72 s | 4.69 s to 4.79 s |
+| Docker (overlayfs) | 26.9 s | 26.8 s to 27.3 s |
 | SOCI lazy pull | — | |
 | Nydus lazy pull | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| EBS snapshot to volume | 10.9 s | 10.1 s to 12 s |
+| JuiceFS | 3.88 min | 3.8 min to 3.92 min |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
 | Archil | — | |

@@ -1,0 +1,91 @@
+system,workspace,measure,rep,value,unit,notes
+Pando,small,cold.git_status,1,2.60016,s,rep 1
+Pando,small,cold.open,1,0.781722,s,rep 1
+Pando,small,cold.status,1,1.81844,s,rep 1
+Pando,small,cold.git_status,2,1.16583,s,rep 2
+Pando,small,cold.open,2,0.599815,s,rep 2
+Pando,small,cold.status,2,0.566012,s,rep 2
+Pando,small,cold.git_status,3,1.22929,s,rep 3
+Pando,small,cold.open,3,0.663439,s,rep 3
+Pando,small,cold.status,3,0.565849,s,rep 3
+Pando,small,cold.git_status,4,1.19264,s,rep 4
+Pando,small,cold.open,4,0.626765,s,rep 4
+Pando,small,cold.status,4,0.565874,s,rep 4
+Pando,small,cold.git_status,5,1.15207,s,rep 5
+Pando,small,cold.open,5,0.586135,s,rep 5
+Pando,small,cold.status,5,0.565937,s,rep 5
+tar from S3,small,cold.git_status,1,4.48324,s,rep 1
+tar from S3,small,cold.open,1,4.31873,s,rep 1
+tar from S3,small,cold.status,1,0.164517,s,rep 1
+tar from S3,small,cold.git_status,2,4.45,s,rep 2
+tar from S3,small,cold.open,2,4.28543,s,rep 2
+tar from S3,small,cold.status,2,0.164578,s,rep 2
+tar from S3,small,cold.git_status,3,4.42498,s,rep 3
+tar from S3,small,cold.open,3,4.2605,s,rep 3
+tar from S3,small,cold.status,3,0.164481,s,rep 3
+tar from S3,small,cold.git_status,4,4.43966,s,rep 4
+tar from S3,small,cold.open,4,4.27512,s,rep 4
+tar from S3,small,cold.status,4,0.164535,s,rep 4
+tar from S3,small,cold.git_status,5,4.41414,s,rep 5
+tar from S3,small,cold.open,5,4.24952,s,rep 5
+tar from S3,small,cold.status,5,0.164615,s,rep 5
+image download from S3,small,cold.git_status,1,4.78689,s,rep 1
+image download from S3,small,cold.open,1,4.37171,s,rep 1
+image download from S3,small,cold.status,1,0.415174,s,rep 1
+image download from S3,small,cold.git_status,2,4.71459,s,rep 2
+image download from S3,small,cold.open,2,4.29939,s,rep 2
+image download from S3,small,cold.status,2,0.415199,s,rep 2
+image download from S3,small,cold.git_status,3,4.69453,s,rep 3
+image download from S3,small,cold.open,3,4.27964,s,rep 3
+image download from S3,small,cold.status,3,0.414899,s,rep 3
+image download from S3,small,cold.git_status,4,4.74905,s,rep 4
+image download from S3,small,cold.open,4,4.28374,s,rep 4
+image download from S3,small,cold.status,4,0.465317,s,rep 4
+image download from S3,small,cold.git_status,5,4.71996,s,rep 5
+image download from S3,small,cold.open,5,4.25481,s,rep 5
+image download from S3,small,cold.status,5,0.465156,s,rep 5
+Docker (overlayfs),small,cold.git_status,1,26.8198,s,rep 1
+Docker (overlayfs),small,cold.open,1,26.6057,s,rep 1
+Docker (overlayfs),small,cold.status,1,0.214133,s,rep 1
+Docker (overlayfs),small,cold.git_status,2,26.9421,s,rep 2
+Docker (overlayfs),small,cold.open,2,26.728,s,rep 2
+Docker (overlayfs),small,cold.status,2,0.214068,s,rep 2
+Docker (overlayfs),small,cold.git_status,3,27.1637,s,rep 3
+Docker (overlayfs),small,cold.open,3,26.9496,s,rep 3
+Docker (overlayfs),small,cold.status,3,0.214085,s,rep 3
+Docker (overlayfs),small,cold.git_status,4,26.9016,s,rep 4
+Docker (overlayfs),small,cold.open,4,26.6875,s,rep 4
+Docker (overlayfs),small,cold.status,4,0.214121,s,rep 4
+Docker (overlayfs),small,cold.git_status,5,27.255,s,rep 5
+Docker (overlayfs),small,cold.open,5,27.0409,s,rep 5
+Docker (overlayfs),small,cold.status,5,0.214131,s,rep 5
+EBS snapshot to volume,small,cold.git_status,1,10.637,s,rep 1
+EBS snapshot to volume,small,cold.open,1,5.61358,s,rep 1
+EBS snapshot to volume,small,cold.status,1,5.02338,s,rep 1
+EBS snapshot to volume,small,cold.git_status,2,10.8845,s,rep 2
+EBS snapshot to volume,small,cold.open,2,5.60947,s,rep 2
+EBS snapshot to volume,small,cold.status,2,5.27499,s,rep 2
+EBS snapshot to volume,small,cold.git_status,3,11.0467,s,rep 3
+EBS snapshot to volume,small,cold.open,3,5.72166,s,rep 3
+EBS snapshot to volume,small,cold.status,3,5.32507,s,rep 3
+EBS snapshot to volume,small,cold.git_status,4,10.0582,s,rep 4
+EBS snapshot to volume,small,cold.open,4,5.58518,s,rep 4
+EBS snapshot to volume,small,cold.status,4,4.47297,s,rep 4
+EBS snapshot to volume,small,cold.git_status,5,11.9918,s,rep 5
+EBS snapshot to volume,small,cold.open,5,6.26655,s,rep 5
+EBS snapshot to volume,small,cold.status,5,5.72521,s,rep 5
+JuiceFS,small,cold.git_status,1,228.284,s,rep 1
+JuiceFS,small,cold.open,1,14.6875,s,rep 1
+JuiceFS,small,cold.status,1,213.596,s,rep 1
+JuiceFS,small,cold.git_status,2,232.749,s,rep 2
+JuiceFS,small,cold.open,2,14.6916,s,rep 2
+JuiceFS,small,cold.status,2,218.057,s,rep 2
+JuiceFS,small,cold.git_status,3,235.475,s,rep 3
+JuiceFS,small,cold.open,3,13.8056,s,rep 3
+JuiceFS,small,cold.status,3,221.67,s,rep 3
+JuiceFS,small,cold.git_status,4,231.716,s,rep 4
+JuiceFS,small,cold.open,4,13.8042,s,rep 4
+JuiceFS,small,cold.status,4,217.912,s,rep 4
+JuiceFS,small,cold.git_status,5,233.169,s,rep 5
+JuiceFS,small,cold.open,5,13.4658,s,rep 5
+JuiceFS,small,cold.status,5,219.704,s,rep 5
