@@ -5,6 +5,8 @@ name: ci
 # Then the store conformance tests against the AWS emulator. On main only: the crash and restart
 # scenarios over more seeds, line coverage, and an auditable release build. Longer fuzzing and
 # mutation testing are in deep.yml; the tests that need a Linux kernel are in kernel.yml.
+# The ruleset on main requires the checks named check, deny and store; check passes only when
+# every pull request job before it passed.
 
 on:
   pull_request:
@@ -54,8 +56,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: tools/check.sh lint
 
-  supply:
-    name: Supply chain
+  deny:
+    name: deny
     needs: tools
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -66,8 +68,23 @@ jobs:
 
       - uses: ./.github/actions/tools
 
-      - name: cargo-deny and cargo-vet
-        run: tools/check.sh supply
+      - name: cargo-deny
+        run: tools/check.sh deny
+
+  vet:
+    name: Vet
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+
+      - name: cargo-vet
+        run: tools/check.sh vet
 
   test:
     name: Tests
@@ -142,6 +159,24 @@ jobs:
           name: fuzz-artifacts-${{ github.run_id }}
           path: fuzz/artifacts
           if-no-files-found: ignore
+
+  check:
+    name: check
+    if: always()
+    needs: [tools, lint, deny, vet, test, asan, fuzz]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every pull request job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for r in $RESULTS; do
+            if [[ $r != success ]]; then
+              echo "a needed job ended $r: $RESULTS" >&2
+              exit 1
+            fi
+          done
 
   coverage:
     name: Coverage
@@ -218,7 +253,7 @@ jobs:
         run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios
 
   store:
-    name: Store conformance
+    name: store
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
