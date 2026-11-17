@@ -54,9 +54,13 @@ FORKABLE = [HIGHLIGHT, OCI, EBS, JFS, ZFS0, ARCHIL, REFLINK]
 LOCAL_ONLY = {REFLINK: "local only"}
 
 
-def panel(metric, label, unit, scale="log", better="lower", systems=None, na=None, ref=None):
+def panel(metric, label, unit, scale="log", better="lower", systems=None, na=None, ref=None, names=None):
     return dict(metric=metric, label=label, unit=unit, scale=scale, better=better,
-                systems=systems or REMOTE, na=na or {}, ref=ref)
+                systems=systems or REMOTE, na=na or {}, ref=ref, names=names or {})
+
+
+# In the fork chart Docker's branch is a container on the host's disk, like a reflink copy.
+FORK_NAMES = {OCI: "Docker (overlayfs, local)"}
 
 
 CHARTS = {
@@ -64,9 +68,10 @@ CHARTS = {
         title="Fork: time to a writable branch",
         alt="Bar chart of the time each system takes to make a writable branch of the workspace",
         panels=[
-            panel("fork.p50", "p50 over up to 1,000 branches", "s", systems=FORKABLE),
-            panel("fork-bytes.per_branch", "storage added per branch", "B", systems=FORKABLE),
-            panel("fork-bytes.per_edit", "storage added by a 5 MiB edit to a branch", "B", systems=FORKABLE),
+            panel("fork.p50", "p50 over up to 1,000 branches", "s", systems=FORKABLE, names=FORK_NAMES),
+            panel("fork-bytes.per_branch", "storage added per branch", "B", systems=FORKABLE, names=FORK_NAMES),
+            panel("fork-bytes.per_edit", "storage added by a 5 MiB edit to a branch", "B", systems=FORKABLE,
+                  names=FORK_NAMES, na={EBS: "none: billed by volume size"}),
         ]),
     "cold": dict(
         title="Cold start: empty host to first git status",
@@ -202,7 +207,7 @@ def draw(name, chart, data, theme):
         for i, s in enumerate(rows):
             cy = top + ROW * i + ROW / 2
             weight = ' font-weight="600"' if s.startswith(HIGHLIGHT) else ""
-            out.append(f'<text x="{x0 - 10}" y="{cy + 4:.1f}" font-size="12" fill="{t["ink"]}" text-anchor="end"{weight}>{escape(s)}</text>')
+            out.append(f'<text x="{x0 - 10}" y="{cy + 4:.1f}" font-size="12" fill="{t["ink"]}" text-anchor="end"{weight}>{escape(p["names"].get(s, s))}</text>')
             if s in known:
                 v = known[s][0]
                 bx = pos(v)
@@ -212,7 +217,7 @@ def draw(name, chart, data, theme):
                 by = cy - BAR / 2
                 # Square at the baseline, 4px rounded at the data end.
                 out.append(f'<path d="M{x0},{by:.1f} h{w - r:.1f} a{r},{r} 0 0 1 {r},{r} v{BAR - 2 * r} a{r},{r} 0 0 1 -{r},{r} h-{w - r:.1f} z" fill="{fill}">'
-                           f'<title>{escape(s)}: {fmt(v, kind)} (range {fmt(known[s][1], kind)} to {fmt(known[s][2], kind)})</title></path>')
+                           f'<title>{escape(p["names"].get(s, s))}: {fmt(v, kind)} (range {fmt(known[s][1], kind)} to {fmt(known[s][2], kind)})</title></path>')
                 out.append(f'<text x="{x0 + w + 6:.1f}" y="{cy + 4:.1f}" font-size="12" fill="{t["ink2"]}">{fmt(v, kind)}</text>')
             else:
                 note = p["na"].get(s, "not measured yet")
@@ -239,9 +244,9 @@ def table(chart, data):
         for s in p["systems"]:
             if s in vals:
                 m, lo, hi = vals[s]
-                lines.append(f"| {s} | {fmt(m, kind)} | {fmt(lo, kind)} to {fmt(hi, kind)} |")
+                lines.append(f"| {p['names'].get(s, s)} | {fmt(m, kind)} | {fmt(lo, kind)} to {fmt(hi, kind)} |")
             else:
-                lines.append(f"| {s} | {p['na'].get(s, '—')} | |")
+                lines.append(f"| {p['names'].get(s, s)} | {p['na'].get(s, '—')} | |")
         lines.append("")
     return "\n".join(lines).rstrip()
 

@@ -5,7 +5,7 @@ Writable branches of a large workspace for AI agents, stored in S3.
 Each agent run needs its own copy of a repository and everything installed in it, often on a
 machine where neither is present. It also needs to preserve its changes when the run ends.
 Pando gives each run a block device backed by a branch of a shared base. Creating a branch takes
-milliseconds and adds no data. The host fetches only what the run reads and uploads only what
+about 100 ms and adds one small ref object. The host fetches only what the run reads and uploads only what
 it changed when the run ends. Any host with access to the bucket can open any branch.
 
 Pando takes its name from a grove of aspens in Utah: a single organism with thousands of trunks
@@ -82,7 +82,7 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 | | Writable fork | Fork cost | Starts on an empty host | Saves only the change |
 |---|---|---|---|---|
-| Pando | yes | ms, 0 bytes | yes, fetches what it reads | yes, 4 KiB dedup |
+| Pando | yes | ~100 ms, a 135 B ref | yes, fetches what it reads | yes, 4 KiB dedup |
 | image or tar from S3 | copy | full copy | downloads everything | no |
 | OCI layers on overlayfs | yes | ms on a host with the image | pulls the image (lazily with SOCI / Nydus) | a new layer per save |
 | EBS snapshot to volume | yes | seconds to create | lazy-loaded, slow first reads | incremental snapshots, minutes |
@@ -94,9 +94,10 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Placeholder.** The charts will be populated after the harness runs on the bench VM
-> (AWS `m8id.4xlarge`, eu-north-1; see [bench/README.md](bench/README.md)). Run
-> `python3 bench/plot.py` to redraw them from `bench/results/`.
+> **Partly measured.** Only the fork chart has results so far; the others will be filled in
+> as the harness gains their measures on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
+> `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
 1.4 GB and 129k files. All systems use the same VM and bucket. Results show medians of 5 runs,
@@ -104,8 +105,10 @@ with Pando in blue.
 
 ### Fork
 
-Time to create a writable branch and storage added by 1,000 branches. These rows are from one
-run so far, not five.
+Time to create a writable branch, and the storage each branch and each edit adds. Docker and
+XFS reflink branches exist only on the host's disk. Pando, JuiceFS and EBS branches are durable
+and open on any host, so each fork waits on the network. These rows are from one run so far, not
+five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 
 <!-- bench:fork -->
 <picture>
@@ -118,33 +121,33 @@ run so far, not five.
 
 | p50 over up to 1,000 branches | median | range |
 |---|---|---|
-| Pando | — | |
-| Docker (overlayfs) | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| Pando | 106 ms | 106 ms to 106 ms |
+| Docker (overlayfs, local) | 11.1 ms | 11.1 ms to 11.1 ms |
+| EBS snapshot to volume | 2.6 s | 2.6 s to 2.6 s |
+| JuiceFS | 12.8 s | 12.8 s to 12.8 s |
 | ZeroFS (NBD) | — | |
 | Archil | — | |
-| XFS reflink (local) | — | |
+| XFS reflink (local) | 1 ms | 1 ms to 1 ms |
 
 | storage added per branch | median | range |
 |---|---|---|
-| Pando | — | |
-| Docker (overlayfs) | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| Pando | 135 B | 135 B to 135 B |
+| Docker (overlayfs, local) | 36.5 KiB | 36.5 KiB to 36.5 KiB |
+| EBS snapshot to volume | 16 GiB | 16 GiB to 16 GiB |
+| JuiceFS | 25.4 MiB | 25.4 MiB to 25.4 MiB |
 | ZeroFS (NBD) | — | |
 | Archil | — | |
-| XFS reflink (local) | — | |
+| XFS reflink (local) | 4.61 KiB | 4.61 KiB to 4.61 KiB |
 
 | storage added by a 5 MiB edit to a branch | median | range |
 |---|---|---|
-| Pando | — | |
-| Docker (overlayfs) | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| Pando | 5.08 MiB | 5.08 MiB to 5.08 MiB |
+| Docker (overlayfs, local) | 5 MiB | 5 MiB to 5 MiB |
+| EBS snapshot to volume | none: billed by volume size | |
+| JuiceFS | 5 MiB | 5 MiB to 5 MiB |
 | ZeroFS (NBD) | — | |
 | Archil | — | |
-| XFS reflink (local) | — | |
+| XFS reflink (local) | 5.75 MiB | 5.75 MiB to 5.75 MiB |
 
 </details>
 <!-- /bench:fork -->
