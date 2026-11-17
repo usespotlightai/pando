@@ -8,10 +8,11 @@ pando-format 1.0
 
 ## What each command does with it
 
-Every command that opens the store reads the marker before it does anything else. Commands that
-open the cache (`attach`, `import`, `base`, `follow`, `gc`, `stat`) read it while the cache
-opens, so it adds no time. The others (`init`, `refs`, `branch`, `advance`, `delete`) wait for
-one more GET.
+Every command that opens the store reads the marker before it reads or writes anything else in
+the store. Commands that open the cache (`attach`, `import`, `base`, `follow`, `gc`, `stat`)
+read it while the cache opens, so it adds no time. Opening the cache recovers this host's
+object log and touches nothing in the store, so a refused command may have done that much. The
+others (`init`, `refs`, `branch`, `advance`, `delete`) wait for one more GET.
 
 - A command that writes (`init`, `import`, `branch`, `advance`, `delete`, `base`, `follow`,
   `gc --delete`, `attach`) creates the marker when the store has none. If another host creates
@@ -20,7 +21,7 @@ one more GET.
 - `detach` and `resize` talk only to the daemon of an attached device and skip the check.
 - A store without a marker was written before markers existed and is in format 1.0.
 - A marker with a major version this build does not read stops the command before it touches
-  anything else: `the store is in format 2.0; this pando reads format 1.x`.
+  anything else in the store: `the store is in format 2.0; this pando reads format 1.x`.
 
 ## Upgrade rules
 

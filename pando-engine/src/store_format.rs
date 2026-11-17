@@ -18,26 +18,25 @@ pub enum Access {
 /// [`StoreFormat::UNMARKED`]; with [`Access::Write`] the marker of [`StoreFormat::CURRENT`] is
 /// written to it first. Fails with [`Error::UnknownFormat`] for a format this build does not read.
 pub async fn check_format(store: &dyn Store, access: Access) -> Result<StoreFormat> {
-    let found = match store.get(keys::FORMAT).await {
-        Ok(o) => StoreFormat::decode(&o.body)?,
-        Err(StoreError::NotFound { .. }) if access == Access::Read => StoreFormat::UNMARKED,
-        Err(StoreError::NotFound { .. }) => {
-            if !StoreFormat::CURRENT.reads(StoreFormat::UNMARKED) {
-                return Err(Error::UnknownFormat {
-                    found: StoreFormat::UNMARKED,
-                });
-            }
-            let marker = Bytes::from(StoreFormat::CURRENT.encode());
-            match store.create(keys::FORMAT, marker).await {
-                Ok(_) => StoreFormat::CURRENT,
-                Err(StoreError::AlreadyExists { .. }) => {
-                    StoreFormat::decode(&store.get(keys::FORMAT).await?.body)?
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+    let unmarked = match store.get(keys::FORMAT).await {
+        Ok(o) => return readable(StoreFormat::decode(&o.body)?),
+        Err(StoreError::NotFound { .. }) => readable(StoreFormat::UNMARKED)?,
         Err(e) => return Err(e.into()),
     };
+    if access == Access::Read {
+        return Ok(unmarked);
+    }
+    let marker = Bytes::from(StoreFormat::CURRENT.encode());
+    match store.create(keys::FORMAT, marker).await {
+        Ok(_) => Ok(StoreFormat::CURRENT),
+        Err(StoreError::AlreadyExists { .. }) => {
+            readable(StoreFormat::decode(&store.get(keys::FORMAT).await?.body)?)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn readable(found: StoreFormat) -> Result<StoreFormat> {
     if StoreFormat::CURRENT.reads(found) {
         Ok(found)
     } else {

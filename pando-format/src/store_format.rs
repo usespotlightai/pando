@@ -36,8 +36,8 @@ impl StoreFormat {
             .split_once('.')
             .ok_or_else(|| bad("want <major>.<minor>"))?;
         Ok(StoreFormat {
-            major: major.parse().map_err(|_| bad("major"))?,
-            minor: minor.parse().map_err(|_| bad("minor"))?,
+            major: number(major).ok_or_else(|| bad("major"))?,
+            minor: number(minor).ok_or_else(|| bad("minor"))?,
         })
     }
 
@@ -45,6 +45,13 @@ impl StoreFormat {
     pub fn reads(&self, store: StoreFormat) -> bool {
         self.major == store.major
     }
+}
+
+fn number(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 impl fmt::Display for StoreFormat {
@@ -77,6 +84,14 @@ mod tests {
             b"pando-format 1\n",
             b"pando 1.0\n",
             b"pando-format a.0\n",
+            b"pando-format 1.0 x\n",
+            b"pando-format 1.0.1\n",
+            b"pando-format .0\n",
+            b"pando-format 1.\n",
+            b"pando-format +1.0\n",
+            b"pando-format 1.+0\n",
+            b"pando-format -1.0\n",
+            b"pando-format 4294967296.0\n",
             b"\xff",
         ] {
             assert!(StoreFormat::decode(b).is_err(), "{b:?}");
