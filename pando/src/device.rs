@@ -107,6 +107,9 @@ mod linux {
         if a.images.is_some() && a.dm.is_none() {
             bail!("--images needs --dm");
         }
+        if a.recover {
+            dead_daemon(id, &a.device).await?;
+        }
         let t0 = Instant::now();
         let switch: Arc<dyn DeviceSwitch> = Arc::new(DmSwitch::new());
         let learned = a
@@ -188,6 +191,24 @@ mod linux {
         let published = finish(att, &a.name).await;
         drop(fe);
         published
+    }
+
+    /// Waits until the kernel holds the I/O of device `id` for a new daemon. A live daemon
+    /// still writes the branch, so recovery must not take it over.
+    async fn dead_daemon(id: u32, device: &std::path::Path) -> Result<()> {
+        for _ in 0..100 {
+            if pando_linux::daemon_dead(id)
+                .await
+                .with_context(|| format!("state of {}", device.display()))?
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        bail!(
+            "the daemon of {} is alive; recover only a device whose daemon died",
+            device.display()
+        )
     }
 
     /// Publishes the branch and frees it; the device no longer writes to its image.
