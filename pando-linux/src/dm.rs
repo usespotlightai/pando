@@ -195,7 +195,7 @@ fn file_name(p: &Path) -> io::Result<&str> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("device {}", p.display())))
 }
 
-fn rdev_text(rdev: u64) -> String {
+pub(crate) fn rdev_text(rdev: u64) -> String {
     format!("{}:{}", libc::major(rdev), libc::minor(rdev))
 }
 
@@ -316,6 +316,23 @@ fn remove(name: &str) -> io::Result<()> {
     }
 }
 
+fn users(name: &str) -> io::Result<Vec<String>> {
+    let st = match dm(DM_DEV_STATUS, name, 0, &[]) {
+        Ok(st) => st,
+        Err(e) if e.raw_os_error() == Some(libc::ENXIO) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let (major, minor) = sys::split_dev(st.dev);
+    let (mut found, _) = crate::users::mounts_and_holders(&format!("{major}:{minor}"), None)?;
+    if found.is_empty() && st.open_count > 0 {
+        found.push(format!(
+            "open {} times, by a mount in another mount namespace or a program",
+            st.open_count
+        ));
+    }
+    Ok(found)
+}
+
 fn live_target(name: &str) -> io::Result<Option<PathBuf>> {
     let table = match live_table(name) {
         Ok(t) => t,
@@ -401,9 +418,19 @@ impl DmSwitch {
     pub fn new() -> DmSwitch {
         DmSwitch::default()
     }
+
+    /// What removing device `name` would cut off: each mount of it, each device stacked on
+    /// it, and, when neither explains its open count, its other openers. Empty when `name`
+    /// does not exist.
+    pub async fn users(&self, name: &str) -> io::Result<Vec<String>> {
+        let name = name.to_owned();
+        blocking(move || users(&name)).await
+    }
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T> {
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
     tokio::task::spawn_blocking(f).await.map_err(io::Error::other)?
 }
 

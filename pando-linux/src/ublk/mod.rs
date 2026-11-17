@@ -9,6 +9,7 @@ mod queue;
 
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -24,6 +25,8 @@ use queue::Queue;
 const DEPTH: u16 = 64;
 /// How long a recovery waits for the kernel to quiesce the device of a dead daemon.
 const QUIESCE_WAIT: Duration = Duration::from_secs(10);
+/// How long a delete waits for the kernel to free a stopped device its daemon let go of.
+pub const RELEASE_WAIT: Duration = Duration::from_secs(10);
 
 /// The number of `/dev/ublkbN`.
 pub fn device_id(dev: &Path) -> io::Result<u32> {
@@ -224,10 +227,71 @@ pub async fn stop(id: u32) -> io::Result<()> {
     blocking(move || Ctrl::open()?.cmd(ctrl::CMD_STOP_DEV, id, 0, None)).await
 }
 
-/// Deletes device `id`. It waits until the daemon lets go of the device, which it does once
-/// the branch is published.
+/// Deletes stopped device `id`. It waits until the daemon lets go of the device, which it does
+/// once the branch is published, and then at most [`RELEASE_WAIT`] for the kernel to free the
+/// device. A mount or an open file that still holds the stopped device fails the delete; the
+/// kernel frees the device once they let go of it.
 pub async fn delete(id: u32) -> io::Result<()> {
-    blocking(move || Ctrl::open()?.cmd(ctrl::CMD_DEL_DEV, id, 0, None)).await
+    blocking(move || {
+        wait_released(&Path::new("/dev").join(format!("ublkc{id}")))?;
+        within(RELEASE_WAIT, move || {
+            Ctrl::open()?.cmd(ctrl::CMD_DEL_DEV, id, 0, None)
+        })
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::TimedOut {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "deleted ublk device {id}, but {e}: a mount or an open file still holds \
+                         /dev/ublkb{id}, and the kernel frees it once they let go of it"
+                    ),
+                )
+            } else {
+                e
+            }
+        })
+    })
+    .await
+}
+
+/// Waits until no daemon holds the ublk character device `cdev`, which only one process may
+/// open at a time.
+fn wait_released(cdev: &Path) -> io::Result<()> {
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(cdev)
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Runs `f` on a thread of its own and waits at most `wait` for its result. A thread still
+/// running then is left behind and ends with the process.
+fn within<T: Send + 'static>(
+    wait: Duration,
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("ublk-ctrl".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })?;
+    match rx.recv_timeout(wait) {
+        Ok(r) => r,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no answer from the kernel after {wait:?}"),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other("the control thread panicked")),
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +302,33 @@ mod tests {
     fn device_ids_come_from_the_block_device_name() {
         assert_eq!(device_id(Path::new("/dev/ublkb12")).unwrap(), 12);
         assert!(device_id(Path::new("/dev/loop0")).is_err());
+    }
+
+    #[test]
+    fn a_call_that_never_returns_times_out() {
+        let t0 = Instant::now();
+        let e = within(Duration::from_millis(50), || -> io::Result<()> {
+            loop {
+                std::thread::park();
+            }
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_call_in_time_returns_its_result() {
+        assert_eq!(within(Duration::from_secs(5), || Ok(7)).unwrap(), 7);
+        let e = within(Duration::from_secs(5), || -> io::Result<()> {
+            Err(io::Error::other("no"))
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "no");
+    }
+
+    #[test]
+    fn a_missing_character_device_is_released() {
+        wait_released(Path::new("/dev/ublkc987654")).unwrap();
     }
 }

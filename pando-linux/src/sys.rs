@@ -43,7 +43,7 @@ pub(crate) fn mknod_block(path: &Path, dev: u64) -> io::Result<()> {
 }
 
 /// Major and minor of a device number in the kernel's encoding of 32-bit numbers.
-fn split_dev(dev: u64) -> (u32, u32) {
+pub(crate) fn split_dev(dev: u64) -> (u32, u32) {
     (
         ((dev >> 8) & 0xfff) as u32,
         ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u32,
