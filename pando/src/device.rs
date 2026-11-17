@@ -66,6 +66,10 @@ pub(crate) struct DetachArgs {
     /// The device-mapper device over it, removed first.
     #[arg(long)]
     pub(crate) dm: Option<String>,
+    /// Stop the device even while a file system on it is mounted or a program holds it open.
+    /// The file system loses the writes it has not flushed.
+    #[arg(long)]
+    pub(crate) force: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -228,6 +232,19 @@ mod linux {
     pub(crate) async fn detach(d: DetachArgs) -> Result<()> {
         let id = pando_linux::device_id(&d.device)?;
         let switch = DmSwitch::new();
+        if !d.force {
+            if let Some(dm) = &d.dm {
+                let users = switch
+                    .users(dm)
+                    .await
+                    .with_context(|| format!("users of /dev/mapper/{dm}"))?;
+                in_use(&format!("/dev/mapper/{dm}"), &users)?;
+            }
+            let users = pando_linux::users(&d.device, d.dm.as_deref())
+                .await
+                .with_context(|| format!("users of {}", d.device.display()))?;
+            in_use(&d.device.display().to_string(), &users)?;
+        }
         if let Some(dm) = &d.dm {
             if pando_linux::daemon_dead(id).await? {
                 pando_linux::stop(id).await?;
@@ -242,5 +259,17 @@ mod linux {
         }
         pando_linux::stop(id).await?;
         Ok(pando_linux::delete(id).await?)
+    }
+
+    /// Fails while `users` hold device `dev`, so a stop cannot cut a mounted file system off.
+    fn in_use(dev: &str, users: &[String]) -> Result<()> {
+        if users.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "{dev} is in use: {}. Unmount it and stop what holds it, then detach again; the \
+             device still serves the branch (--force stops it anyway and loses unflushed writes)",
+            users.join(", ")
+        )
     }
 }

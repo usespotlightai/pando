@@ -14,5 +14,8 @@ libc.workspace = true
 pando-engine.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

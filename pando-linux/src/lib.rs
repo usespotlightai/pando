@@ -12,9 +12,19 @@
 mod dm;
 mod sys;
 mod ublk;
+mod users;
 
 pub use dm::DmSwitch;
-pub use ublk::{Frontend, FrontendOptions, daemon_dead, delete, device_id, stop};
+pub use ublk::{Frontend, FrontendOptions, RELEASE_WAIT, daemon_dead, delete, device_id, stop};
+
+/// What a stop of block device `dev` would cut off: each mount of it, each device stacked on
+/// it other than the device-mapper device named `over`, and, when neither explains it, an
+/// exclusive opener such as a mount in another mount namespace. Empty when `dev` does not
+/// exist.
+pub async fn users(dev: &std::path::Path, over: Option<&str>) -> std::io::Result<Vec<String>> {
+    let (dev, over) = (dev.to_owned(), over.map(str::to_owned));
+    dm::blocking(move || users::users(&dev, over.as_deref())).await
+}
 
 /// Whether `path` is a block device.
 pub fn is_block_device(path: &std::path::Path) -> bool {
