@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ use object_store::{
     UpdateVersion,
 };
 use pando_engine::ports::{Object, ObjectInfo, Store, StoreError, Version};
+use tokio::sync::{OnceCell, oneshot};
 
 /// The longest one request may take. A segment PUT shares the uplink with the other PUTs in
 /// flight, so on a slow link it takes minutes.
@@ -53,8 +54,40 @@ impl std::fmt::Debug for S3Config {
 
 #[derive(Debug)]
 pub struct S3Store {
-    inner: Arc<dyn ObjectStore>,
+    inner: Client,
     prefix: String,
+}
+
+type Built = Result<Arc<dyn ObjectStore>, String>;
+
+/// The `object_store` client. [`S3Store::new`] builds it on a thread of its own: the build
+/// loads the system's root certificates, which takes tens of milliseconds the caller can spend
+/// on other work, such as opening its cache. The first request waits for it.
+#[derive(Debug)]
+struct Client {
+    ready: OnceCell<Built>,
+    building: Mutex<Option<oneshot::Receiver<Built>>>,
+}
+
+impl Client {
+    async fn get(&self, key: &str) -> Result<&Arc<dyn ObjectStore>, StoreError> {
+        let built = self
+            .ready
+            .get_or_init(|| async {
+                let rx = self.building.lock().expect("client lock").take();
+                match rx {
+                    Some(rx) => rx
+                        .await
+                        .unwrap_or_else(|_| Err("the store client build stopped".to_string())),
+                    None => Err("the store client build stopped".to_string()),
+                }
+            })
+            .await;
+        built.as_ref().map_err(|e| StoreError::Other {
+            key: key.to_string(),
+            source: e.clone().into(),
+        })
+    }
 }
 
 impl S3Store {
@@ -70,14 +103,37 @@ impl S3Store {
         if let Some(e) = &c.endpoint {
             b = b.with_endpoint(e);
         }
-        let inner = b.build().map_err(|e| map_err(&c.bucket, e))?;
-        Ok(S3Store::over(Arc::new(inner), &c.prefix))
+        let (tx, rx) = oneshot::channel();
+        let bucket = c.bucket.clone();
+        std::thread::Builder::new()
+            .name("s3-client".into())
+            .spawn(move || {
+                let built = b
+                    .build()
+                    .map(|s| Arc::new(s) as Arc<dyn ObjectStore>)
+                    .map_err(|e| map_err(&bucket, e).to_string());
+                let _ = tx.send(built);
+            })
+            .map_err(|e| StoreError::Other {
+                key: c.bucket.clone(),
+                source: Box::new(e),
+            })?;
+        Ok(S3Store {
+            inner: Client {
+                ready: OnceCell::new(),
+                building: Mutex::new(Some(rx)),
+            },
+            prefix: c.prefix.trim_matches('/').to_string(),
+        })
     }
 
     /// The port over another `object_store` backend, such as its in-memory store in tests.
     pub fn over(inner: Arc<dyn ObjectStore>, prefix: &str) -> S3Store {
         S3Store {
-            inner,
+            inner: Client {
+                ready: OnceCell::new_with(Some(Ok(inner))),
+                building: Mutex::new(None),
+            },
             prefix: prefix.trim_matches('/').to_string(),
         }
     }
@@ -108,6 +164,8 @@ impl S3Store {
         };
         let r = self
             .inner
+            .get(key)
+            .await?
             .put_opts(&self.path(key), PutPayload::from(body), opts)
             .await
             .map_err(|e| map_err(key, e))?;
@@ -137,6 +195,8 @@ impl Store for S3Store {
     async fn get(&self, key: &str) -> Result<Object, StoreError> {
         let r = self
             .inner
+            .get(key)
+            .await?
             .get(&self.path(key))
             .await
             .map_err(|e| map_err(key, e))?;
@@ -147,6 +207,8 @@ impl Store for S3Store {
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, StoreError> {
         self.inner
+            .get(key)
+            .await?
             .get_range(&self.path(key), range)
             .await
             .map_err(|e| map_err(key, e))
@@ -159,6 +221,8 @@ impl Store for S3Store {
         };
         let r = self
             .inner
+            .get(key)
+            .await?
             .get_opts(&self.path(key), opts)
             .await
             .map_err(|e| map_err(key, e))?;
@@ -186,6 +250,8 @@ impl Store for S3Store {
     async fn list(&self, dir: &str) -> Result<Vec<ObjectInfo>, StoreError> {
         let mut out: Vec<ObjectInfo> = self
             .inner
+            .get(dir)
+            .await?
             .list(Some(&self.path(dir.trim_end_matches('/'))))
             .map_ok(|m| ObjectInfo {
                 key: self.relative(&m.location),
@@ -200,7 +266,7 @@ impl Store for S3Store {
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        match self.inner.delete(&self.path(key)).await {
+        match self.inner.get(key).await?.delete(&self.path(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(map_err(key, e)),
         }

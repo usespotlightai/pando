@@ -1,8 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-use sha2::{Digest, Sha256};
-
 use crate::FormatError;
 
 /// The SHA-256 of an object's content. It names chunks and tree nodes.
@@ -14,7 +12,8 @@ impl Hash {
     pub const ZERO: Hash = Hash([0; 32]);
 
     pub fn of(b: &[u8]) -> Hash {
-        Hash(Sha256::digest(b).into())
+        let d = ring::digest::digest(&ring::digest::SHA256, b);
+        Hash(d.as_ref().try_into().expect("SHA-256 is 32 bytes"))
     }
 
     pub fn is_zero(&self) -> bool {
