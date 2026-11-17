@@ -80,9 +80,10 @@ def imds(path):
 def unmount(path):
     """Unmounts path, killing what still holds it after 10 s. Raises if it stays mounted."""
     for _ in range(20):
+        if os.path.ismount(path):
+            subprocess.run(["umount", str(path)], stderr=subprocess.DEVNULL)
         if not os.path.ismount(path):
             return
-        subprocess.run(["umount", str(path)], stderr=subprocess.DEVNULL)
         time.sleep(0.5)
     run("fuser", "-km", path, check=False)
     time.sleep(1)
