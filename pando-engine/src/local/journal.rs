@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use pando_format::CHUNK_SIZE;
-use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 
 use super::read_file;
-use crate::Result;
 use crate::ports::{LocalFile, LocalFs, Open};
+use crate::{Error, Result};
 
 const HEADER: usize = 16;
 const SHARDS: usize = 16;
@@ -19,7 +19,8 @@ const SHARDS: usize = 16;
 /// it would lose a disk's volatile write cache. Each flush starts a new generation; a committed
 /// flush removes the generations below it. A generation has one file per shard of chunk
 /// indexes, so writes to different chunks append in parallel and one chunk's records stay in
-/// order. A record is `[chunk index u64][offset in chunk u32][length u32][data]`.
+/// order. A record is `[chunk index u64][offset in chunk u32][length u32][data]`. Appends to one
+/// shard queue while a write is in flight and go out together in the next one.
 #[derive(Debug)]
 pub(crate) struct Journal {
     fs: Arc<dyn LocalFs>,
@@ -30,13 +31,75 @@ pub(crate) struct Journal {
 #[derive(Debug)]
 struct Generation {
     number: u64,
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<Arc<Shard>>,
 }
 
 #[derive(Debug)]
 struct Shard {
     file: Arc<dyn LocalFile>,
+    queue: Mutex<Queue>,
+}
+
+/// The records waiting for a shard's next write. While `writing`, one caller or task writes
+/// them.
+#[derive(Debug, Default)]
+struct Queue {
     end: u64,
+    records: BytesMut,
+    waiters: Vec<oneshot::Sender<Result<(), Arc<Error>>>>,
+    writing: bool,
+}
+
+impl Shard {
+    /// Writes the queued records until none are left.
+    async fn drain(&self) {
+        loop {
+            let (batch, waiters, at) = {
+                let mut q = self.queue.lock().expect("journal queue lock");
+                if q.records.is_empty() {
+                    q.writing = false;
+                    return;
+                }
+                (q.records.split().freeze(), std::mem::take(&mut q.waiters), q.end)
+            };
+            let n = batch.len() as u64;
+            let done = self.write(batch, at).await.map_err(|e| Arc::new(Error::Io(e)));
+            if done.is_ok() {
+                self.queue.lock().expect("journal queue lock").end += n;
+            }
+            for w in waiters {
+                let _ = w.send(done.clone());
+            }
+        }
+    }
+
+    async fn write(&self, batch: Bytes, at: u64) -> std::io::Result<()> {
+        let done = self.file.write_at_nowait(std::slice::from_ref(&batch), at)?;
+        if done < batch.len() {
+            self.file
+                .write_at(vec![batch.slice(done..)], at + done as u64)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// The caller that writes a shard's queue. Dropped before the queue is empty, it hands the
+/// rest to a task, so queued appends never wait for a writer that is gone.
+struct Lead(Option<Arc<Shard>>);
+
+impl Drop for Lead {
+    fn drop(&mut self) {
+        let Some(shard) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move { shard.drain().await });
+            }
+            Err(_) => shard.queue.lock().expect("journal queue lock").writing = false,
+        }
+    }
 }
 
 fn parse_name(name: &str) -> Option<u64> {
@@ -112,7 +175,13 @@ impl Journal {
         for s in 0..SHARDS {
             let file = self.fs.open(&self.path(number, s), Open::Create).await?;
             let end = file.size().await?;
-            shards.push(Mutex::new(Shard { file, end }));
+            shards.push(Arc::new(Shard {
+                file,
+                queue: Mutex::new(Queue {
+                    end,
+                    ..Queue::default()
+                }),
+            }));
         }
         *self.current.write().expect("journal lock") = Some(Arc::new(Generation { number, shards }));
         Ok(())
@@ -136,19 +205,27 @@ impl Journal {
             .expect("journal lock")
             .clone()
             .expect("journal started");
-        let mut hdr = Vec::with_capacity(HEADER);
-        hdr.extend_from_slice(&idx.to_le_bytes());
-        hdr.extend_from_slice(&(inner as u32).to_le_bytes());
-        hdr.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        let n = (HEADER + data.len()) as u64;
-        let bufs = vec![Bytes::from(hdr), data];
-        let mut s = g.shards[(idx % SHARDS as u64) as usize].lock().await;
-        let done = s.file.write_at_nowait(&bufs, s.end)?;
-        if (done as u64) < n {
-            s.file.write_at(skip(bufs, done), s.end + done as u64).await?;
+        let shard = &g.shards[(idx % SHARDS as u64) as usize];
+        let (tx, rx) = oneshot::channel();
+        let lead = {
+            let mut q = shard.queue.lock().expect("journal queue lock");
+            q.records.reserve(HEADER + data.len());
+            q.records.put_u64_le(idx);
+            q.records.put_u32_le(inner as u32);
+            q.records.put_u32_le(data.len() as u32);
+            q.records.put_slice(&data);
+            q.waiters.push(tx);
+            !std::mem::replace(&mut q.writing, true)
+        };
+        if lead {
+            let mut lead = Lead(Some(shard.clone()));
+            shard.drain().await;
+            lead.0 = None;
         }
-        s.end += n;
-        Ok(())
+        match rx.await {
+            Ok(done) => done.map_err(Error::Shared),
+            Err(_) => Err(Error::Cancelled),
+        }
     }
 
     /// Starts the next generation and returns it.
@@ -181,32 +258,10 @@ impl Journal {
     }
 }
 
-/// `bufs` without its first `n` bytes.
-fn skip(bufs: Vec<Bytes>, mut n: usize) -> Vec<Bytes> {
-    let mut rest = Vec::with_capacity(bufs.len());
-    for b in bufs {
-        if n >= b.len() {
-            n -= b.len();
-        } else {
-            rest.push(b.slice(n..));
-            n = 0;
-        }
-    }
-    rest
-}
-
 #[cfg(all(test, feature = "sim"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn skip_drops_a_prefix_across_buffers() {
-        let b = vec![Bytes::from_static(b"abc"), Bytes::from_static(b"defg")];
-        assert_eq!(skip(b.clone(), 0), b);
-        assert_eq!(skip(b.clone(), 3), [Bytes::from_static(b"defg")]);
-        assert_eq!(skip(b.clone(), 5), [Bytes::from_static(b"fg")]);
-        assert!(skip(b, 7).is_empty());
-    }
     use crate::sim::SimFs;
 
     #[tokio::test]
@@ -240,6 +295,41 @@ mod tests {
 
         j.drop_below(2).await;
         assert_eq!(again.replay(0, |_, _, _| Ok(())).await.unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_appends_to_one_shard_all_replay() {
+        let fs = SimFs::default();
+        let j = Arc::new(
+            Journal::open(Arc::new(fs.clone()), Path::new("/j"))
+                .await
+                .unwrap(),
+        );
+        j.start(1).await.unwrap();
+        let tasks: Vec<_> = (0..64u64)
+            .map(|i| {
+                let j = j.clone();
+                tokio::spawn(async move {
+                    j.append(i * SHARDS as u64, 0, Bytes::from(vec![i as u8; 100]))
+                        .await
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        let mut seen = Vec::new();
+        let n = j
+            .replay(0, |i, _, d| {
+                assert!(d.iter().all(|&b| u64::from(b) * SHARDS as u64 == i));
+                seen.push(i);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 64);
+        seen.sort_unstable();
+        assert_eq!(seen, (0..64).map(|i| i * SHARDS as u64).collect::<Vec<_>>());
     }
 
     #[tokio::test]

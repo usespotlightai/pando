@@ -397,10 +397,10 @@ impl Volume {
         if off + p.len() as u64 > self.inner.size {
             return Err(Error::BeyondEnd);
         }
-        for (idx, at, pos, n) in parts(off, p.len()) {
-            self.inner.write_chunk(idx, at, &p[pos..pos + n], true).await?;
-        }
-        Ok(())
+        let writes = parts(off, p.len())
+            .into_iter()
+            .map(|(idx, at, pos, n)| self.inner.write_chunk(idx, at, &p[pos..pos + n], true));
+        futures::future::join_all(writes).await.into_iter().collect()
     }
 
     /// Clears a range. Whole chunks that hold no data stay sparse.

@@ -363,9 +363,13 @@ impl LocalFile for SimFile {
         Ok(())
     }
 
-    /// Takes only the first buffer, so callers also take the path that finishes the write.
+    /// Takes only the first half of the first buffer, so callers also take the path that
+    /// finishes the write.
     fn write_at_nowait(&self, bufs: &[Bytes], offset: u64) -> io::Result<usize> {
-        Ok(self.write_bufs(&bufs[..bufs.len().min(1)], offset))
+        let Some(first) = bufs.first() else {
+            return Ok(0);
+        };
+        Ok(self.write_bufs(&[first.slice(..first.len() / 2)], offset))
     }
 
     async fn sync_data(&self) -> io::Result<()> {
