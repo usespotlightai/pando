@@ -7,6 +7,7 @@ use std::sync::Arc;
 use pando_engine::ports::Rng;
 use pando_engine::sim::{self, Fault, SimFs, SimRng, SimStore, StoreOp};
 use pando_engine::{Cache, Ports, Volume};
+use pando_format::{u64_from, usize_from};
 
 const SIZE: usize = 4 << 20;
 const CHUNK: usize = 64 << 10;
@@ -15,12 +16,19 @@ const BRANCH: &str = "main";
 /// What one scenario did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
+    /// Writes and zeroings of a random range.
     pub writes: usize,
+    /// Flushes; a host crash keeps what the last one made durable.
     pub flushes: usize,
+    /// Checkpoints, each a publish to the store.
     pub checkpoints: usize,
+    /// Closes and reopens of the volume on the same host.
     pub restarts: usize,
+    /// Host crashes, which lose what was written since the last flush.
     pub crashes: usize,
+    /// Store faults injected into a later create or update of a ref.
     pub faults: usize,
+    /// Reads checked against the model.
     pub reads: usize,
 }
 
@@ -48,7 +56,7 @@ async fn open(ports: &Ports, dir: &str) -> Result<Volume, String> {
 
 impl World {
     fn below(&self, n: usize) -> usize {
-        (self.rng.next_u64() % n as u64) as usize
+        usize_from(self.rng.next_u64() % u64_from(n))
     }
 
     fn range(&self) -> (usize, usize) {
@@ -64,7 +72,7 @@ impl World {
     fn bytes(&self, n: usize) -> Vec<u8> {
         let seed = self.rng.next_u64();
         if self.below(4) == 0 {
-            return vec![(seed as u8) | 1; n];
+            return vec![seed.to_le_bytes()[0] | 1; n];
         }
         let mut x = seed | 1;
         (0..n)
@@ -72,7 +80,7 @@ impl World {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
-                x as u8
+                x.to_le_bytes()[0]
             })
             .collect()
     }
@@ -92,7 +100,7 @@ impl World {
 
     async fn check(&mut self, v: &Volume, off: usize, len: usize, when: &str) -> Result<(), String> {
         let mut got = vec![0; len];
-        v.read_at(&mut got, off as u64)
+        v.read_at(&mut got, u64_from(off))
             .await
             .map_err(|e| format!("{when}: read {len} at {off}: {e}"))?;
         self.report.reads += 1;
@@ -114,7 +122,7 @@ impl World {
 /// Runs `steps` random steps with `seed`, then checks the whole volume from a fresh host.
 pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String> {
     let (ports, store, fs) = sim::ports(seed);
-    Volume::create(&ports, BRANCH, SIZE as u64)
+    Volume::create(&ports, BRANCH, u64_from(SIZE))
         .await
         .map_err(|e| e.to_string())?;
     let mut w = World {
@@ -138,14 +146,8 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
             0..50 => {
                 let (off, len) = w.range();
                 let b = w.bytes(len);
-                if trace {
-                    eprintln!(
-                        "  write {len} at {off} (chunks {}..={})",
-                        off / CHUNK,
-                        (off + len - 1) / CHUNK
-                    );
-                }
-                v.write_at(&b, off as u64)
+                trace_range(trace, "write", off, len);
+                v.write_at(&b, u64_from(off))
                     .await
                     .map_err(|e| format!("{at}: write: {e}"))?;
                 w.model[off..off + len].copy_from_slice(&b);
@@ -153,14 +155,8 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
             }
             50..55 => {
                 let (off, len) = w.range();
-                if trace {
-                    eprintln!(
-                        "  zero {len} at {off} (chunks {}..={})",
-                        off / CHUNK,
-                        (off + len - 1) / CHUNK
-                    );
-                }
-                v.zero(off as u64, len as u64)
+                trace_range(trace, "zero", off, len);
+                v.zero(u64_from(off), u64_from(len))
                     .await
                     .map_err(|e| format!("{at}: zero: {e}"))?;
                 w.model[off..off + len].fill(0);
@@ -216,11 +212,21 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
     Ok(w.report)
 }
 
+fn trace_range(on: bool, what: &str, off: usize, len: usize) {
+    if on {
+        eprintln!(
+            "  {what} {len} at {off} (chunks {}..={})",
+            off / CHUNK,
+            (off + len - 1) / CHUNK
+        );
+    }
+}
+
 /// Two hosts take the branch in turns. Each open fences the writer before it, which must then
 /// fail to publish; the store keeps what the fenced writer published before.
 pub async fn writers_take_turns(seed: u64, turns: usize) -> Result<(), String> {
     let (ports, _, _) = sim::ports(seed);
-    Volume::create(&ports, BRANCH, SIZE as u64)
+    Volume::create(&ports, BRANCH, u64_from(SIZE))
         .await
         .map_err(|e| e.to_string())?;
     let rng = SimRng::new(seed);
@@ -247,9 +253,10 @@ pub async fn writers_take_turns(seed: u64, turns: usize) -> Result<(), String> {
                 "turn {turn}: the new writer does not see the last publish"
             ));
         }
-        let off = (rng.next_u64() % (SIZE as u64 - 1000)) as usize;
-        let b = vec![turn as u8 + 1; 1000];
-        v.write_at(&b, off as u64)
+        let off = usize_from(rng.next_u64() % (u64_from(SIZE) - 1000));
+        let fill = u8::try_from(turn + 1).map_err(|e| format!("turn {turn}: {e}"))?;
+        let b = vec![fill; 1000];
+        v.write_at(&b, u64_from(off))
             .await
             .map_err(|e| format!("turn {turn}: write: {e}"))?;
         v.checkpoint()

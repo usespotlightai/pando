@@ -1,8 +1,10 @@
 name: ci
 
-# Format, lints, tests, dependency checks and the store conformance tests (against the AWS
-# emulator) on every pull request and every push to main. On main only: the crash and restart
-# scenarios over more seeds. The tests that need a Linux kernel are in kernel.yml.
+# The checks from tools/check.sh on every pull request and every push to main: lints, supply
+# chain, tests, the unsafe code under AddressSanitizer and a short run of every fuzz target.
+# Then the store conformance tests against the AWS emulator. On main only: the crash and restart
+# scenarios over more seeds, line coverage, and an auditable release build. Longer fuzzing and
+# mutation testing are in deep.yml; the tests that need a Linux kernel are in kernel.yml.
 
 on:
   pull_request:
@@ -22,7 +24,20 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  check:
+  tools:
+    name: Check tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+
+  lint:
+    name: Lints
+    needs: tools
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -30,31 +45,159 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Toolchain from rust-toolchain.toml
-        run: rustup toolchain install
+      - uses: ./.github/actions/tools
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Lints
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: tools/check.sh lint
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Tests
-        run: cargo test --workspace --all-features
-
-  deny:
+  supply:
+    name: Supply chain
+    needs: tools
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: ./.github/actions/tools
+
+      - name: cargo-deny and cargo-vet
+        run: tools/check.sh supply
+
+  test:
+    name: Tests
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Tests
+        run: tools/check.sh test
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: junit-${{ github.run_id }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+
+  asan:
+    name: AddressSanitizer
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+        with:
+          nightly: "true"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: asan
+
+      - name: pando-host and pando-linux under AddressSanitizer
+        run: tools/check.sh asan
+
+  fuzz:
+    name: Fuzz smoke
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+        with:
+          nightly: "true"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          key: fuzz
+
+      - name: Every fuzz target for 30 seconds, from the seeds
+        run: tools/check.sh fuzz 30
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  coverage:
+    name: Coverage
+    if: github.event_name != 'pull_request'
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: coverage
+
+      - name: Line coverage
+        run: |
+          tools/check.sh coverage | tee "$RUNNER_TEMP/coverage.txt"
+          { echo '```'; cat "$RUNNER_TEMP/coverage.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ github.run_id }}
+          path: target/coverage/lcov.info
+
+  release:
+    name: Auditable release build
+    if: github.event_name != 'pull_request'
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
+
+      - name: Release build with its dependency list embedded
+        run: tools/check.sh release
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pando-${{ github.sha }}
+          path: target/release/pando
+          if-no-files-found: error
 
   scenarios:
+    name: Crash and restart scenarios
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -75,6 +218,7 @@ jobs:
         run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios
 
   store:
+    name: Store conformance
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

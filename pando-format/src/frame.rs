@@ -3,7 +3,7 @@ use std::io::Read;
 
 use bytes::Bytes;
 
-use crate::{FormatError, Hash, Recipe, Verified};
+use crate::{FormatError, Hash, Recipe, Verified, u64_from, usize_from};
 
 /// The most payload a writer puts in one frame. One GET of a frame fills the cache with
 /// every neighbour in it.
@@ -14,15 +14,16 @@ pub const ZSTD_LEVEL: i32 = 3;
 const RECIPE_FLAG: u32 = 1 << 31;
 const HEADER_ENTRY: usize = 40;
 const HEADER_MAX: usize = 16 << 20;
+const PAYLOAD_MAX: usize = 16 * FRAME_MAX;
 
 /// One object in a frame: its content hash, where it sits in the payload, and whether the
 /// bytes are a recipe of the chunk (whose hash it still is) rather than the chunk itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct FrameObject {
-    pub hash: Hash,
-    pub inner: u32,
-    pub len: u32,
-    pub recipe: bool,
+struct FrameObject {
+    hash: Hash,
+    inner: u32,
+    len: u32,
+    recipe: bool,
 }
 
 /// Collects objects into one frame.
@@ -36,10 +37,12 @@ pub struct FrameBuilder {
 }
 
 impl FrameBuilder {
+    /// Whether no object has been pushed.
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
     }
 
+    /// The uncompressed payload bytes pushed so far.
     pub fn payload_len(&self) -> usize {
         self.payload.len()
     }
@@ -51,8 +54,12 @@ impl FrameBuilder {
 
     /// Appends an object and returns its offset and length in the payload.
     pub fn push(&mut self, hash: Hash, bytes: &[u8], recipe: bool) -> (u32, u32) {
-        let inner = self.payload.len() as u32;
-        let len = bytes.len() as u32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "writers close a frame once is_full_for says so, and objects are at most a chunk or \
+                      its recipe, so a payload stays near FRAME_MAX (1 MiB)"
+        )]
+        let (inner, len) = (self.payload.len() as u32, bytes.len() as u32);
         self.objects.push(FrameObject {
             hash,
             inner,
@@ -63,14 +70,17 @@ impl FrameBuilder {
         (inner, len)
     }
 
+    /// The compressed frame of the pushed objects, in push order.
     pub fn finish(self) -> Result<Vec<u8>, FormatError> {
         encode_frame(&self.objects, &self.payload)
     }
 }
 
-pub fn encode_frame(objects: &[FrameObject], payload: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn encode_frame(objects: &[FrameObject], payload: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let count =
+        u32::try_from(objects.len()).map_err(|_| FormatError::malformed("frame", "too many objects"))?;
     let mut raw = Vec::with_capacity(4 + objects.len() * HEADER_ENTRY + payload.len());
-    raw.extend_from_slice(&(objects.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&count.to_le_bytes());
     for o in objects {
         raw.extend_from_slice(&o.hash.0);
         raw.extend_from_slice(&o.inner.to_le_bytes());
@@ -84,7 +94,9 @@ pub fn encode_frame(objects: &[FrameObject], payload: &[u8]) -> Result<Vec<u8>, 
 /// rebuilt, by [`Recipe::rebuild`]).
 #[derive(Debug, Default)]
 pub struct DecodedFrame {
+    /// The plain objects, each checked against its hash.
     pub objects: HashMap<Hash, Verified>,
+    /// The recipes by the hash of the chunk they rebuild; not checked until rebuilt.
     pub recipes: HashMap<Hash, Bytes>,
 }
 
@@ -98,7 +110,7 @@ pub fn decode_frame(z: &[u8], keep: Option<&dyn Fn(&Hash) -> bool>) -> Result<De
     dec.read_exact(&mut count)?;
     let header = (u32::from_le_bytes(count) as usize)
         .checked_mul(HEADER_ENTRY)
-        .filter(|&n| n <= HEADER_MAX && size.is_none_or(|s| (4 + n) as u64 <= s))
+        .filter(|&n| n <= HEADER_MAX && size.is_none_or(|s| u64_from(4 + n) <= s))
         .ok_or_else(|| FormatError::malformed("frame", "header longer than the frame"))?;
     let mut entries = vec![0; header];
     dec.read_exact(&mut entries)?;
@@ -111,39 +123,38 @@ pub fn decode_frame(z: &[u8], keep: Option<&dyn Fn(&Hash) -> bool>) -> Result<De
 
     let mut payload = Vec::new();
     let mut sources = HashSet::new();
-    match (keep, size) {
-        (Some(keep), Some(size)) => {
-            let limit = (size - 4 - header as u64) as usize;
-            let end = payload_end(&objects, &|h| keep(h), limit)?;
-            payload.resize(end, 0);
-            dec.read_exact(&mut payload)?;
-            sources = kept_recipe_sources(&objects, &payload, keep);
-            if !sources.is_empty() {
-                let end = payload_end(&objects, &|h| keep(h) || sources.contains(h), limit)?;
-                let have = payload.len();
-                if end > have {
-                    payload.resize(end, 0);
-                    dec.read_exact(&mut payload[have..])?;
-                }
-            }
+    if let (Some(keep), Some(size)) = (keep, size) {
+        let limit = usize_from(size - 4 - u64_from(header));
+        let end = payload_end(&objects, &|h| keep(h), limit)?;
+        read_payload_to(&mut dec, &mut payload, end)?;
+        sources = kept_recipe_sources(&objects, &payload, keep);
+        if !sources.is_empty() {
+            let end = payload_end(&objects, &|h| keep(h) || sources.contains(h), limit)?;
+            read_payload_to(&mut dec, &mut payload, end)?;
         }
-        _ => {
-            dec.read_to_end(&mut payload)?;
-            if let Some(keep) = keep {
-                sources = kept_recipe_sources(&objects, &payload, keep);
-            }
+    } else {
+        dec.by_ref()
+            .take(u64_from(PAYLOAD_MAX) + 1)
+            .read_to_end(&mut payload)?;
+        if payload.len() > PAYLOAD_MAX {
+            return Err(FormatError::malformed(
+                "frame",
+                "payload larger than any writer makes",
+            ));
+        }
+        if let Some(keep) = keep {
+            sources = kept_recipe_sources(&objects, &payload, keep);
         }
     }
     let keep = |h: &Hash| keep.is_none_or(|k| k(h)) || sources.contains(h);
-    frame_objects(&objects, Bytes::from(payload), &keep)
+    frame_objects(&objects, &Bytes::from(payload), &keep)
 }
 
-fn header_entry(e: &[u8; HEADER_ENTRY]) -> FrameObject {
-    let u32_at = |at: usize| u32::from_le_bytes(e[at..at + 4].try_into().expect("4 bytes"));
-    let len = u32_at(36);
+fn header_entry(&[ref hash @ .., i0, i1, i2, i3, l0, l1, l2, l3]: &[u8; HEADER_ENTRY]) -> FrameObject {
+    let len = u32::from_le_bytes([l0, l1, l2, l3]);
     FrameObject {
-        hash: Hash(e[..32].try_into().expect("32 bytes")),
-        inner: u32_at(32),
+        hash: Hash(*hash),
+        inner: u32::from_le_bytes([i0, i1, i2, i3]),
         len: len & !RECIPE_FLAG,
         recipe: len & RECIPE_FLAG != 0,
     }
@@ -151,6 +162,27 @@ fn header_entry(e: &[u8; HEADER_ENTRY]) -> FrameObject {
 
 fn span(o: &FrameObject) -> std::ops::Range<usize> {
     o.inner as usize..o.inner as usize + o.len as usize
+}
+
+fn read_payload_to(dec: &mut impl Read, payload: &mut Vec<u8>, end: usize) -> Result<(), FormatError> {
+    if end > PAYLOAD_MAX {
+        return Err(FormatError::malformed(
+            "frame",
+            "payload larger than any writer makes",
+        ));
+    }
+    let Some(more) = end.checked_sub(payload.len()) else {
+        return Ok(());
+    };
+    dec.take(u64_from(more)).read_to_end(payload)?;
+    if payload.len() == end {
+        Ok(())
+    } else {
+        Err(FormatError::malformed(
+            "frame",
+            "payload shorter than its header says",
+        ))
+    }
 }
 
 fn payload_end(
@@ -185,7 +217,7 @@ fn kept_recipe_sources(
 
 fn frame_objects(
     objects: &[FrameObject],
-    payload: Bytes,
+    payload: &Bytes,
     keep: &dyn Fn(&Hash) -> bool,
 ) -> Result<DecodedFrame, FormatError> {
     let mut out = DecodedFrame::default();

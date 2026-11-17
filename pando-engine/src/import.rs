@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use pando_format::{CHUNK_SIZE, Entry, Hash, Ref, Writer, WriterId, is_zero};
+use pando_format::{CHUNK_SIZE, Entry, Hash, Ref, Writer, WriterId, is_zero, u64_from, usize_from};
 
 use crate::cache::Cache;
 use crate::packer::{PackStats, Packer, SEG_MAX};
@@ -13,17 +13,19 @@ use crate::ports::{CpuClass, LocalFile, Open, on_cpu};
 use crate::tree::Tree;
 use crate::{Ports, Result, ext4};
 
-const CHUNK: u64 = CHUNK_SIZE as u64;
+const CHUNK: u64 = u64_from(CHUNK_SIZE);
 const READ_AHEAD: usize = 16;
 
 /// What an import uploaded.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImportReport {
+    /// The size of the branch in bytes: the size of the image.
     pub size: u64,
     /// Chunks that hold data; zero chunks stay holes.
     pub chunks: usize,
     /// Chunks of ext4 metadata, packed first so they share few frames.
     pub metadata: usize,
+    /// What the upload of the chunks and the tree packed and sent.
     pub upload: PackStats,
 }
 
@@ -35,15 +37,15 @@ struct ImageFile<'a> {
 
 impl ext4::Image for ImageFile<'_> {
     async fn read(&mut self, off: u64, len: u64) -> Result<Vec<u8>> {
-        let mut b = self.f.read_at(len as usize, off).await?.to_vec();
-        b.resize(len as usize, 0);
+        let mut b = self.f.read_at(usize_from(len), off).await?.to_vec();
+        b.resize(usize_from(len), 0);
         Ok(b)
     }
 
-    async fn wave(&mut self, idxs: Vec<u64>) -> Result<()> {
+    fn wave(&mut self, idxs: Vec<u64>) -> impl Future<Output = Result<()>> {
         self.order
             .extend(idxs.into_iter().filter_map(|i| self.at.get(&i).copied()));
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -86,11 +88,11 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
         return Err(crate::Error::RefExists(name.to_owned()));
     }
     let generation = 1;
-    let tree = Tree::new(cache.clone(), size.div_ceil(CHUNK));
-    let cpu = ports.cpu.clone();
+    let tree = Tree::new(Arc::clone(cache), size.div_ceil(CHUNK));
+    let cpu = Arc::clone(&ports.cpu);
     let mut chunks = futures::stream::iter(0..size.div_ceil(CHUNK))
         .map(|idx| {
-            let (f, cpu) = (f.clone(), cpu.clone());
+            let (f, cpu) = (Arc::clone(&f), Arc::clone(&cpu));
             async move {
                 let mut b = f.read_at(CHUNK_SIZE, idx * CHUNK).await?.to_vec();
                 b.resize(CHUNK_SIZE, 0);
@@ -121,7 +123,13 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
     cache.sync_local().await?;
     let root = tree.update(&Entry::EMPTY, &updates).await?;
     let writer = Arc::new(Writer::new(WriterId::new(name, generation), ports.rng.next_u32()));
-    let mut p = Packer::new(remote.clone(), ports.cpu.clone(), writer, SEG_MAX, Arc::default());
+    let mut p = Packer::new(
+        remote.clone(),
+        Arc::clone(&ports.cpu),
+        writer,
+        SEG_MAX,
+        Arc::default(),
+    );
     let metadata = pack_metadata(&f, cache, &updates, &mut p).await?;
     let packed = tree.pack(&root, &mut p).await?;
     p.finish().await?;
@@ -144,7 +152,8 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
     })
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use bytes::Bytes;
 
@@ -194,7 +203,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ext4_metadata_is_packed_first() {
         let (ports, _, _) = sim::ports(10);
-        let mut img = crate::ext4::tests::image();
+        let mut img = ext4::tests::image();
         img[100 * CHUNK_SIZE] = 7;
         ports.fs.create_dir_all(Path::new("/img")).await.unwrap();
         let f = ports.fs.open(Path::new("/img/disk"), Open::Create).await.unwrap();

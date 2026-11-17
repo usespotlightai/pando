@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 pub(crate) use journal::Journal;
 pub(crate) use object_log::{ObjectLog, WritebackHold};
+use pando_format::usize_from;
 
 use crate::ports::{LocalFs, Open};
 
@@ -24,7 +25,7 @@ fn tmp_path(p: &Path) -> PathBuf {
 /// Replaces `p` with `b` so that a crash leaves either the old or the new content, and the new
 /// content is durable when this returns.
 pub(crate) async fn write_durable(fs: &dyn LocalFs, p: &Path, b: Bytes) -> io::Result<()> {
-    let dir = p.parent().unwrap_or(Path::new(""));
+    let dir = p.parent().unwrap_or_else(|| Path::new(""));
     fs.create_dir_all(dir).await?;
     let tmp = tmp_path(p);
     let f = fs.open(&tmp, Open::CreateNew).await?;
@@ -36,7 +37,7 @@ pub(crate) async fn write_durable(fs: &dyn LocalFs, p: &Path, b: Bytes) -> io::R
 
 /// Replaces `p` with `b` atomically, without waiting for the disk.
 pub(crate) async fn write_atomic(fs: &dyn LocalFs, p: &Path, b: Bytes) -> io::Result<()> {
-    let dir = p.parent().unwrap_or(Path::new(""));
+    let dir = p.parent().unwrap_or_else(|| Path::new(""));
     fs.create_dir_all(dir).await?;
     let tmp = tmp_path(p);
     let f = fs.open(&tmp, Open::CreateNew).await?;
@@ -49,9 +50,16 @@ pub(crate) async fn read_file(fs: &dyn LocalFs, p: &Path) -> io::Result<Option<B
     match fs.open(p, Open::Read).await {
         Ok(f) => {
             let n = f.size().await?;
-            Ok(Some(f.read_at(n as usize, 0).await?))
+            Ok(Some(f.read_at(usize_from(n), 0).await?))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// The first `N` bytes of `b`, which then starts after them; `None` when `b` is shorter.
+pub(crate) fn take<const N: usize>(b: &mut &[u8]) -> Option<[u8; N]> {
+    let (head, rest) = b.split_first_chunk::<N>()?;
+    *b = rest;
+    Some(*head)
 }

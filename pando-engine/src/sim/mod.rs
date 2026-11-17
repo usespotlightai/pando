@@ -22,12 +22,12 @@ use crate::Ports;
 /// Ports on in-memory adapters, seeded with `seed`.
 pub fn ports(seed: u64) -> (Ports, Arc<SimStore>, Arc<SimFs>) {
     let clock = Arc::new(SimClock::new());
-    let store = Arc::new(SimStore::new(clock.clone()));
+    let store = Arc::new(SimStore::new(Arc::<SimClock>::clone(&clock)));
     let fs = Arc::new(SimFs::default());
     let ports = Ports {
-        store: store.clone(),
-        fs: fs.clone(),
-        image: fs.clone(),
+        store: Arc::<SimStore>::clone(&store),
+        fs: Arc::<SimFs>::clone(&fs),
+        image: Arc::<SimFs>::clone(&fs),
         clock,
         rng: Arc::new(SimRng::new(seed)),
         cpu: Arc::new(InlineCpu),

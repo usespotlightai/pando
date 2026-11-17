@@ -1,6 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
@@ -29,14 +29,17 @@ async fn upload_as(remote: &Remote, n: u32, deps: Vec<SegId>, frames: Vec<Vec<(B
                 hash: h,
                 loc: Loc {
                     seg: id,
-                    frame: f as u32,
+                    frame: u32::try_from(f).unwrap(),
                     inner,
                     len,
                 },
             });
         }
         let z = fb.finish().unwrap();
-        index.push((data.len() as u32, z.len() as u32));
+        index.push((
+            u32::try_from(data.len()).unwrap(),
+            u32::try_from(z.len()).unwrap(),
+        ));
         data.extend_from_slice(&z);
     }
     let idx = SegmentIndex { frames: index, deps }.encode();
@@ -54,7 +57,7 @@ async fn upload(remote: &Remote, frames: Vec<Vec<(Bytes, bool, Hash)>>) -> Seg {
 fn chunk(seed: u8) -> Bytes {
     Bytes::from(
         (0..CHUNK_SIZE)
-            .map(|i| (i as u8).wrapping_mul(seed).wrapping_add(seed))
+            .map(|i| i.to_le_bytes()[0].wrapping_mul(seed).wrapping_add(seed))
             .collect::<Vec<_>>(),
     )
 }
@@ -86,7 +89,7 @@ fn half_of(src: &Entry, src_bytes: &[u8]) -> (Bytes, bool, Hash) {
     for (i, p) in picks.iter_mut().enumerate().take(BLOCKS_PER_CHUNK / 2) {
         *p = Pick::Source {
             src: 0,
-            block: (i + BLOCKS_PER_CHUNK / 2) as u8,
+            block: u8::try_from(i + BLOCKS_PER_CHUNK / 2).unwrap(),
         };
     }
     let enc = Recipe::encode(std::slice::from_ref(src), &picks, &want);
@@ -100,10 +103,15 @@ fn want_of(src_bytes: &[u8]) -> Bytes {
 }
 
 async fn cache(ports: &crate::Ports, dir: &str) -> Cache {
-    let remote = Remote::new(ports.store.clone());
-    Cache::open_with(ports.fs.clone(), ports.cpu.clone(), remote, Path::new(dir))
-        .await
-        .unwrap()
+    let remote = Remote::new(Arc::clone(&ports.store));
+    Cache::open_with(
+        Arc::clone(&ports.fs),
+        Arc::clone(&ports.cpu),
+        remote,
+        Path::new(dir),
+    )
+    .await
+    .unwrap()
 }
 
 fn gets(c: &Cache) -> u64 {
@@ -172,7 +180,7 @@ async fn adjacent_frames_go_as_one_run_and_ready_fires_for_every_entry() {
     let frames = (0..6).map(|i| vec![plain(noise(i))]).collect();
     let seg = upload(c.remote(), frames).await;
     let seen = Mutex::new(Vec::new());
-    let ready = |i: usize| seen.lock().unwrap().push(i);
+    let ready = |i: usize| seen.lock().push(i);
     let es = [seg.entries[4], seg.entries[1], seg.entries[2], seg.entries[1]];
     let n = c
         .fetch_with(
@@ -185,7 +193,7 @@ async fn adjacent_frames_go_as_one_run_and_ready_fires_for_every_entry() {
         )
         .await;
     assert_eq!(n, 3);
-    let mut seen = seen.into_inner().unwrap();
+    let mut seen = seen.into_inner();
     seen.sort_unstable();
     assert_eq!(seen, vec![0, 1, 2, 3]);
     assert_eq!(
@@ -209,7 +217,7 @@ async fn a_failed_index_still_tells_every_entry() {
         applied: false,
     });
     let seen = Mutex::new(0);
-    let ready = |_: usize| *seen.lock().unwrap() += 1;
+    let ready = |_: usize| *seen.lock() += 1;
     c.fetch_with(
         &seg.entries,
         &FetchOpts {
@@ -219,7 +227,7 @@ async fn a_failed_index_still_tells_every_entry() {
         },
     )
     .await;
-    assert_eq!(*seen.lock().unwrap(), 2);
+    assert_eq!(*seen.lock(), 2);
     assert!(!c.has(&seg.entries[0].hash).await);
     assert_eq!(
         c.fetch_entries(&seg.entries, 2).await,

@@ -34,7 +34,8 @@ const ATTR_FUA: u32 = 1 << 3;
 const PARAM_TYPE_BASIC: u32 = 1;
 
 const INFO_LEN: usize = 64;
-const PARAMS_LEN: usize = 40;
+const PARAMS_SIZE: u32 = 40;
+const PARAMS_LEN: usize = PARAMS_SIZE as usize;
 
 fn op(nr: u32) -> u32 {
     let dir = if matches!(nr, CMD_GET_DEV_INFO | CMD_GET_FEATURES) {
@@ -42,7 +43,7 @@ fn op(nr: u32) -> u32 {
     } else {
         3
     };
-    sys::ioc(dir, b'u', nr, 32) as u32
+    sys::ioc32(dir, b'u', nr, 32)
 }
 
 /// What `GET_DEV_INFO` reports of a device.
@@ -87,7 +88,7 @@ fn encode_info(d: &NewDevice) -> Vec<u8> {
 /// Basic parameters: 4 KiB blocks, a volatile cache with FUA, and the device size.
 fn encode_params(size: u64, max_io: u32) -> Vec<u8> {
     let mut b = vec![0u8; PARAMS_LEN];
-    b[0..4].copy_from_slice(&(PARAMS_LEN as u32).to_le_bytes());
+    b[0..4].copy_from_slice(&PARAMS_SIZE.to_le_bytes());
     b[4..8].copy_from_slice(&PARAM_TYPE_BASIC.to_le_bytes());
     b[8..12].copy_from_slice(&(ATTR_VOLATILE_CACHE | ATTR_FUA).to_le_bytes());
     b[12..16].copy_from_slice(&[12, 12, 12, 12]);
@@ -130,9 +131,10 @@ impl Ctrl {
         let mut cmd = [0u8; 80];
         cmd[0..4].copy_from_slice(&id.to_le_bytes());
         cmd[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
-        if let Some(b) = &buf {
-            cmd[6..8].copy_from_slice(&(b.len() as u16).to_le_bytes());
-            cmd[8..16].copy_from_slice(&(b.as_ptr() as u64).to_le_bytes());
+        if let Some(b) = buf {
+            let len = u16::try_from(b.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            cmd[6..8].copy_from_slice(&len.to_le_bytes());
+            cmd[8..16].copy_from_slice(&(b.as_mut_ptr() as u64).to_le_bytes());
         }
         cmd[16..24].copy_from_slice(&data.to_le_bytes());
         let e = opcode::UringCmd80::new(types::Fd(self.file.as_raw_fd()), op(nr))
@@ -208,10 +210,10 @@ mod tests {
 
     #[test]
     fn control_ioctls_match_the_kernel() {
-        assert_eq!(op(CMD_ADD_DEV), 0xc0207504);
-        assert_eq!(op(CMD_GET_DEV_INFO), 0x80207502);
-        assert_eq!(op(CMD_GET_FEATURES), 0x80207513);
-        assert_eq!(op(CMD_UPDATE_SIZE), 0xc0207515);
+        assert_eq!(op(CMD_ADD_DEV), 0xc020_7504);
+        assert_eq!(op(CMD_GET_DEV_INFO), 0x8020_7502);
+        assert_eq!(op(CMD_GET_FEATURES), 0x8020_7513);
+        assert_eq!(op(CMD_UPDATE_SIZE), 0xc020_7515);
     }
 
     #[test]

@@ -1,0 +1,28 @@
+name: Check tools
+description: >-
+  The pinned Rust toolchain and the check tools from tools/install.sh in ~/.pando-tools, cached
+  by the hash of that script; tools/check.sh finds them there. Set nightly to also install the
+  pinned nightly toolchain.
+
+inputs:
+  nightly:
+    description: Install the nightly toolchain from tools/nightly.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Toolchain from rust-toolchain.toml
+      shell: bash
+      run: rustup toolchain install && rustup component add llvm-tools
+
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.pando-tools
+        key: pando-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/install.sh', 'tools/nightly') }}
+
+    - name: Install the check tools
+      shell: bash
+      env:
+        PANDO_INSTALL_NIGHTLY: ${{ inputs.nightly == 'true' && '1' || '0' }}
+      run: tools/install.sh "$HOME/.pando-tools"

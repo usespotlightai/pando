@@ -2,6 +2,11 @@
 //! must pass, and seeded crash and fault scenarios as the engine grows.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::print_stderr,
+    reason = "a conformance check fails by panicking, and a traced scenario reports to the test's stderr"
+)]
 
 pub mod scenario;
 pub mod store_conformance;

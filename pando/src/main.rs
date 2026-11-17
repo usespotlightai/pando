@@ -1,4 +1,11 @@
+//! The `pando` command: manages branches in the store and serves them as block devices.
+
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool reports to its terminal"
+)]
 
 mod config;
 mod device;
@@ -165,10 +172,7 @@ async fn main() -> Result<()> {
             let t0 = Instant::now();
             let r = base::build_branch(&ports, &cache().await?, &dir, &name, parallel).await?;
             if r.built {
-                let seed = r
-                    .seed
-                    .map(|s| format!(", seeded from {}", s.short()))
-                    .unwrap_or_default();
+                let seed = r.seed.map_or_default(|s| format!(", seeded from {}", s.short()));
                 println!(
                     "base of {name} built in {:.1?}: {} chunks{seed}",
                     t0.elapsed(),
@@ -202,31 +206,12 @@ async fn main() -> Result<()> {
             keep_young,
             validate,
         } => {
-            let r = gc::collect(
-                &cache().await?,
-                ports.clock.as_ref(),
-                &GcOptions {
-                    delete,
-                    keep_young,
-                    validate,
-                },
-            )
-            .await?;
-            println!(
-                "{} live segments ({} MiB, {} MiB used), {} dead ({} MiB){}; kept {} of current writers, {} young, {} needed by kept; {} revived; {} stale change lists",
-                r.live,
-                r.live_bytes >> 20,
-                r.used_bytes >> 20,
-                r.dead,
-                r.dead_bytes >> 20,
-                if r.deleted { ", deleted" } else { "" },
-                r.current_writer,
-                r.young,
-                r.needed_by_kept,
-                r.revived,
-                r.stale_change_lists
-            );
-            Ok(())
+            let opts = GcOptions {
+                delete,
+                keep_young,
+                validate,
+            };
+            collect(&ports, &cache().await?, &opts).await
         }
         Command::Attach(a) => device::attach(&ports, cache().await?, a, cli.store.identity()).await,
         Command::Detach(d) => device::detach(d).await,
@@ -245,11 +230,30 @@ async fn main() -> Result<()> {
     }
 }
 
+async fn collect(ports: &Ports, cache: &Arc<Cache>, opts: &GcOptions) -> Result<()> {
+    let r = gc::collect(cache, ports.clock.as_ref(), opts).await?;
+    println!(
+        "{} live segments ({} MiB, {} MiB used), {} dead ({} MiB){}; kept {} of current writers, {} young, {} needed by kept; {} revived; {} stale change lists",
+        r.live,
+        r.live_bytes >> 20,
+        r.used_bytes >> 20,
+        r.dead,
+        r.dead_bytes >> 20,
+        if r.deleted { ", deleted" } else { "" },
+        r.current_writer,
+        r.young,
+        r.needed_by_kept,
+        r.revived,
+        r.stale_change_lists
+    );
+    Ok(())
+}
+
 async fn refs(ports: &Ports) -> Result<()> {
     for o in ports.store.list(keys::REFS).await? {
         let name = o.key.strip_prefix(&format!("{}/", keys::REFS)).unwrap_or(&o.key);
         let r = Ref::decode(&ports.store.get(&o.key).await?.body).with_context(|| format!("ref {name}"))?;
-        let from = r.from.map(|f| format!(" from {f}")).unwrap_or_default();
+        let from = r.from.map_or_default(|f| format!(" from {f}"));
         println!("{name} {} {} {}{from}", r.size, r.generation, r.root.hash.short());
     }
     Ok(())
@@ -263,7 +267,7 @@ mod tests {
     fn durations_parse_with_their_units() {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
-        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_hours(24));
         assert!(parse_duration("3d").is_err());
     }
 

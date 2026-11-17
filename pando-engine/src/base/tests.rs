@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use pando_format::{CHUNK_SIZE, Ref};
+use pando_format::{CHUNK_SIZE, Ref, usize_from};
 
 use super::follow::FOLLOW_MAX_AGE;
 use super::*;
@@ -15,8 +15,8 @@ const SIZE: u64 = 4 << 20;
 /// Noise, except that chunk 7 repeats chunk 2.
 fn data(seed: u64) -> Vec<u8> {
     let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    let mut out = Vec::with_capacity(SIZE as usize);
-    while out.len() < SIZE as usize {
+    let mut out = Vec::with_capacity(usize_from(SIZE));
+    while out.len() < usize_from(SIZE) {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -31,7 +31,7 @@ async fn host(ports: &Ports, dir: &str) -> Arc<Cache> {
 }
 
 async fn write(ports: &Ports, c: &Arc<Cache>, b: &[u8], off: u64) -> Ref {
-    let v = Volume::open(ports, c.clone(), Path::new("/v"), "main")
+    let v = Volume::open(ports, Arc::clone(c), Path::new("/v"), "main")
         .await
         .unwrap();
     v.write_at(b, off).await.unwrap();
@@ -54,7 +54,7 @@ async fn image(ports: &Ports, bases: &Bases, r: &Ref) -> Vec<u8> {
         .open(&bases.path(&r.root.hash), Open::Read)
         .await
         .unwrap();
-    f.read_at(r.size as usize, 0).await.unwrap().to_vec()
+    f.read_at(usize_from(r.size), 0).await.unwrap().to_vec()
 }
 
 #[tokio::test(start_paused = true)]
@@ -67,12 +67,12 @@ async fn a_build_writes_the_root_and_a_branch_reads_it() {
 
     let b = host(&ports, "/b").await;
     let bases = Bases::new(&ports, Path::new("/b/bases"));
-    let tree = Tree::new(b.clone(), r.size.div_ceil(CHUNK_SIZE as u64));
+    let tree = Tree::new(Arc::clone(&b), r.size.div_ceil(CHUNK_SIZE as u64));
     let rep = build(&bases, &b, &tree, r.root, r.size, opts(false))
         .await
         .unwrap();
     assert!(rep.built);
-    assert_eq!(rep.chunks, SIZE as usize / CHUNK_SIZE - 1);
+    assert_eq!(rep.chunks, usize_from(SIZE) / CHUNK_SIZE - 1);
     assert_eq!(rep.from_fetch + rep.read_back + rep.recipes, rep.chunks);
     assert!(!b.serves_base(BaseKey::Building(r.root.hash)));
     assert_eq!(image(&ports, &bases, &r).await, want);
@@ -83,7 +83,7 @@ async fn a_build_writes_the_root_and_a_branch_reads_it() {
             .built
     );
 
-    let v = Volume::open(&ports, b.clone(), Path::new("/w"), "main")
+    let v = Volume::open(&ports, Arc::clone(&b), Path::new("/w"), "main")
         .await
         .unwrap();
     assert!(v.use_base(&bases).await.unwrap());
@@ -109,7 +109,7 @@ async fn a_new_root_is_seeded_from_the_nearest_base() {
     let b = host(&ports, "/b").await;
     let bases = Bases::new(&ports, Path::new("/b/bases"));
     let chunks = SIZE.div_ceil(CHUNK_SIZE as u64);
-    let t1 = Tree::new(b.clone(), chunks);
+    let t1 = Tree::new(Arc::clone(&b), chunks);
     build(&bases, &b, &t1, r1.root, SIZE, opts(false)).await.unwrap();
 
     let change = vec![0x5a; CHUNK_SIZE + 10];
@@ -117,7 +117,7 @@ async fn a_new_root_is_seeded_from_the_nearest_base() {
     let r2 = write(&ports, &a, &change, 2 * CHUNK_SIZE as u64).await;
 
     let fresh = host(&ports, "/c").await;
-    let t2 = Tree::new(fresh.clone(), chunks);
+    let t2 = Tree::new(Arc::clone(&fresh), chunks);
     let bases_c = Bases::new(&ports, Path::new("/b/bases"));
     let rep = build(&bases_c, &fresh, &t2, r2.root, SIZE, opts(true))
         .await
@@ -139,7 +139,7 @@ async fn a_served_base_answers_chunk_reads_and_gives_upload_blocks() {
 
     let b = host(&ports, "/b").await;
     let bases = Bases::new(&ports, Path::new("/b/bases"));
-    let tree = Arc::new(Tree::new(b.clone(), SIZE.div_ceil(CHUNK_SIZE as u64)));
+    let tree = Arc::new(Tree::new(Arc::clone(&b), SIZE.div_ceil(CHUNK_SIZE as u64)));
     assert!(bases.blocks_for(&tree, r.root).await.unwrap().is_none());
     let rep = build(&bases, &b, &tree, r.root, SIZE, opts(true)).await.unwrap();
     assert!(rep.from_fetch > 0);
@@ -169,7 +169,7 @@ async fn a_follower_builds_the_new_root_of_a_followed_branch_and_evicts_old_base
     let b = host(&ports, "/b").await;
     let bases = Bases::new(&ports, Path::new("/b/bases"));
     bases.note_follow("main").await.unwrap();
-    let mut f = Follower::new(&ports, b.clone(), Path::new("/b/bases"), 8, 1, 0);
+    let mut f = Follower::new(&ports, Arc::clone(&b), Path::new("/b/bases"), 8, 1, 0);
     assert_eq!(f.once().await.unwrap(), 1);
     assert!(bases.has(&r1.root.hash).await);
     assert_eq!(f.once().await.unwrap(), 0);

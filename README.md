@@ -56,6 +56,11 @@ Linux container and takes the same arguments.
 cargo test --workspace
 ```
 
+`tools/check.sh` runs the checks CI runs, in a container with every tool pinned
+(`tools/Dockerfile`, `tools/install.sh`): with no arguments it runs the lints, the supply-chain
+checks and the tests. It also takes `asan`, `fuzz [seconds]`, `coverage`, `mutants`, or any
+single check by name, such as `clippy` or `shellcheck`. The fuzz targets are in `fuzz/`.
+
 Fixtures in `pando-format/tests/fixtures` pin the byte encoding of every stored object.
 
 ## Alternatives

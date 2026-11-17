@@ -1,0 +1,8 @@
+include = ["**/*.toml"]
+exclude = ["target/**", "fuzz/target/**", ".claude/**", "**/node_modules/**", "supply-chain/**"]
+
+[formatting]
+column_width = 110
+indent_string = "    "
+reorder_keys = false
+reorder_arrays = false

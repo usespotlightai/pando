@@ -28,14 +28,9 @@ pub(crate) fn path(image: &Path) -> PathBuf {
 
 impl Owner {
     fn encode(&self) -> String {
-        let mut s = format!("generation {}\n", self.generation);
-        if let Some(b) = self.base {
-            s += &format!("base {b}\n");
-        }
-        if self.switched {
-            s += "switched\n";
-        }
-        s
+        let base = self.base.map_or_else(String::new, |b| format!("base {b}\n"));
+        let switched = if self.switched { "switched\n" } else { "" };
+        format!("generation {}\n{base}{switched}", self.generation)
     }
 
     fn decode(s: &str) -> Option<Owner> {

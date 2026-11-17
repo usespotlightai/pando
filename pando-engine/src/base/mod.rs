@@ -54,10 +54,10 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
 impl Bases {
     pub(crate) fn new(ports: &Ports, dir: &Path) -> Bases {
         Bases {
-            fs: ports.fs.clone(),
-            image: ports.image.clone(),
-            clock: ports.clock.clone(),
-            cpu: ports.cpu.clone(),
+            fs: Arc::clone(&ports.fs),
+            image: Arc::clone(&ports.image),
+            clock: Arc::clone(&ports.clock),
+            cpu: Arc::clone(&ports.cpu),
             dir: dir.to_owned(),
         }
     }
@@ -196,7 +196,7 @@ pub async fn build_branch(
         .get_ref(name)
         .await?
         .ok_or_else(|| Error::Corrupt(format!("{name}: no such branch")))?;
-    let tree = Tree::new(cache.clone(), r.size.div_ceil(CHUNK_SIZE as u64));
+    let tree = Tree::new(Arc::clone(cache), r.size.div_ceil(CHUNK_SIZE as u64));
     let opts = BuildOptions {
         parallel,
         serve: false,
@@ -205,5 +205,6 @@ pub async fn build_branch(
     build(&Bases::new(ports, dir), cache, &tree, r.root, r.size, opts).await
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests;

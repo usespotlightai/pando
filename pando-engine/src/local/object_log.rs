@@ -1,18 +1,20 @@
-use std::collections::{BTreeSet, HashMap};
+use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use pando_format::Hash;
+use pando_format::{Hash, u64_from, usize_from};
 use tokio::sync::Notify;
 
-use super::{read_file, write_atomic};
+use super::{read_file, take, write_atomic};
 use crate::ports::{Advice, FileLock, LocalFile, LocalFs, Open};
 use crate::{Error, Result};
 
 const HEADER: usize = 32 + 4;
+const HEADER_LEN: u64 = u64_from(HEADER);
 const REF_FLAG: u32 = 1 << 31;
 const SHARDS: usize = 256;
 /// After this many appended bytes the log starts its write-back, so a flush's sync does not
@@ -40,7 +42,7 @@ pub(crate) struct ObjectLog {
     landed: Arc<Notify>,
     poisoned: Arc<AtomicBool>,
     _lock: Box<dyn FileLock>,
-    files: Mutex<HashMap<PathBuf, Arc<ExtFile>>>,
+    files: Mutex<BTreeMap<PathBuf, Arc<ExtFile>>>,
     unwritten: AtomicU64,
     writing_back: Arc<AtomicBool>,
     holds: AtomicU32,
@@ -75,18 +77,16 @@ impl ExtFile {
         if self.gone.load(Ordering::Acquire) {
             return None;
         }
-        if let Some(f) = self.file.lock().expect("ext file lock").clone() {
+        let opened = self.file.lock().clone();
+        if let Some(f) = opened {
             return Some(f);
         }
-        match fs.open(&self.path, Open::Read).await {
-            Ok(f) => {
-                let mut slot = self.file.lock().expect("ext file lock");
-                (!self.gone.load(Ordering::Acquire)).then(|| slot.get_or_insert(f).clone())
-            }
-            Err(_) => {
-                self.gone.store(true, Ordering::Release);
-                None
-            }
+        if let Ok(f) = fs.open(&self.path, Open::Read).await {
+            let mut slot = self.file.lock();
+            (!self.gone.load(Ordering::Acquire)).then(|| Arc::clone(slot.get_or_insert(f)))
+        } else {
+            self.gone.store(true, Ordering::Release);
+            None
         }
     }
 
@@ -94,7 +94,7 @@ impl ExtFile {
         if self.gone.load(Ordering::Acquire) {
             return None;
         }
-        self.file.lock().expect("ext file lock").clone()
+        self.file.lock().clone()
     }
 }
 
@@ -123,23 +123,23 @@ struct Window {
 impl Window {
     /// `len` bytes at `at`, fewer at the end of the file.
     async fn read(&mut self, f: &dyn LocalFile, at: u64, len: usize) -> io::Result<Bytes> {
-        let end = self.start + self.buf.len() as u64;
-        if at < self.start || at + len as u64 > end {
+        let end = self.start + u64_from(self.buf.len());
+        if at < self.start || at + u64_from(len) > end {
             if len > SCAN_WINDOW {
                 return f.read_at(len, at).await;
             }
             self.buf = f.read_at(SCAN_WINDOW, at).await?;
             self.start = at;
         }
-        let from = (at - self.start) as usize;
+        let from = usize_from(at - self.start);
         Ok(self.buf.slice(from..(from + len).min(self.buf.len())))
     }
 
     /// [`Self::read`] for a few bytes: from the page cache when it holds them, so a scan of
     /// headers does not read the objects between them.
     async fn read_small(&mut self, f: &dyn LocalFile, at: u64, len: usize) -> io::Result<Bytes> {
-        let end = self.start + self.buf.len() as u64;
-        if at < self.start || at + len as u64 > end {
+        let end = self.start + u64_from(self.buf.len());
+        if at < self.start || at + u64_from(len) > end {
             let mut b = vec![0; len];
             if f.read_at_nowait(&mut b, at)? == Some(len) {
                 return Ok(Bytes::from(b));
@@ -158,7 +158,7 @@ fn header(h: Hash, len: u32) -> Bytes {
 
 impl ObjectLog {
     pub(crate) async fn open(fs: Arc<dyn LocalFs>, path: &Path) -> Result<ObjectLog> {
-        let dir = path.parent().unwrap_or(Path::new(""));
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
         fs.create_dir_all(dir).await?;
         let mut lock_path = path.as_os_str().to_owned();
         lock_path.push(".lock");
@@ -171,7 +171,7 @@ impl ObjectLog {
         let file = fs.open(path, Open::Create).await?;
         fs.sync_dir(dir).await?;
         let log = ObjectLog {
-            fs: fs.clone(),
+            fs: Arc::clone(&fs),
             file,
             path: path.to_path_buf(),
             end: AtomicU64::new(0),
@@ -211,15 +211,15 @@ impl ObjectLog {
         let size = self.file.size().await?;
         let mut w = Window::default();
         let mut off = 0u64;
-        while off + HEADER as u64 <= size {
+        while off + HEADER_LEN <= size {
             let hdr = w.read_small(self.file.as_ref(), off, HEADER).await?;
-            if hdr.len() < HEADER {
+            let mut rest: &[u8] = &hdr;
+            let (Some(h), Some(n)) = (take::<32>(&mut rest), take::<4>(&mut rest)) else {
                 break;
-            }
-            let h = Hash(hdr[..32].try_into().expect("32 bytes"));
-            let n = u32::from_le_bytes(hdr[32..].try_into().expect("4 bytes"));
+            };
+            let (h, n) = (Hash(h), u32::from_le_bytes(n));
             let plen = u64::from(n & !REF_FLAG);
-            let body = off + HEADER as u64;
+            let body = off + HEADER_LEN;
             if body + plen > size {
                 break;
             }
@@ -231,19 +231,26 @@ impl ObjectLog {
                 continue;
             }
             if n & REF_FLAG != 0 {
-                let payload = w.read_small(self.file.as_ref(), body, plen as usize).await?;
-                let Some(loc) = self.read_ref(off, &payload) else {
+                let payload = w.read_small(self.file.as_ref(), body, usize_from(plen)).await?;
+                let Some((len, ext, ext_off)) = self.read_ref(&payload) else {
                     break;
                 };
-                let (ext, ext_off) = loc.ext.as_ref().expect("a ref record names a file");
                 if let Some(f) = ext.open(self.fs.as_ref()).await {
                     if off >= synced {
-                        let data = f.read_at(loc.len as usize, *ext_off).await?;
+                        let data = f.read_at(len as usize, ext_off).await?;
                         if Hash::of(&data) != h {
                             break;
                         }
                     }
-                    self.index(h, Arc::new(loc));
+                    self.index(
+                        h,
+                        Arc::new(Loc {
+                            off,
+                            len,
+                            touched: AtomicBool::new(false),
+                            ext: Some((ext, ext_off)),
+                        }),
+                    );
                 }
             } else {
                 if off >= synced {
@@ -267,36 +274,23 @@ impl ObjectLog {
         Ok(off)
     }
 
-    fn read_ref(&self, off: u64, b: &[u8]) -> Option<Loc> {
-        if b.len() < 12 {
-            return None;
-        }
-        let len = u32::from_le_bytes(b[..4].try_into().expect("4 bytes"));
-        let ext_off = u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"));
-        let path = std::str::from_utf8(&b[12..]).ok()?;
-        let ext = self.ext_file(Path::new(path));
-        Some(Loc {
-            off,
-            len,
-            touched: AtomicBool::new(false),
-            ext: Some((ext, ext_off)),
-        })
+    /// The object length, file and offset in that file that a reference record's payload names.
+    fn read_ref(&self, mut b: &[u8]) -> Option<(u32, Arc<ExtFile>, u64)> {
+        let len = u32::from_le_bytes(take(&mut b)?);
+        let ext_off = u64::from_le_bytes(take(&mut b)?);
+        let path = std::str::from_utf8(b).ok()?;
+        Some((len, self.ext_file(Path::new(path)), ext_off))
     }
 
     fn ext_file(&self, path: &Path) -> Arc<ExtFile> {
-        self.files
-            .lock()
-            .expect("files lock")
-            .entry(path.to_path_buf())
-            .or_insert_with(|| {
-                Arc::new(ExtFile {
-                    path: path.to_path_buf(),
-                    file: Mutex::default(),
-                    gone: AtomicBool::new(false),
-                    needs_sync: AtomicBool::new(false),
-                })
+        Arc::clone(self.files.lock().entry(path.to_path_buf()).or_insert_with(|| {
+            Arc::new(ExtFile {
+                path: path.to_path_buf(),
+                file: Mutex::default(),
+                gone: AtomicBool::new(false),
+                needs_sync: AtomicBool::new(false),
             })
-            .clone()
+        }))
     }
 
     fn shard(&self, h: &Hash) -> &RwLock<HashMap<Hash, Arc<Loc>>> {
@@ -304,19 +298,14 @@ impl ObjectLog {
     }
 
     fn index(&self, h: Hash, loc: Arc<Loc>) {
-        let mut m = self.shard(&h).write().expect("shard lock");
+        let mut m = self.shard(&h).write();
         if m.get(&h).is_none_or(|old| old.dead()) {
             m.insert(h, loc);
         }
     }
 
     fn lookup(&self, h: &Hash) -> Option<Arc<Loc>> {
-        self.shard(h)
-            .read()
-            .expect("shard lock")
-            .get(h)
-            .filter(|l| !l.dead())
-            .cloned()
+        self.shard(h).read().get(h).filter(|l| !l.dead()).cloned()
     }
 
     pub(crate) fn has(&self, h: &Hash) -> bool {
@@ -331,30 +320,31 @@ impl ObjectLog {
     /// Writes a record at the end of the log. The write runs on its own task, so a caller that
     /// stops waiting leaves no hole: a failed write leaves padding instead.
     async fn append(&self, h: Hash, hdr: Bytes, body: Bytes) -> Result<u64> {
-        let n = (hdr.len() + body.len()) as u64;
+        let pad_len = u32::try_from(body.len())
+            .map_err(|_| Error::Corrupt(format!("object {h} has a record of {} bytes", body.len())))?;
+        let n = u64_from(hdr.len() + body.len());
         let at = {
-            let mut f = self.in_flight.lock().expect("in-flight lock");
+            let mut f = self.in_flight.lock();
             let at = self.end.fetch_add(n, Ordering::AcqRel);
             f.insert(at);
             at
         };
         let (file, in_flight, landed, poisoned) = (
-            self.file.clone(),
-            self.in_flight.clone(),
-            self.landed.clone(),
-            self.poisoned.clone(),
+            Arc::clone(&self.file),
+            Arc::clone(&self.in_flight),
+            Arc::clone(&self.landed),
+            Arc::clone(&self.poisoned),
         );
         let task = tokio::spawn(async move {
             let r = file.write_at(vec![hdr, body], at).await;
-            let settled = match r {
-                Ok(()) => true,
-                Err(_) => {
-                    let pad = header(Hash::ZERO, (n - HEADER as u64) as u32);
-                    file.write_at(vec![pad], at).await.is_ok()
-                }
+            let settled = if let Ok(()) = r {
+                true
+            } else {
+                let pad = header(Hash::ZERO, pad_len);
+                file.write_at(vec![pad], at).await.is_ok()
             };
             if settled {
-                in_flight.lock().expect("in-flight lock").remove(&at);
+                in_flight.lock().remove(&at);
             } else {
                 poisoned.store(true, Ordering::Release);
             }
@@ -371,7 +361,8 @@ impl ObjectLog {
         if self.has(&h) {
             return Ok(());
         }
-        let len = b.len() as u32;
+        let len =
+            u32::try_from(b.len()).map_err(|_| Error::Corrupt(format!("object {h} of {} bytes", b.len())))?;
         let at = self.append(h, header(h, len), b).await?;
         self.index(
             h,
@@ -384,7 +375,7 @@ impl ObjectLog {
         );
         let n = self
             .unwritten
-            .fetch_add(u64::from(len) + HEADER as u64, Ordering::AcqRel);
+            .fetch_add(u64::from(len) + HEADER_LEN, Ordering::AcqRel);
         if n + u64::from(len) >= WRITEBACK_BYTES && self.holds.load(Ordering::Acquire) == 0 {
             self.write_back();
         }
@@ -410,12 +401,17 @@ impl ObjectLog {
         payload.extend_from_slice(&len.to_le_bytes());
         payload.extend_from_slice(&offset.to_le_bytes());
         payload.extend_from_slice(p);
+        let plen = u32::try_from(payload.len())
+            .ok()
+            .filter(|n| n & REF_FLAG == 0)
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "reference object {h}: the path {} is too long",
+                    path.display()
+                ))
+            })?;
         let at = self
-            .append(
-                h,
-                header(h, REF_FLAG | payload.len() as u32),
-                Bytes::from(payload),
-            )
+            .append(h, header(h, REF_FLAG | plen), Bytes::from(payload))
             .await?;
         self.index(
             h,
@@ -433,12 +429,12 @@ impl ObjectLog {
     pub(crate) fn drop_file(&self, path: &Path) {
         let e = self.ext_file(path);
         e.gone.store(true, Ordering::Release);
-        e.file.lock().expect("ext file lock").take();
+        e.file.lock().take();
     }
 
     async fn source(&self, loc: &Loc) -> Option<(Arc<dyn LocalFile>, u64)> {
         match &loc.ext {
-            None => Some((self.file.clone(), loc.off + HEADER as u64)),
+            None => Some((Arc::clone(&self.file), loc.off + HEADER_LEN)),
             Some((e, off)) => e.open(self.fs.as_ref()).await.map(|f| (f, *off)),
         }
     }
@@ -460,7 +456,7 @@ impl ObjectLog {
         if len < loc.len as usize && !loc.touched.swap(true, Ordering::AcqRel) {
             f.advise(at, u64::from(loc.len), Advice::WillNeed);
         }
-        Ok(Some(f.read_at(len, at + inner as u64).await?))
+        Ok(Some(f.read_at(len, at + u64_from(inner)).await?))
     }
 
     /// Reads bytes of `h` into `dst` only from the page cache; `false` when that is not enough.
@@ -476,13 +472,13 @@ impl ObjectLog {
             )));
         }
         let (f, at) = match &loc.ext {
-            None => (self.file.clone(), loc.off + HEADER as u64),
+            None => (Arc::clone(&self.file), loc.off + HEADER_LEN),
             Some((e, off)) => match e.opened() {
                 Some(f) => (f, *off),
                 None => return Ok(false),
             },
         };
-        Ok(f.read_at_nowait(dst, at + inner as u64)? == Some(dst.len()))
+        Ok(f.read_at_nowait(dst, at + u64_from(inner))? == Some(dst.len()))
     }
 
     /// The whole object `h`. An object kept in another file is checked against its hash, since
@@ -510,7 +506,7 @@ impl ObjectLog {
             return;
         }
         self.unwritten.store(0, Ordering::Release);
-        let (file, flag) = (self.file.clone(), self.writing_back.clone());
+        let (file, flag) = (Arc::clone(&self.file), Arc::clone(&self.writing_back));
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
                 rt.spawn(async move {
@@ -526,7 +522,7 @@ impl ObjectLog {
     /// log is durable up to them.
     pub(crate) async fn sync(&self) -> Result<()> {
         let end = {
-            let _f = self.in_flight.lock().expect("in-flight lock");
+            let _f = self.in_flight.lock();
             self.end.load(Ordering::Acquire)
         };
         loop {
@@ -539,7 +535,7 @@ impl ObjectLog {
                     self.path.display()
                 ))));
             }
-            let first = self.in_flight.lock().expect("in-flight lock").first().copied();
+            let first = self.in_flight.lock().first().copied();
             if first.is_none_or(|f| f >= end) {
                 break;
             }
@@ -548,7 +544,6 @@ impl ObjectLog {
         let ext: Vec<Arc<ExtFile>> = self
             .files
             .lock()
-            .expect("files lock")
             .values()
             .filter(|e| e.needs_sync.swap(false, Ordering::AcqRel))
             .cloned()
@@ -572,7 +567,8 @@ impl ObjectLog {
     }
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use super::*;
     use crate::sim::SimFs;
@@ -633,7 +629,7 @@ mod tests {
         let tail = vec![
             header(Hash::ZERO, 100),
             Bytes::from(vec![0; 100]),
-            header(h2, b2.len() as u32),
+            header(h2, u32::try_from(b2.len()).unwrap()),
             b2.clone(),
         ];
         f.write_at(tail.clone(), at).await.unwrap();
@@ -679,7 +675,7 @@ mod tests {
         img.write_at(vec![Bytes::from(vec![0; 100]), b.clone()], 0)
             .await
             .unwrap();
-        log.put_ref(h, Path::new("/c/img"), 100, b.len() as u32)
+        log.put_ref(h, Path::new("/c/img"), 100, u32::try_from(b.len()).unwrap())
             .await
             .unwrap();
         assert_eq!(log.get(&h).await.unwrap(), Some(b));

@@ -135,7 +135,7 @@ struct HostFile {
 #[async_trait]
 impl LocalFile for HostFile {
     async fn read_at(&self, len: usize, offset: u64) -> io::Result<Bytes> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || {
             let mut buf = BytesMut::zeroed(len);
             let mut got = 0;
@@ -164,7 +164,7 @@ impl LocalFile for HostFile {
     }
 
     async fn write_at(&self, bufs: Vec<Bytes>, offset: u64) -> io::Result<()> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || {
             let mut at = offset;
             for b in bufs {
@@ -181,17 +181,17 @@ impl LocalFile for HostFile {
     }
 
     async fn sync_data(&self) -> io::Result<()> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || f.sync_data()).await
     }
 
     async fn set_len(&self, len: u64) -> io::Result<()> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || f.set_len(len)).await
     }
 
     async fn size(&self) -> io::Result<u64> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || {
             let m = f.metadata()?;
             if m.file_type().is_block_device() {
@@ -205,7 +205,7 @@ impl LocalFile for HostFile {
     async fn start_writeback(&self) {
         #[cfg(target_os = "linux")]
         {
-            let f = self.file.clone();
+            let f = Arc::clone(&self.file);
             let _ = blocking(move || {
                 crate::linux::start_writeback(&f);
                 Ok(())
