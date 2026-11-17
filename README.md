@@ -94,7 +94,7 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** The fork, cold-start and warm-start charts have results so far; the others fill in
+> **Partly measured.** The fork, cold-start, warm-start and agent-workload charts have results so far; the others fill in
 > as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
 > [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
 > `bench/results/`.
@@ -228,6 +228,9 @@ over ublk.
 
 Time to run the 14 command types agents use most often in Spotlight sandboxes (`git status`,
 `tsc`, `oxlint`, `vitest`, `npm ci`, ...), expressed as a ratio to native ext4 on local NVMe.
+Each system ran the replay 3 times on a fresh branch of a warm host, page cache dropped. Native
+took 70.5 s. Most of JuiceFS's time is `npm ci`, about 9.5 min against 7.6 s; in its first
+repetition one `vitest` run failed, and it passed in the other two.
 
 <!-- bench:replay -->
 <picture>
@@ -240,14 +243,14 @@ Time to run the 14 command types agents use most often in Spotlight sandboxes (`
 
 | total time as a ratio to native (1.00x) | median | range |
 |---|---|---|
-| native ext4 (NVMe) | — | |
-| Pando | — | |
-| Pando (handoff) | — | |
-| image download from S3 | — | |
-| Docker (overlayfs) | — | |
+| native ext4 (NVMe) | 1.00x | 1.00x to 1.01x |
+| Pando | 1.07x | 1.06x to 1.17x |
+| Pando (handoff) | 1.05x | 1.04x to 1.06x |
+| image download from S3 | 1.03x | 1.03x to 1.04x |
+| Docker (overlayfs) | 1.02x | 1.02x to 1.03x |
 | Nydus lazy pull | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| EBS snapshot to volume | 1.17x | 1.16x to 1.23x |
+| JuiceFS | 9.96x | 9.90x to 12.07x |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
 | Archil | — | |
