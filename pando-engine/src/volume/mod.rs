@@ -574,6 +574,11 @@ impl Inner {
             (m.size, m.tree.clone())
         };
         if size == old {
+            if self.size() < old {
+                self.persist().await?;
+                self.size.store(old, Ordering::Release);
+                self.kick.notify_one();
+            }
             return Ok(());
         }
         if size < old {
@@ -1105,6 +1110,7 @@ impl Inner {
 #[cfg(all(test, feature = "sim"))]
 mod tests {
     use super::*;
+    use crate::ports::Open;
     use crate::sim::{self, SimFs, SimStore};
 
     const SIZE: u64 = 64 << 20;
@@ -1316,6 +1322,35 @@ mod tests {
             .unwrap();
         assert_eq!(other.size(), 2 * SIZE);
         assert_eq!(read(&other, 2 * SIZE - 10, 10).await, vec![0; 10]);
+        other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_grow_whose_state_write_failed_can_be_repeated() {
+        let (ports, _, fs) = sim::ports(9);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        let state = Path::new("/a/state");
+        fs.remove(state).await.unwrap();
+        fs.open(state, Open::Create).await.unwrap();
+        assert!(v.grow(2 * SIZE).await.is_err());
+        assert_eq!(v.size(), SIZE);
+        fs.remove(state).await.unwrap();
+        fs.create_dir_all(state).await.unwrap();
+        v.grow(2 * SIZE).await.unwrap();
+        assert_eq!(v.size(), 2 * SIZE);
+        v.write_at(&data(2, 100), 2 * SIZE - 100).await.unwrap();
+        v.checkpoint().await.unwrap();
+        v.close().await;
+        let other = Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "main")
+            .await
+            .unwrap();
+        assert_eq!(other.size(), 2 * SIZE);
+        assert_eq!(read(&other, 2 * SIZE - 100, 100).await, data(2, 100));
         other.close().await;
     }
 
