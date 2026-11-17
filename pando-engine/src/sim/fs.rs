@@ -322,6 +322,21 @@ impl SimFile {
             &mut s.next_place,
         )
     }
+
+    fn write_bufs(&self, bufs: &[Bytes], offset: u64) -> usize {
+        self.with_places(|d, next| {
+            let mut at = offset as usize;
+            for b in bufs {
+                if d.current.len() < at + b.len() {
+                    d.current.resize(at + b.len(), 0);
+                }
+                d.current[at..at + b.len()].copy_from_slice(b);
+                d.write(at as u64, b.len() as u64, next);
+                at += b.len();
+            }
+            at - offset as usize
+        })
+    }
 }
 
 #[async_trait]
@@ -344,18 +359,13 @@ impl LocalFile for SimFile {
     }
 
     async fn write_at(&self, bufs: Vec<Bytes>, offset: u64) -> io::Result<()> {
-        self.with_places(|d, next| {
-            let mut at = offset as usize;
-            for b in bufs {
-                if d.current.len() < at + b.len() {
-                    d.current.resize(at + b.len(), 0);
-                }
-                d.current[at..at + b.len()].copy_from_slice(&b);
-                d.write(at as u64, b.len() as u64, next);
-                at += b.len();
-            }
-        });
+        self.write_bufs(&bufs, offset);
         Ok(())
+    }
+
+    /// Takes only the first buffer, so callers also take the path that finishes the write.
+    fn write_at_nowait(&self, bufs: &[Bytes], offset: u64) -> io::Result<usize> {
+        Ok(self.write_bufs(&bufs[..bufs.len().min(1)], offset))
     }
 
     async fn sync_data(&self) -> io::Result<()> {

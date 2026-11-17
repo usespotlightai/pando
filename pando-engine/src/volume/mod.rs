@@ -361,13 +361,20 @@ impl Volume {
         if off + p.len() as u64 > self.inner.size {
             return Err(Error::BeyondEnd);
         }
-        let parts = parts(off, p.len());
-        let mut futs = Vec::with_capacity(parts.len());
-        for &(idx, at, _, n) in &parts {
-            futs.push(self.inner.read_chunk(idx, at, n));
+        let mut misses = Vec::new();
+        for (idx, at, pos, n) in parts(off, p.len()) {
+            if !self.inner.try_read_chunk(idx, at, &mut p[pos..pos + n])? {
+                misses.push((idx, at, pos, n));
+            }
         }
+        if misses.is_empty() {
+            return Ok(());
+        }
+        let futs = misses
+            .iter()
+            .map(|&(idx, at, _, n)| self.inner.read_chunk(idx, at, n));
         let got = futures::future::join_all(futs).await;
-        for ((_, _, pos, n), b) in parts.into_iter().zip(got) {
+        for ((_, _, pos, n), b) in misses.into_iter().zip(got) {
             p[pos..pos + n].copy_from_slice(&b?);
         }
         Ok(())
@@ -595,12 +602,17 @@ impl Inner {
             }
             m.root
         };
+        self.try_read_stored(idx, &root, at, dst)
+    }
+
+    /// [`Self::read_base`], then [`Self::read_committed`], from memory and the page cache only.
+    fn try_read_stored(&self, idx: u64, root: &Entry, at: usize, dst: &mut [u8]) -> Result<bool> {
         if let Some(base) = self.base_of(idx)
             && base.read_nowait(idx * CHUNK + at as u64, dst)
         {
             return Ok(true);
         }
-        let Some(e) = self.tree.lookup_nowait(&root, idx) else {
+        let Some(e) = self.tree.lookup_nowait(root, idx) else {
             return Ok(false);
         };
         if e.is_empty() {
@@ -637,12 +649,14 @@ impl Inner {
             Some(f.to_vec())
         } else if data.len() < CHUNK_SIZE {
             let n = CHUNK.min(self.size - idx * CHUNK) as usize;
-            let b = match self.read_base(idx, 0, n).await {
-                Some(b) => b,
-                None => self.read_committed(idx, &root, 0, CHUNK_SIZE).await?,
-            };
-            let mut v = b.to_vec();
-            v.resize(CHUNK_SIZE, 0);
+            let mut v = vec![0; CHUNK_SIZE];
+            if !self.try_read_stored(idx, &root, 0, &mut v[..n])? {
+                let b = match self.read_base(idx, 0, n).await {
+                    Some(b) => b,
+                    None => self.read_committed(idx, &root, 0, n).await?,
+                };
+                v[..b.len()].copy_from_slice(&b);
+            }
             Some(v)
         } else {
             Some(vec![0; CHUNK_SIZE])

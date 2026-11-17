@@ -141,8 +141,12 @@ impl Journal {
         hdr.extend_from_slice(&(inner as u32).to_le_bytes());
         hdr.extend_from_slice(&(data.len() as u32).to_le_bytes());
         let n = (HEADER + data.len()) as u64;
+        let bufs = vec![Bytes::from(hdr), data];
         let mut s = g.shards[(idx % SHARDS as u64) as usize].lock().await;
-        s.file.write_at(vec![Bytes::from(hdr), data], s.end).await?;
+        let done = s.file.write_at_nowait(&bufs, s.end)?;
+        if (done as u64) < n {
+            s.file.write_at(skip(bufs, done), s.end + done as u64).await?;
+        }
         s.end += n;
         Ok(())
     }
@@ -177,9 +181,32 @@ impl Journal {
     }
 }
 
+/// `bufs` without its first `n` bytes.
+fn skip(bufs: Vec<Bytes>, mut n: usize) -> Vec<Bytes> {
+    let mut rest = Vec::with_capacity(bufs.len());
+    for b in bufs {
+        if n >= b.len() {
+            n -= b.len();
+        } else {
+            rest.push(b.slice(n..));
+            n = 0;
+        }
+    }
+    rest
+}
+
 #[cfg(all(test, feature = "sim"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_drops_a_prefix_across_buffers() {
+        let b = vec![Bytes::from_static(b"abc"), Bytes::from_static(b"defg")];
+        assert_eq!(skip(b.clone(), 0), b);
+        assert_eq!(skip(b.clone(), 3), [Bytes::from_static(b"defg")]);
+        assert_eq!(skip(b.clone(), 5), [Bytes::from_static(b"fg")]);
+        assert!(skip(b, 7).is_empty());
+    }
     use crate::sim::SimFs;
 
     #[tokio::test]

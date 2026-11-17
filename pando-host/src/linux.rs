@@ -1,20 +1,29 @@
 #![allow(unsafe_code)]
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use pando_engine::ports::{Advice, Extent};
 use rustix::fs::{FallocateFlags, fadvise, fallocate, ioctl_ficlone};
-use rustix::io::{Errno, ReadWriteFlags, preadv2};
+use rustix::io::{Errno, ReadWriteFlags, preadv2, pwritev2};
 use rustix::ioctl::{Getter, Setter, ioctl, opcode};
 
 pub(crate) fn read_nowait(f: &File, buf: &mut [u8], offset: u64) -> io::Result<Option<usize>> {
     match preadv2(f, &mut [IoSliceMut::new(buf)], offset, ReadWriteFlags::NOWAIT) {
         Ok(n) => Ok(Some(n)),
         Err(Errno::AGAIN | Errno::OPNOTSUPP) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn write_nowait(f: &File, bufs: &[&[u8]], offset: u64) -> io::Result<usize> {
+    let slices: Vec<IoSlice<'_>> = bufs.iter().map(|b| IoSlice::new(b)).collect();
+    match pwritev2(f, &slices, offset, ReadWriteFlags::NOWAIT) {
+        Ok(n) => Ok(n),
+        Err(Errno::AGAIN | Errno::OPNOTSUPP) => Ok(0),
         Err(e) => Err(e.into()),
     }
 }

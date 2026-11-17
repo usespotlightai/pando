@@ -176,6 +176,19 @@ impl LocalFile for HostFile {
         .await
     }
 
+    fn write_at_nowait(&self, bufs: &[Bytes], offset: u64) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            let bufs: Vec<&[u8]> = bufs.iter().map(|b| &b[..]).collect();
+            crate::linux::write_nowait(&self.file, &bufs, offset)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (bufs, offset);
+            Ok(0)
+        }
+    }
+
     async fn sync_data(&self) -> io::Result<()> {
         let f = self.file.clone();
         blocking(move || f.sync_data()).await

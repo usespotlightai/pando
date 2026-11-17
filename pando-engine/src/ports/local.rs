@@ -57,6 +57,9 @@ pub trait LocalFile: Send + Sync + fmt::Debug {
     /// Reads only what is in the page cache: `None` when the read would wait for the disk.
     fn read_at_nowait(&self, buf: &mut [u8], offset: u64) -> io::Result<Option<usize>>;
     async fn write_at(&self, bufs: Vec<Bytes>, offset: u64) -> io::Result<()>;
+    /// Writes into the page cache only while that needs no wait: the bytes written, which are
+    /// a prefix of `bufs` and 0 when the write would wait.
+    fn write_at_nowait(&self, bufs: &[Bytes], offset: u64) -> io::Result<usize>;
     async fn sync_data(&self) -> io::Result<()>;
     async fn set_len(&self, len: u64) -> io::Result<()>;
     async fn size(&self) -> io::Result<u64>;
