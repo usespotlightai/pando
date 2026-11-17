@@ -20,6 +20,7 @@ use std::time::Duration;
 pub use build::BuildReport;
 pub(crate) use build::{BuildOptions, build};
 use bytes::Bytes;
+pub use follow::Follower;
 use pando_format::{Entry, Hash};
 pub(crate) use view::BaseView;
 

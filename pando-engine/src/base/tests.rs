@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use pando_format::{CHUNK_SIZE, Ref};
 
-use super::follow::{FOLLOW_MAX_AGE, Follower};
+use super::follow::FOLLOW_MAX_AGE;
 use super::*;
 use crate::cache::{BaseKey, Cache};
 use crate::{Ports, Volume, sim};
@@ -169,7 +169,7 @@ async fn a_follower_builds_the_new_root_of_a_followed_branch_and_evicts_old_base
     let b = host(&ports, "/b").await;
     let bases = Bases::new(&ports, Path::new("/b/bases"));
     bases.note_follow("main").await.unwrap();
-    let mut f = Follower::new(bases.clone(), b.clone(), 8, 1, 0);
+    let mut f = Follower::new(&ports, b.clone(), Path::new("/b/bases"), 8, 1, 0);
     assert_eq!(f.once().await.unwrap(), 1);
     assert!(bases.has(&r1.root.hash).await);
     assert_eq!(f.once().await.unwrap(), 0);

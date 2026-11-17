@@ -6,7 +6,7 @@
 //! budget.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -14,10 +14,10 @@ use bytes::Bytes;
 use pando_format::{CHUNK_SIZE, Hash};
 
 use super::{Bases, BuildOptions, build, with_suffix};
-use crate::Result;
 use crate::cache::Cache;
 use crate::local::{read_file, write_atomic};
 use crate::tree::Tree;
+use crate::{Ports, Result};
 
 pub(crate) const FOLLOW_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -89,7 +89,7 @@ impl Bases {
 
 /// Builds the base images of new roots of the branches this host follows.
 #[derive(Debug)]
-pub(crate) struct Follower {
+pub struct Follower {
     bases: Bases,
     cache: Arc<Cache>,
     parallel: usize,
@@ -99,15 +99,18 @@ pub(crate) struct Follower {
 }
 
 impl Follower {
-    pub(crate) fn new(
-        bases: Bases,
+    /// A follower of the branches noted in base image directory `dir`; it keeps the `keep` most
+    /// recently used base images within `budget` bytes (zero: no budget).
+    pub fn new(
+        ports: &Ports,
         cache: Arc<Cache>,
+        dir: &Path,
         parallel: usize,
         keep: usize,
         budget: u64,
     ) -> Follower {
         Follower {
-            bases,
+            bases: Bases::new(ports, dir),
             cache,
             parallel,
             keep,
@@ -118,7 +121,7 @@ impl Follower {
 
     /// Checks every followed branch once and builds the base image of each new root; returns
     /// how many it built.
-    pub(crate) async fn once(&mut self) -> Result<usize> {
+    pub async fn once(&mut self) -> Result<usize> {
         let dir = self.bases.follow_dir();
         let fs = self.bases.fs.clone();
         let Ok(entries) = fs.list(&dir).await else {

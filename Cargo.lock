@@ -1135,6 +1135,7 @@ dependencies = [
  "clap",
  "pando-engine",
  "pando-format",
+ "pando-host",
  "pando-s3",
  "tokio",
 ]

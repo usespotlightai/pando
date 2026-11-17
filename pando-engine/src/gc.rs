@@ -124,6 +124,27 @@ async fn with_deps(remote: &Remote, ids: &[SegId]) -> Result<HashSet<SegId>> {
     Ok(out)
 }
 
+/// What a store holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub branches: usize,
+    pub segments: usize,
+    pub segment_bytes: u64,
+    pub change_lists: usize,
+}
+
+/// Counts what the store behind `cache` holds.
+pub async fn usage(cache: &Arc<Cache>) -> Result<Usage> {
+    let remote = cache.remote();
+    let segs = remote.list_segments().await?;
+    Ok(Usage {
+        branches: remote.list_refs().await?.len(),
+        segments: segs.len(),
+        segment_bytes: segs.values().map(|s| s.size).sum(),
+        change_lists: remote.list_change_lists().await?.len(),
+    })
+}
+
 /// Collects the garbage of the store behind `cache`.
 pub async fn collect(cache: &Arc<Cache>, clock: &dyn Clock, opts: &GcOptions) -> Result<GcReport> {
     debug_assert!(opts.keep_young > learned::MAX_AGE || opts.keep_young.is_zero());

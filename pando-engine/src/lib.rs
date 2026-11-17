@@ -26,6 +26,7 @@ mod flight;
 mod gate;
 pub mod gc;
 mod handoff;
+mod import;
 mod local;
 mod packer;
 pub mod ports;
@@ -38,6 +39,7 @@ mod volume;
 
 pub use cache::{Cache, CacheStats};
 pub use error::{Error, Result};
+pub use import::{ImportReport, import};
 pub use packer::PackStats;
 pub use ports::Ports;
 pub use remote::RemoteStats;
