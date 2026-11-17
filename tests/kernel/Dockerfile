@@ -13,7 +13,12 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 	libacl1-dev libattr1-dev libaio-dev uuid-dev liburing-dev xfslibs-dev libgdbm-dev libcap-dev \
 	acl attr bc dump gawk quota xfsdump libcap2-bin keyutils perl python3 file sqlite3 >/dev/null \
 	&& rm -rf /var/lib/apt/lists/*
-RUN git clone -q --depth 1 --branch $XFSTESTS_REF https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /opt/xfstests \
+RUN for try in 1 2 3 4 5; do \
+		git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone -q --depth 1 --branch $XFSTESTS_REF https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /opt/xfstests && break; \
+		rm -rf /opt/xfstests; \
+		if [ "$try" = 5 ]; then echo "xfstests $XFSTESTS_REF: clone failed 5 times" >&2; exit 1; fi; \
+		sleep $((try * 15)); \
+	done \
 	&& cd /opt/xfstests && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 \
 	&& test -x /var/lib/xfstests/check && test -x /var/lib/xfstests/ltp/fsstress \
 	&& test -x /var/lib/xfstests/src/log-writes/replay-log
