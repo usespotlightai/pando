@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use pando_engine::gc::{self, GcOptions};
+use pando_engine::store_format::{Access, check_format};
 use pando_engine::{Cache, Ports, Volume, base, branch};
 use pando_format::{Ref, keys};
 
@@ -99,6 +100,38 @@ enum Command {
     Resize(device::ResizeArgs),
 }
 
+impl Command {
+    /// How the command uses the store; `None` when it only talks to an attached device's daemon.
+    fn access(&self) -> Option<Access> {
+        match self {
+            Command::Detach(_) | Command::Resize(_) => None,
+            Command::Refs | Command::Stat | Command::Gc { delete: false, .. } => Some(Access::Read),
+            Command::Init { .. }
+            | Command::Import { .. }
+            | Command::Branch { .. }
+            | Command::Advance { .. }
+            | Command::Delete { .. }
+            | Command::Base { .. }
+            | Command::Follow { .. }
+            | Command::Gc { delete: true, .. }
+            | Command::Attach(_) => Some(Access::Write),
+        }
+    }
+
+    /// Whether the command works through this host's cache.
+    fn uses_cache(&self) -> bool {
+        matches!(
+            self,
+            Command::Import { .. }
+                | Command::Base { .. }
+                | Command::Follow { .. }
+                | Command::Gc { .. }
+                | Command::Stat
+                | Command::Attach(_)
+        )
+    }
+}
+
 /// Parses durations such as `500ms`, `15s`, `10m` and `24h`.
 pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
     let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -135,13 +168,27 @@ pub(crate) fn parse_size(s: &str) -> Result<u64> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let ports = pando_host::ports(cli.store.open()?, cli.cpu_threads)?;
-    let cache = || async { Ok::<_, anyhow::Error>(Arc::new(Cache::open(&ports, &cli.cache).await?)) };
+    let checked = async {
+        if let Some(access) = cli.command.access() {
+            check_format(ports.store.as_ref(), access).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let opened = if cli.command.uses_cache() {
+        let open = async { Ok::<_, anyhow::Error>(Arc::new(Cache::open(&ports, &cli.cache).await?)) };
+        let ((), cache) = tokio::try_join!(checked, open)?;
+        Some(cache)
+    } else {
+        checked.await?;
+        None
+    };
+    let cache = || opened.clone().context("this command opens no cache");
     match cli.command {
         Command::Refs => refs(&ports).await,
         Command::Init { name, size } => Ok(Volume::create(&ports, &name, size).await?),
         Command::Import { name, image } => {
             let t0 = Instant::now();
-            let r = pando_engine::import(&ports, &cache().await?, &name, &image).await?;
+            let r = pando_engine::import(&ports, &cache()?, &name, &image).await?;
             println!(
                 "imported {name}: {} MiB device, {} chunks with data ({} of ext4 metadata), {} segments ({} MiB) in {:.1?}",
                 r.size >> 20,
@@ -163,7 +210,7 @@ async fn main() -> Result<()> {
         Command::Delete { name } => Ok(branch::delete(&ports, &name).await?),
         Command::Base { name, dir, parallel } => {
             let t0 = Instant::now();
-            let r = base::build_branch(&ports, &cache().await?, &dir, &name, parallel).await?;
+            let r = base::build_branch(&ports, &cache()?, &dir, &name, parallel).await?;
             if r.built {
                 let seed = r
                     .seed
@@ -187,7 +234,7 @@ async fn main() -> Result<()> {
             parallel,
             once,
         } => {
-            let mut f = base::Follower::new(&ports, cache().await?, &dir, parallel, keep, budget);
+            let mut f = base::Follower::new(&ports, cache()?, &dir, parallel, keep, budget);
             loop {
                 let n = f.once().await?;
                 if once {
@@ -203,7 +250,7 @@ async fn main() -> Result<()> {
             validate,
         } => {
             let r = gc::collect(
-                &cache().await?,
+                &cache()?,
                 ports.clock.as_ref(),
                 &GcOptions {
                     delete,
@@ -228,11 +275,11 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Attach(a) => device::attach(&ports, cache().await?, a, cli.store.identity()).await,
+        Command::Attach(a) => device::attach(&ports, cache()?, a, cli.store.identity()).await,
         Command::Detach(d) => device::detach(d).await,
         Command::Resize(r) => device::resize(r).await,
         Command::Stat => {
-            let u = gc::usage(&cache().await?).await?;
+            let u = gc::usage(&cache()?).await?;
             println!(
                 "{} branches, {} segments ({} MiB), {} change lists",
                 u.branches,
@@ -265,6 +312,23 @@ mod tests {
         assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
         assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
         assert!(parse_duration("3d").is_err());
+    }
+
+    #[test]
+    fn only_commands_that_write_may_mark_the_store() {
+        let access = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("pando").chain(args.iter().copied()))
+                .unwrap()
+                .command
+                .access()
+        };
+        assert_eq!(access(&["refs"]), Some(Access::Read));
+        assert_eq!(access(&["stat"]), Some(Access::Read));
+        assert_eq!(access(&["gc"]), Some(Access::Read));
+        assert_eq!(access(&["gc", "--delete"]), Some(Access::Write));
+        assert_eq!(access(&["init", "main", "4096"]), Some(Access::Write));
+        assert_eq!(access(&["branch", "main", "run-1"]), Some(Access::Write));
+        assert_eq!(access(&["detach", "--device", "/dev/ublkb0"]), None);
     }
 
     #[test]

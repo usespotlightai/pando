@@ -20,6 +20,7 @@ mod node;
 mod recipe;
 mod recording;
 mod reference;
+mod store_format;
 mod verified;
 
 pub use block::{BLOCK_SIZE, BLOCKS_PER_CHUNK, BlockKey, BlockKeys, CHUNK_SIZE, is_zero};
@@ -34,4 +35,5 @@ pub use node::{FANOUT, Node, depth_for, digit};
 pub use recipe::{Pick, RECIPE_SOURCES_MAX, Recipe, RecipeError, Run};
 pub use recording::{RECORDING_MAGIC, Recording};
 pub use reference::Ref;
+pub use store_format::StoreFormat;
 pub use verified::Verified;

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pando_format::{FormatError, Hash, SegId};
+use pando_format::{FormatError, Hash, SegId, StoreFormat};
 
 use crate::ports::StoreError;
 
@@ -17,6 +17,9 @@ pub enum Error {
     Store(#[from] StoreError),
     #[error(transparent)]
     Format(#[from] FormatError),
+    /// The store's format marker names a format this build does not read.
+    #[error("the store is in format {found}; this pando reads format {}.x", StoreFormat::CURRENT.major)]
+    UnknownFormat { found: StoreFormat },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// A write past the end of the volume.

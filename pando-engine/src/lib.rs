@@ -36,6 +36,7 @@ mod recording;
 mod remote;
 #[cfg(feature = "sim")]
 pub mod sim;
+pub mod store_format;
 mod tree;
 mod volume;
 

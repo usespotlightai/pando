@@ -1,0 +1,51 @@
+# Store format versions
+
+Every store holds one marker object, `format`, at its prefix root:
+
+```
+pando-format 1.0
+```
+
+## What each command does with it
+
+Every command that opens the store reads the marker before it does anything else. Commands that
+open the cache (`attach`, `import`, `base`, `follow`, `gc`, `stat`) read it while the cache
+opens, so it adds no time. The others (`init`, `refs`, `branch`, `advance`, `delete`) wait for
+one more GET.
+
+- A command that writes (`init`, `import`, `branch`, `advance`, `delete`, `base`, `follow`,
+  `gc --delete`, `attach`) creates the marker when the store has none. If another host creates
+  it first, the command checks that host's marker instead.
+- A command that only reads (`refs`, `stat`, `gc` without `--delete`) never writes it.
+- `detach` and `resize` talk only to the daemon of an attached device and skip the check.
+- A store without a marker was written before markers existed and is in format 1.0.
+- A marker with a major version this build does not read stops the command before it touches
+  anything else: `the store is in format 2.0; this pando reads format 1.x`.
+
+## Upgrade rules
+
+A build reads and writes every store whose major version equals its own, whatever the minor
+version.
+
+**Minor version** (1.0 to 1.1): only additions that a build of an older minor version can
+ignore, such as:
+
+- a new kind of object under a new key prefix;
+- a new line after the first in a text object (refs, the marker), which older decoders skip.
+
+An older build keeps working on a store with a newer minor version. A newer build writes its
+own minor version only when it creates the marker; it does not rewrite an existing one.
+
+**Major version** (1.x to 2.0): any other change to the bytes of a stored object: entries,
+refs, tree nodes, frames, segment indexes, recipes, change lists or recordings, or the key
+layout. Builds of the old major version refuse the store, so they cannot misread it or mix old
+objects into it.
+
+A major change needs:
+
+1. new golden fixtures, checked in both directions (`tools/golden/run.sh write`, then `read`);
+2. a migration, or a new store, for the data in existing stores;
+3. a new marker, written last, once the store holds only objects of the new format.
+
+Each kind of object does not carry its own version yet. Add one when a change has to let objects
+of two formats live in the same store.

@@ -8,6 +8,8 @@ pub const CHANGES: &str = "changes";
 pub const HINTS: &str = "hints";
 /// A key no object has; a GET of it opens connections before a fetch needs them.
 pub const WARM: &str = "warm";
+/// The marker that holds the store's [`crate::StoreFormat`].
+pub const FORMAT: &str = "format";
 
 pub fn segment(id: SegId) -> String {
     format!("{SEGMENTS}/{id}")
