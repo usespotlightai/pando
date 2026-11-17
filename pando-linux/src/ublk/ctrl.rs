@@ -32,9 +32,12 @@ pub(crate) const STATE_FAIL_IO: u16 = 3;
 const ATTR_VOLATILE_CACHE: u32 = 1 << 2;
 const ATTR_FUA: u32 = 1 << 3;
 const PARAM_TYPE_BASIC: u32 = 1;
+const PARAM_TYPE_DISCARD: u32 = 1 << 1;
+/// The most bytes one discard or write-zeroes request clears; its result still fits an i32.
+const MAX_CLEAR: u32 = 1 << 30;
 
 const INFO_LEN: usize = 64;
-const PARAMS_LEN: usize = 40;
+const PARAMS_LEN: usize = 60;
 
 fn op(nr: u32) -> u32 {
     let dir = if matches!(nr, CMD_GET_DEV_INFO | CMD_GET_FEATURES) {
@@ -84,15 +87,20 @@ fn encode_info(d: &NewDevice) -> Vec<u8> {
     b
 }
 
-/// Basic parameters: 4 KiB blocks, a volatile cache with FUA, and the device size.
+/// Basic parameters: 4 KiB blocks, a volatile cache with FUA, and the device size. Discard
+/// and write-zeroes clear any 4 KiB-aligned range, which then reads as zeros.
 fn encode_params(size: u64, max_io: u32) -> Vec<u8> {
     let mut b = vec![0u8; PARAMS_LEN];
     b[0..4].copy_from_slice(&(PARAMS_LEN as u32).to_le_bytes());
-    b[4..8].copy_from_slice(&PARAM_TYPE_BASIC.to_le_bytes());
+    b[4..8].copy_from_slice(&(PARAM_TYPE_BASIC | PARAM_TYPE_DISCARD).to_le_bytes());
     b[8..12].copy_from_slice(&(ATTR_VOLATILE_CACHE | ATTR_FUA).to_le_bytes());
     b[12..16].copy_from_slice(&[12, 12, 12, 12]);
     b[16..20].copy_from_slice(&(max_io >> 9).to_le_bytes());
     b[24..32].copy_from_slice(&(size >> 9).to_le_bytes());
+    b[44..48].copy_from_slice(&4096u32.to_le_bytes());
+    b[48..52].copy_from_slice(&(MAX_CLEAR >> 9).to_le_bytes());
+    b[52..56].copy_from_slice(&(MAX_CLEAR >> 9).to_le_bytes());
+    b[56..58].copy_from_slice(&1u16.to_le_bytes());
     b
 }
 
@@ -236,5 +244,18 @@ mod tests {
         let p = encode_params(1 << 30, 512 << 10);
         assert_eq!(u64::from_le_bytes(p[24..32].try_into().unwrap()), (1 << 30) >> 9);
         assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 1024);
+    }
+
+    #[test]
+    fn params_offer_discard_and_write_zeroes_in_one_segment() {
+        let p = encode_params(1 << 30, 512 << 10);
+        let u32_at = |i: usize| u32::from_le_bytes(p[i..i + 4].try_into().unwrap());
+        assert_eq!(u32_at(0) as usize, p.len());
+        assert_eq!(u32_at(4), PARAM_TYPE_BASIC | PARAM_TYPE_DISCARD);
+        assert_eq!(u32_at(40), 0);
+        assert_eq!(u32_at(44), 4096);
+        assert_eq!(u32_at(48), 1 << 21);
+        assert_eq!(u32_at(52), 1 << 21);
+        assert_eq!(u16::from_le_bytes([p[56], p[57]]), 1);
     }
 }

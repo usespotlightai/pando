@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-pub(crate) use journal::Journal;
+pub(crate) use journal::{Journal, Record};
 pub(crate) use object_log::{ObjectLog, WritebackHold};
 
 use crate::ports::{LocalFs, Open};
