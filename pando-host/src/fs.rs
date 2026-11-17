@@ -96,6 +96,28 @@ impl LocalFs for HostFs {
         .await?;
         Ok(Box::new(HostLock { _file: file }))
     }
+
+    async fn try_lock(&self, path: &Path) -> io::Result<Box<dyn FileLock>> {
+        let path = path.to_path_buf();
+        let file = blocking(move || {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            match f.try_lock() {
+                Ok(()) => Ok(f),
+                Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!("{} is held by another process", path.display()),
+                )),
+                Err(std::fs::TryLockError::Error(e)) => Err(e),
+            }
+        })
+        .await?;
+        Ok(Box::new(HostLock { _file: file }))
+    }
 }
 
 #[derive(Debug)]

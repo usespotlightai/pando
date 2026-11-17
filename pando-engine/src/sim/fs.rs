@@ -236,6 +236,10 @@ impl LocalFs for SimFs {
             id,
         }))
     }
+
+    async fn try_lock(&self, path: &Path) -> io::Result<Box<dyn FileLock>> {
+        self.lock(path).await
+    }
 }
 
 #[async_trait]

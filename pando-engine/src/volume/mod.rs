@@ -1018,6 +1018,7 @@ mod tests {
         v.flush().await.unwrap();
         v.write_at(&data(2, 1000), 500).await.unwrap();
         v.close().await;
+        drop(v);
 
         let again = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
             .await
@@ -1031,6 +1032,7 @@ mod tests {
             "the daemon restart replays the journal"
         );
         again.close().await;
+        drop(again);
 
         crash(&fs);
         let after = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
@@ -1059,12 +1061,14 @@ mod tests {
             v.flush().await.unwrap();
         }
         v.close().await;
+        drop(v);
         crash(&fs);
         let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
             .await
             .unwrap();
         v.write_at(&data(9, 10), 0).await.unwrap();
         v.close().await;
+        drop(v);
         let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
             .await
             .unwrap();
@@ -1074,6 +1078,7 @@ mod tests {
             "the journal starts above the floor the state names"
         );
         v.close().await;
+        drop(v);
     }
 
     fn crash(fs: &SimFs) {

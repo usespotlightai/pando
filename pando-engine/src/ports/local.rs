@@ -46,6 +46,8 @@ pub trait LocalFs: Send + Sync + fmt::Debug {
     async fn sync_dir(&self, dir: &Path) -> io::Result<()>;
     /// An exclusive lock between processes on this host, held until the guard drops.
     async fn lock(&self, path: &Path) -> io::Result<Box<dyn FileLock>>;
+    /// [`Self::lock`], or `ResourceBusy` at once when another holder has it.
+    async fn try_lock(&self, path: &Path) -> io::Result<Box<dyn FileLock>>;
 }
 
 #[async_trait]

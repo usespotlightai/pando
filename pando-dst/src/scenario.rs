@@ -180,6 +180,7 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
             }
             72..77 => {
                 v.close().await;
+                drop(v);
                 v = open(&w.ports, "/host")
                     .await
                     .map_err(|e| format!("{at}: restart: {e}"))?;
@@ -187,6 +188,7 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
             }
             77..82 => {
                 v.close().await;
+                drop(v);
                 w.fs.crash();
                 w.model.clone_from(&w.flushed);
                 v = open(&w.ports, "/host")

@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
 use pando_format::Hash;
+use tokio::sync::Notify;
 
 use super::{read_file, write_atomic};
-use crate::ports::{Advice, LocalFile, LocalFs, Open};
+use crate::ports::{Advice, FileLock, LocalFile, LocalFs, Open};
 use crate::{Error, Result};
 
 const HEADER: usize = 32 + 4;
@@ -24,7 +25,8 @@ const WRITEBACK_BYTES: u64 = 8 << 20;
 /// file must not change while records name it; once it is dropped, its records read as misses.
 ///
 /// `<log>.synced` says how much of the log is durable, so an open after a crash checks the
-/// hashes of the records beyond it only.
+/// hashes of the records beyond it only. A record with the zero hash is padding: the space of
+/// an append whose write failed. One process at a time opens the log: `<log>.lock`.
 #[derive(Debug)]
 pub(crate) struct ObjectLog {
     fs: Arc<dyn LocalFs>,
@@ -32,7 +34,12 @@ pub(crate) struct ObjectLog {
     path: PathBuf,
     end: AtomicU64,
     shards: Vec<RwLock<HashMap<Hash, Arc<Loc>>>>,
-    in_flight: Mutex<BTreeSet<u64>>,
+    /// Where appends are still writing. An append that could not write its record or its
+    /// padding stays here, and the log is poisoned.
+    in_flight: Arc<Mutex<BTreeSet<u64>>>,
+    landed: Arc<Notify>,
+    poisoned: Arc<AtomicBool>,
+    _lock: Box<dyn FileLock>,
     files: Mutex<HashMap<PathBuf, Arc<ExtFile>>>,
     unwritten: AtomicU64,
     writing_back: Arc<AtomicBool>,
@@ -103,6 +110,32 @@ impl Drop for WritebackHold<'_> {
     }
 }
 
+/// How much of the log a scan reads at once.
+const SCAN_WINDOW: usize = 4 << 20;
+
+/// The part of the log a scan read last, so it reads the log in large blocks.
+#[derive(Default)]
+struct Window {
+    start: u64,
+    buf: Bytes,
+}
+
+impl Window {
+    /// `len` bytes at `at`, fewer at the end of the file.
+    async fn read(&mut self, f: &dyn LocalFile, at: u64, len: usize) -> io::Result<Bytes> {
+        let end = self.start + self.buf.len() as u64;
+        if at < self.start || at + len as u64 > end {
+            if len > SCAN_WINDOW {
+                return f.read_at(len, at).await;
+            }
+            self.buf = f.read_at(SCAN_WINDOW, at).await?;
+            self.start = at;
+        }
+        let from = (at - self.start) as usize;
+        Ok(self.buf.slice(from..(from + len).min(self.buf.len())))
+    }
+}
+
 fn header(h: Hash, len: u32) -> Bytes {
     let mut b = Vec::with_capacity(HEADER);
     b.extend_from_slice(&h.0);
@@ -114,6 +147,14 @@ impl ObjectLog {
     pub(crate) async fn open(fs: Arc<dyn LocalFs>, path: &Path) -> Result<ObjectLog> {
         let dir = path.parent().unwrap_or(Path::new(""));
         fs.create_dir_all(dir).await?;
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = fs.try_lock(Path::new(&lock_path)).await.map_err(|e| {
+            Error::Io(io::Error::new(
+                e.kind(),
+                format!("the object log {} is in use: {e}", path.display()),
+            ))
+        })?;
         let file = fs.open(path, Open::Create).await?;
         fs.sync_dir(dir).await?;
         let log = ObjectLog {
@@ -122,7 +163,10 @@ impl ObjectLog {
             path: path.to_path_buf(),
             end: AtomicU64::new(0),
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
-            in_flight: Mutex::default(),
+            in_flight: Arc::default(),
+            landed: Arc::default(),
+            poisoned: Arc::default(),
+            _lock: lock,
             files: Mutex::default(),
             unwritten: AtomicU64::new(0),
             writing_back: Arc::default(),
@@ -152,9 +196,10 @@ impl ObjectLog {
     /// Indexes the records, checking those at or past `synced`; returns where the valid log ends.
     async fn scan(&self, synced: u64) -> Result<u64> {
         let size = self.file.size().await?;
+        let mut w = Window::default();
         let mut off = 0u64;
         while off + HEADER as u64 <= size {
-            let hdr = self.file.read_at(HEADER, off).await?;
+            let hdr = w.read(self.file.as_ref(), off, HEADER).await?;
             if hdr.len() < HEADER {
                 break;
             }
@@ -165,8 +210,16 @@ impl ObjectLog {
             if body + plen > size {
                 break;
             }
+            if h == Hash::ZERO {
+                if off >= synced {
+                    break;
+                }
+                off = body + plen;
+                continue;
+            }
             if n & REF_FLAG != 0 {
-                let Some(loc) = self.read_ref(off, plen).await? else {
+                let payload = w.read(self.file.as_ref(), body, plen as usize).await?;
+                let Some(loc) = self.read_ref(off, &payload) else {
                     break;
                 };
                 let (ext, ext_off) = loc.ext.as_ref().expect("a ref record names a file");
@@ -181,7 +234,7 @@ impl ObjectLog {
                 }
             } else {
                 if off >= synced {
-                    let data = self.file.read_at(n as usize, body).await?;
+                    let data = w.read(self.file.as_ref(), body, n as usize).await?;
                     if data.len() != n as usize || Hash::of(&data) != h {
                         break;
                     }
@@ -201,23 +254,20 @@ impl ObjectLog {
         Ok(off)
     }
 
-    async fn read_ref(&self, off: u64, plen: u64) -> Result<Option<Loc>> {
-        if plen < 12 {
-            return Ok(None);
+    fn read_ref(&self, off: u64, b: &[u8]) -> Option<Loc> {
+        if b.len() < 12 {
+            return None;
         }
-        let b = self.file.read_at(plen as usize, off + HEADER as u64).await?;
         let len = u32::from_le_bytes(b[..4].try_into().expect("4 bytes"));
         let ext_off = u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"));
-        let Ok(path) = std::str::from_utf8(&b[12..]) else {
-            return Ok(None);
-        };
+        let path = std::str::from_utf8(&b[12..]).ok()?;
         let ext = self.ext_file(Path::new(path));
-        Ok(Some(Loc {
+        Some(Loc {
             off,
             len,
             touched: AtomicBool::new(false),
             ext: Some((ext, ext_off)),
-        }))
+        })
     }
 
     fn ext_file(&self, path: &Path) -> Arc<ExtFile> {
@@ -265,6 +315,8 @@ impl ObjectLog {
         self.lookup(h).is_some_and(|l| l.ext.is_none())
     }
 
+    /// Writes a record at the end of the log. The write runs on its own task, so a caller that
+    /// stops waiting leaves no hole: a failed write leaves padding instead.
     async fn append(&self, h: Hash, hdr: Bytes, body: Bytes) -> Result<u64> {
         let n = (hdr.len() + body.len()) as u64;
         let at = {
@@ -273,8 +325,30 @@ impl ObjectLog {
             f.insert(at);
             at
         };
-        let r = self.file.write_at(vec![hdr, body], at).await;
-        self.in_flight.lock().expect("in-flight lock").remove(&at);
+        let (file, in_flight, landed, poisoned) = (
+            self.file.clone(),
+            self.in_flight.clone(),
+            self.landed.clone(),
+            self.poisoned.clone(),
+        );
+        let task = tokio::spawn(async move {
+            let r = file.write_at(vec![hdr, body], at).await;
+            let settled = match r {
+                Ok(()) => true,
+                Err(_) => {
+                    let pad = header(Hash::ZERO, (n - HEADER as u64) as u32);
+                    file.write_at(vec![pad], at).await.is_ok()
+                }
+            };
+            if settled {
+                in_flight.lock().expect("in-flight lock").remove(&at);
+            } else {
+                poisoned.store(true, Ordering::Release);
+            }
+            landed.notify_waiters();
+            r
+        });
+        let r = task.await.map_err(io::Error::other)?;
         r.map_err(|e| Error::Io(io::Error::new(e.kind(), format!("write object {h}: {e}"))))?;
         Ok(at)
     }
@@ -435,16 +509,29 @@ impl ObjectLog {
         }
     }
 
-    /// Makes every finished put durable, then records how far the log is durable: up to the
-    /// first record still being written.
+    /// Waits for every put that started before it, makes them durable, then records that the
+    /// log is durable up to them.
     pub(crate) async fn sync(&self) -> Result<()> {
         let end = {
-            let f = self.in_flight.lock().expect("in-flight lock");
-            f.first()
-                .copied()
-                .unwrap_or(self.end.load(Ordering::Acquire))
-                .min(self.end.load(Ordering::Acquire))
+            let _f = self.in_flight.lock().expect("in-flight lock");
+            self.end.load(Ordering::Acquire)
         };
+        loop {
+            let landed = self.landed.notified();
+            tokio::pin!(landed);
+            landed.as_mut().enable();
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(Error::Io(io::Error::other(format!(
+                    "the object log {} lost a write",
+                    self.path.display()
+                ))));
+            }
+            let first = self.in_flight.lock().expect("in-flight lock").first().copied();
+            if first.is_none_or(|f| f >= end) {
+                break;
+            }
+            landed.await;
+        }
         let ext: Vec<Arc<ExtFile>> = self
             .files
             .lock()
@@ -507,6 +594,49 @@ mod tests {
         let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         assert_eq!(after.get(&h1).await.unwrap(), Some(b1));
         assert!(!after.has(&h2));
+    }
+
+    #[tokio::test]
+    async fn one_process_at_a_time_opens_the_log() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let err = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap_err();
+        assert!(err.to_string().contains("in use"), "{err}");
+        drop(log);
+        ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn padding_is_skipped_below_the_synced_mark_and_ends_the_log_above_it() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let ((h1, b1), (h2, b2)) = (obj(1), obj(2));
+        log.put(h1, b1).await.unwrap();
+        drop(log);
+        let f = fs.open(path, Open::ReadWrite).await.unwrap();
+        let at = f.size().await.unwrap();
+        let tail = vec![
+            header(Hash::ZERO, 100),
+            Bytes::from(vec![0; 100]),
+            header(h2, b2.len() as u32),
+            b2.clone(),
+        ];
+        f.write_at(tail.clone(), at).await.unwrap();
+        let end = f.size().await.unwrap();
+
+        let unsynced = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert!(unsynced.has(&h1) && !unsynced.has(&h2));
+        drop(unsynced);
+        assert_eq!(f.size().await.unwrap(), at, "the open cut the log at the padding");
+        f.write_at(tail, at).await.unwrap();
+        write_atomic(&fs, Path::new("/c/objects.synced"), Bytes::from(end.to_string()))
+            .await
+            .unwrap();
+        let synced = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert!(synced.has(&h1) && !synced.has(&Hash::ZERO));
+        assert_eq!(synced.get(&h2).await.unwrap(), Some(b2));
     }
 
     #[tokio::test]
