@@ -145,7 +145,9 @@ XFS reflink branches exist only on the host's disk. Pando, JuiceFS, EBS, ZeroFS 
 branches are durable and open on any host, so each fork waits on the network. These rows are from
 one run so far, not five. JuiceFS made 100 branches, EBS and ZeroFS 10, and S3 Files 3; the others
 made 1,000. ZeroFS has only read-only checkpoints, so a writable branch is a copy of the device
-file. S3 Files has no branches, so a branch is a copy of every file through the mount.
+file. S3 Files has no branches, so a branch is a copy of every file through the mount. On Pando a
+5 MiB edit adds 7.58 MiB to the store in this run, against 5.08 MiB in the run before it; the
+cause is not known yet.
 
 <!-- bench:fork -->
 <picture>
@@ -350,8 +352,9 @@ Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs 
 Pando. Pando (ublk) reads come out ahead of the local NVMe because its daemon keeps the branch in
 cache files read through the host's page cache: direct I/O skips the page cache of the device, not
 of the daemon, so those rows mostly measure memory. Its writes do not: sequential writes match the
-NVMe, and 4 KiB random writes reach about 14k IOPS, a tenth of the NVMe's (467k IOPS in the run
-before this one). After handoff, I/O goes through device-mapper and a loop device to the image on
+NVMe, and 4 KiB random writes reach about 14k IOPS, a tenth of the NVMe's 134k. In the run before
+this one Pando's own random writes reached 467k IOPS; the drop is a regression whose cause is not
+known yet. After handoff, I/O goes through device-mapper and a loop device to the image on
 the NVMe and runs at the NVMe's speed. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On
 ZeroFS every request goes over NBD to its server and on S3 Files over NFS to the file system, so a
 single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
@@ -430,14 +433,15 @@ the device after 120 s. What it acknowledged before the kill was intact.
 
 | System | Failed writes | Stall | fsck | Files correct |
 |---|---|---|---|---|
-| Pando | 0 (4 in one run) | 0.16 s | clean in 4 of 5 runs | all acknowledged (1,379 to 1,445 per run) |
+| Pando | 0, 0, 0, 0 and 4 | 0.16 s | errors in 1 of 5 runs (known bug) | all acknowledged (1,379 to 1,445 per run) |
 | JuiceFS | 2 | 0.23 s | clean | all acknowledged (264 to 270 per run) |
 | ZeroFS | 1 | did not recover | clean | all acknowledged (20 per run) |
 | Amazon S3 Files | 0 | 3.16 s | no checker | all acknowledged (348 to 352 per run) |
 
 In one of Pando's five runs the restarted daemon logged `ublk io: File exists (os error 17)`, 4
 writes failed, and the fresh host's `e2fsck -fn` found the root directory, the inode count and the
-block bitmap of one group wrong (exit 4). Every acknowledged file still read back correctly.
+block bitmap of one group wrong (exit 4). Every acknowledged file still read back correctly. This
+is a known recovery bug in main at `d57f1de`, not a quirk of the measure, and is not fixed yet.
 
 Pando also ran a reboot case five times: the same writer, and five seconds in the host reboots
 through `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would. After the
