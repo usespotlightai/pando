@@ -639,7 +639,7 @@ fn live_target(name: &str) -> io::Result<Option<PathBuf>> {
 /// Binds a free loop device to `image` with direct I/O, so the image is not cached twice. The
 /// loop device frees itself when its last user lets go of it; the returned file is a user
 /// until the table that maps it is loaded.
-fn attach_loop(image: &Path) -> io::Result<(PathBuf, OwnedFd)> {
+pub(crate) fn attach_loop(image: &Path) -> io::Result<(PathBuf, OwnedFd)> {
     let ctl = OpenOptions::new()
         .read(true)
         .write(true)
@@ -672,7 +672,7 @@ fn attach_loop(image: &Path) -> io::Result<(PathBuf, OwnedFd)> {
 }
 
 /// Sets the size of loop device `device` to the current length of its image.
-fn refresh_loop(device: &Path) -> io::Result<()> {
+pub(crate) fn refresh_loop(device: &Path) -> io::Result<()> {
     let devt = sys_dev("block", file_name(device)?)?;
     let lf = open_usable(device, true, Some(&devt))?;
     sys::ioctl_int(lf.as_raw_fd(), LOOP_SET_CAPACITY).map(drop)

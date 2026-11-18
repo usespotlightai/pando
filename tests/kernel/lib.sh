@@ -60,7 +60,7 @@ exited() {
 # any, the kernel log since the marker goes to $R/$TEST.dmesg.
 kernel_errors() {
 	local since n
-	since=$(dmesg | sed -n "/$1/,\$p")
+	since=$(dmesg | awk -v m="$1" 'index($0, m) { on = 1; buf = "" } on { buf = buf $0 "\n" } END { printf "%s", buf }')
 	n=$(grep -ciE "I/O error|blk_update_request|buffer I/O" <<<"$since" || true)
 	[[ $n = 0 ]] || printf '%s\n' "$since" >>"$R/$TEST.dmesg"
 	echo "$n"
