@@ -11,11 +11,18 @@ impl Hash {
     /// The hash of nothing: an [`Entry`](crate::Entry) with it is empty.
     pub const ZERO: Hash = Hash([0; 32]);
 
+    /// The SHA-256 of `b`.
+    #[expect(
+        clippy::expect_used,
+        clippy::missing_panics_doc,
+        reason = "a SHA-256 digest is always 32 bytes"
+    )]
     pub fn of(b: &[u8]) -> Hash {
         let d = ring::digest::digest(&ring::digest::SHA256, b);
         Hash(d.as_ref().try_into().expect("SHA-256 is 32 bytes"))
     }
 
+    /// Whether this is [`Hash::ZERO`], which names no object.
     pub fn is_zero(&self) -> bool {
         *self == Self::ZERO
     }

@@ -83,11 +83,12 @@ pub(crate) async fn save(cache: &Cache, opened: &Entry, end: &Entry) -> Result<u
     Ok(r.entries.len())
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use std::path::Path;
 
-    use pando_format::CHUNK_SIZE;
+    use pando_format::{CHUNK_SIZE, SegId, SegmentIndex, u64_from};
 
     use super::*;
     use crate::{Volume, sim};
@@ -116,7 +117,7 @@ mod tests {
         let (ports, _, _) = sim::ports(5);
         Volume::create(&ports, "main", 1 << 22).await.unwrap();
         let a = Arc::new(Cache::open(&ports, Path::new("/a")).await.unwrap());
-        let v = Volume::open(&ports, a.clone(), Path::new("/va"), "main")
+        let v = Volume::open(&ports, Arc::clone(&a), Path::new("/va"), "main")
             .await
             .unwrap();
         v.write_at(&vec![7; 1 << 22], 0).await.unwrap();
@@ -124,18 +125,19 @@ mod tests {
         v.close().await;
 
         let b = Arc::new(Cache::open(&ports, Path::new("/b")).await.unwrap());
-        let v = Volume::open(&ports, b.clone(), Path::new("/vb"), "main")
+        let v = Volume::open(&ports, Arc::clone(&b), Path::new("/vb"), "main")
             .await
             .unwrap();
         let mut buf = vec![0; 100];
-        v.read_at(&mut buf, 5 * CHUNK_SIZE as u64).await.unwrap();
+        v.read_at(&mut buf, 5 * u64_from(CHUNK_SIZE)).await.unwrap();
         let opened = v.root();
         assert!(save(&b, &opened, &v.root()).await.unwrap() >= 2);
         v.close().await;
 
         let c = Arc::new(Cache::open(&ports, Path::new("/c")).await.unwrap());
         let rec = load(&c, &opened).await;
-        assert!(!rec.indexes.is_empty());
+        let none: [(SegId, SegmentIndex); 0] = [];
+        assert_ne!(rec.indexes, none);
         let gets = || c.remote().stats().gets.load(std::sync::atomic::Ordering::Relaxed);
         let before = gets();
         assert!(prefetch(&c, &rec, 8).await >= 1);

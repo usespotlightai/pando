@@ -12,15 +12,16 @@
 //! other bases on the host where the change list's block keys find them all, else from the
 //! store.
 
-use std::collections::{HashMap, HashSet};
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use pando_format::{BlockKeys, CHUNK_SIZE, ChangeList, Entry, Hash, Recipe, is_zero};
+use pando_format::{BlockKeys, CHUNK_SIZE, ChangeList, Entry, Hash, Recipe, is_zero, u64_from, usize_from};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 use super::host_blocks::{HostBlocks, Plan};
@@ -33,7 +34,7 @@ use crate::ports::{CpuClass, FileLock, LocalFile, LocalFs, Open, on_cpu};
 use crate::tree::Tree;
 use crate::{Error, Result};
 
-const CHUNK: u64 = CHUNK_SIZE as u64;
+const CHUNK: u64 = u64_from(CHUNK_SIZE);
 /// A base is seeded from another only when at most a quarter of its chunks differ; past that,
 /// the build from the frames is as fast.
 const SEED_SHARE: u64 = 4;
@@ -83,14 +84,14 @@ async fn lock(fs: &dyn LocalFs, path: &Path) -> io::Result<Box<dyn FileLock>> {
     loop {
         match fs.lock(path).await {
             Err(e) if e.kind() == io::ErrorKind::ResourceBusy => {
-                tokio::time::sleep(Duration::from_millis(50)).await
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             r => return r,
         }
     }
 }
 
-async fn wait_foreground(after: &Option<watch::Receiver<bool>>) {
+async fn wait_foreground(after: Option<&watch::Receiver<bool>>) {
     if let Some(rx) = after {
         let mut rx = rx.clone();
         let _ = tokio::time::timeout(FOREGROUND_FIRST_MAX, rx.wait_for(|v| *v)).await;
@@ -126,20 +127,19 @@ pub(crate) async fn build(
             Err(_) => cache.stop_serving_base(key),
         }
     }
-    let (mut report, blocks, file) = match done {
-        Some(d) => d,
-        None => {
-            let _ = bases.fs.remove(&tmp).await;
-            let file = bases.fs.open(&tmp, Open::Create).await?;
-            file.set_len(size).await?;
-            let _ = bases.image.prepare(&tmp, None).await;
-            match from_frames(bases, cache, tree, root, size, file.clone(), &opts).await {
-                Ok((r, b)) => (r, b, file),
-                Err(e) => {
-                    cache.stop_serving_base(key);
-                    let _ = bases.fs.remove(&tmp).await;
-                    return Err(e);
-                }
+    let (mut report, blocks, file) = if let Some(d) = done {
+        d
+    } else {
+        let _ = bases.fs.remove(&tmp).await;
+        let file = bases.fs.open(&tmp, Open::Create).await?;
+        file.set_len(size).await?;
+        let _ = bases.image.prepare(&tmp, None).await;
+        match from_frames(bases, cache, tree, root, size, Arc::clone(&file), &opts).await {
+            Ok((r, b)) => (r, b, file),
+            Err(e) => {
+                cache.stop_serving_base(key);
+                let _ = bases.fs.remove(&tmp).await;
+                return Err(e);
             }
         }
     };
@@ -171,7 +171,7 @@ async fn save(
     write_durable(
         bases.fs.as_ref(),
         &Bases::nodes_path(path),
-        node_pack::encode(&nodes),
+        node_pack::encode(&nodes)?,
     )
     .await?;
     bases.fs.rename(tmp, path).await?;
@@ -225,13 +225,13 @@ async fn from_frames(
         BlockMap::default(),
         opts.parallel,
     );
-    cache.serve_base(BaseKey::Building(root.hash), fill.built.clone());
-    wait_foreground(&opts.after).await;
+    cache.serve_base(BaseKey::Building(root.hash), Arc::clone(&fill.built));
+    wait_foreground(opts.after.as_ref()).await;
     let report = fill.run(&order, None).await?;
-    Ok((report, fill.blocks.into_inner().expect("blocks lock")))
+    Ok((report, fill.blocks.into_inner()))
 }
 
-#[allow(clippy::too_many_arguments, reason = "one build's inputs, each used once")]
+#[expect(clippy::too_many_arguments, reason = "one build's inputs, each used once")]
 async fn seeded(
     bases: &Bases,
     cache: &Arc<Cache>,
@@ -259,9 +259,12 @@ async fn seeded(
         }
     })
     .await?;
-    let served = Arc::new(PartialBase::new(seed_file.clone(), seed_places.iter().copied()));
+    let served = Arc::new(PartialBase::new(
+        Arc::clone(&seed_file),
+        seed_places.iter().copied(),
+    ));
     for (h, idx) in &seed_places {
-        served.written(h, CHUNK.min(size - idx * CHUNK) as usize);
+        served.written(h, usize_from(CHUNK.min(size - idx * CHUNK)));
     }
     let key = BaseKey::Seed(seed_root);
     cache.serve_base(key, served);
@@ -273,7 +276,7 @@ async fn seeded(
     r
 }
 
-#[allow(clippy::too_many_arguments, reason = "one build's inputs, each used once")]
+#[expect(clippy::too_many_arguments, reason = "one build's inputs, each used once")]
 async fn seed_into(
     bases: &Bases,
     cache: &Arc<Cache>,
@@ -307,7 +310,7 @@ async fn seed_into(
             .map(|(i, e)| (i, e, None))
             .collect(),
     };
-    if changes.len() as u64 * SEED_SHARE > size.div_ceil(CHUNK) {
+    if u64_from(changes.len()) * SEED_SHARE > size.div_ceil(CHUNK) {
         return Err(Error::Corrupt(format!(
             "{} chunks differ from the seed base",
             changes.len()
@@ -323,7 +326,7 @@ async fn seed_into(
 
     let mut places: HashMap<Hash, Vec<u64>> = HashMap::new();
     let mut holes = Vec::new();
-    let mut planned: HashMap<Hash, (Entry, Plan)> = HashMap::new();
+    let mut planned: BTreeMap<Hash, (Entry, Plan)> = BTreeMap::new();
     let mut fetch = Vec::new();
     for (idx, e, keys) in &changes {
         if idx * CHUNK >= size {
@@ -349,9 +352,17 @@ async fn seed_into(
             None => fetch.push(*e),
         }
     }
-    let fill = Fill::new(bases, cache, file.clone(), size, places, blocks, opts.parallel);
-    cache.serve_base(BaseKey::Building(root.hash), fill.built.clone());
-    wait_foreground(&opts.after).await;
+    let fill = Fill::new(
+        bases,
+        cache,
+        Arc::clone(&file),
+        size,
+        places,
+        blocks,
+        opts.parallel,
+    );
+    cache.serve_base(BaseKey::Building(root.hash), Arc::clone(&fill.built));
+    wait_foreground(opts.after.as_ref()).await;
     for idx in &holes {
         let n = CHUNK.min(size - idx * CHUNK);
         bases.image.punch_hole(tmp, idx * CHUNK, n).await?;
@@ -360,7 +371,7 @@ async fn seed_into(
     let mut report = fill.run(&fetch, Some((&host, &local))).await?;
     report.seed = Some(seed_root);
     report.holes = holes.len();
-    Ok((report, fill.blocks.into_inner().expect("blocks lock"), file))
+    Ok((report, fill.blocks.into_inner(), file))
 }
 
 /// Writes the chunks of `places` into one image.
@@ -381,7 +392,7 @@ struct FillSink<'f, 'a> {
     fill: &'f Fill<'a>,
     queue: mpsc::UnboundedSender<(Hash, Bytes)>,
     queued: &'f AtomicUsize,
-    recipes: &'f Mutex<HashMap<Hash, Bytes>>,
+    recipes: &'f Mutex<BTreeMap<Hash, Bytes>>,
 }
 
 impl Sink for FillSink<'_, '_> {
@@ -404,11 +415,7 @@ impl Sink for FillSink<'_, '_> {
         if !self.fill.wants(h) {
             return true;
         }
-        self.recipes
-            .lock()
-            .expect("recipes lock")
-            .entry(*h)
-            .or_insert_with(|| enc.clone());
+        self.recipes.lock().entry(*h).or_insert_with(|| enc.clone());
         true
     }
 }
@@ -424,7 +431,7 @@ impl<'a> Fill<'a> {
         parallel: usize,
     ) -> Fill<'a> {
         let built = Arc::new(PartialBase::new(
-            file.clone(),
+            Arc::clone(&file),
             places.iter().map(|(h, at)| (*h, at[0])),
         ));
         let claimed = places.keys().map(|h| (*h, AtomicBool::new(false))).collect();
@@ -457,7 +464,8 @@ impl<'a> Fill<'a> {
         let mut local = BlockMap::default();
         for (i, idx) in self.places[h].iter().enumerate() {
             let off = idx * CHUNK;
-            let n = CHUNK.min(self.size - off) as usize;
+            let n64 = CHUNK.min(self.size - off);
+            let n = usize_from(n64);
             let part = if b.len() >= n {
                 b.slice(..n)
             } else {
@@ -472,12 +480,12 @@ impl<'a> Fill<'a> {
             if !is_zero(&part) {
                 local.add_chunk(*idx, &part);
             }
-            let w = self.written.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-            if w / WRITEBACK_STEP != (w - n as u64) / WRITEBACK_STEP {
+            let w = self.written.fetch_add(n64, Ordering::Relaxed) + n64;
+            if w / WRITEBACK_STEP != (w - n64) / WRITEBACK_STEP {
                 self.file.start_writeback().await;
             }
         }
-        self.blocks.lock().expect("blocks lock").merge(local);
+        self.blocks.lock().merge(local);
         Ok(())
     }
 
@@ -487,7 +495,7 @@ impl<'a> Fill<'a> {
             return None;
         }
         let off = self.places.get(h)?[0] * CHUNK;
-        let n = CHUNK.min(self.size - off) as usize;
+        let n = usize_from(CHUNK.min(self.size - off));
         self.file.read_at(n, off).await.ok().filter(|b| b.len() == n)
     }
 
@@ -503,7 +511,7 @@ impl<'a> Fill<'a> {
             ..BuildReport::default()
         };
         let queued = AtomicUsize::new(0);
-        let recipes: Mutex<HashMap<Hash, Bytes>> = Mutex::default();
+        let recipes: Mutex<BTreeMap<Hash, Bytes>> = Mutex::default();
         let (tx, rx) = mpsc::unbounded_channel::<(Hash, Bytes)>();
         let rx = AsyncMutex::new(rx);
         let from_fetch = AtomicUsize::new(0);
@@ -573,11 +581,21 @@ impl<'a> Fill<'a> {
         report.frames = frames;
         report.from_fetch = from_fetch.into_inner();
         report.from_local = from_local.into_inner();
+        report.read_back = self.read_back(fetch, local.map(|(_, p)| p)).await?;
+        report.recipes = self.rebuild(&recipes.into_inner()).await?;
+        if let Some(h) = self.places.keys().filter(|h| !self.built.has(h)).min() {
+            return Err(Error::Corrupt(format!("chunk {} is not in its frame", h.short())));
+        }
+        Ok(report)
+    }
 
+    /// Reads back from the cache the chunks of `fetch` and `planned` that no one wrote yet;
+    /// returns how many.
+    async fn read_back(&self, fetch: &[Entry], planned: Option<&[(Entry, Plan)]>) -> Result<usize> {
         let all: Vec<Entry> = fetch
             .iter()
             .copied()
-            .chain(local.into_iter().flat_map(|(_, p)| p.iter().map(|(e, _)| *e)))
+            .chain(planned.into_iter().flat_map(|p| p.iter().map(|(e, _)| *e)))
             .collect();
         let mut futs = Vec::new();
         for e in &all {
@@ -588,25 +606,17 @@ impl<'a> Fill<'a> {
                 });
             }
         }
-        report.read_back = futs.len();
+        let n = futs.len();
         bounded(futs, self.parallel)
             .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-
-        let recipes = recipes.into_inner().expect("recipes lock");
-        report.recipes = self.rebuild(&recipes).await?;
-        for h in self.places.keys() {
-            if !self.built.has(h) {
-                return Err(Error::Corrupt(format!("chunk {} is not in its frame", h.short())));
-            }
-        }
-        Ok(report)
+        Ok(n)
     }
 
     /// Rebuilds the recipe chunks no frame held as themselves. A source this build wrote is read
     /// from the image; the others are fetched first, as one fetch.
-    async fn rebuild(&self, recipes: &HashMap<Hash, Bytes>) -> Result<usize> {
+    async fn rebuild(&self, recipes: &BTreeMap<Hash, Bytes>) -> Result<usize> {
         let todo: Vec<(&Hash, &Bytes)> = recipes.iter().filter(|(h, _)| self.wants(h)).collect();
         if todo.is_empty() {
             return Ok(0);
@@ -640,7 +650,7 @@ impl<'a> Fill<'a> {
                     let r = Recipe::parse(&enc)
                         .map_err(|why| Error::Corrupt(format!("recipe for {}: {why}", h.short())))?;
                     r.rebuild(h, |s| got.get(&s.hash).cloned().ok_or("not fetched"))
-                        .map(|v| v.into_bytes())
+                        .map(pando_format::Verified::into_bytes)
                         .map_err(|e| Error::Corrupt(e.to_string()))
                 })
                 .await?;

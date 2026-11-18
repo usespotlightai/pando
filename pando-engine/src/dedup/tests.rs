@@ -36,9 +36,9 @@ fn rewrite(from: &[u8], at: usize, n: usize, seed: u64) -> Bytes {
 
 async fn tree(ports: &Ports, dir: &str) -> Arc<Tree> {
     let c = Cache::open_with(
-        ports.fs.clone(),
-        ports.cpu.clone(),
-        Remote::new(ports.store.clone()),
+        Arc::clone(&ports.fs),
+        Arc::clone(&ports.cpu),
+        Remote::new(Arc::clone(&ports.store)),
         Path::new(dir),
     )
     .await
@@ -69,7 +69,7 @@ async fn base(ports: &Ports, t: &Tree, chunks: &[(u64, Bytes)]) -> (Entry, Block
     let root = t.update(&Entry::EMPTY, &ups).await.unwrap();
     let mut p = Packer::new(
         t.cache().remote().clone(),
-        ports.cpu.clone(),
+        Arc::clone(&ports.cpu),
         writer(),
         SEG_MAX,
         Arc::default(),
@@ -96,8 +96,8 @@ async fn pack_one(
 ) -> (Entry, Packer) {
     let h = Hash::of(b);
     let mut p = Packer::new(
-        Remote::new(ports.store.clone()),
-        ports.cpu.clone(),
+        Remote::new(Arc::clone(&ports.store)),
+        Arc::clone(&ports.cpu),
         writer(),
         SEG_MAX,
         Arc::default(),
@@ -120,12 +120,12 @@ async fn rewritten_base_blocks_go_up_as_a_recipe() {
     let a = Bytes::from(noise(1, CHUNK_SIZE));
     let (root, map, image) = base(&ports, &t, &[(3, a.clone())]).await;
     let dedup = Arc::new(Dedup {
-        base: Some(BaseBlocks::new(t.clone(), root, map, image)),
+        base: Some(BaseBlocks::new(Arc::clone(&t), root, map, image)),
         learned: None,
     });
 
     let b = rewrite(&a, 4, 8, 2);
-    let (e, p) = pack_one(&ports, Some(dedup.clone()), None, &b).await;
+    let (e, p) = pack_one(&ports, Some(Arc::clone(&dedup)), None, &b).await;
     let s = p.stats();
     assert_eq!((s.recipes, s.reused), (1, 0));
     assert!(
@@ -135,7 +135,7 @@ async fn rewritten_base_blocks_go_up_as_a_recipe() {
     );
     assert_eq!(read_elsewhere(&ports, "/b", &e).await, b);
 
-    let (same, p) = pack_one(&ports, Some(dedup.clone()), None, &a).await;
+    let (same, p) = pack_one(&ports, Some(Arc::clone(&dedup)), None, &a).await;
     assert_eq!(p.stats().reused, 1);
     assert_eq!(
         same,
@@ -183,28 +183,33 @@ async fn a_later_run_takes_blocks_from_chunks_an_earlier_run_published() {
     let (ports, _, _) = sim::ports(3);
     let dir = Path::new("/learned");
     let first = Arc::new(
-        Learner::new(ports.fs.clone(), ports.clock.clone(), dir, "main")
+        Learner::new(Arc::clone(&ports.fs), Arc::clone(&ports.clock), dir, "main")
             .await
             .unwrap(),
     );
     let a = Bytes::from(noise(5, CHUNK_SIZE));
-    let (ea, p) = pack_one(&ports, None, Some(first.clone()), &a).await;
+    let (ea, p) = pack_one(&ports, None, Some(Arc::clone(&first)), &a).await;
     assert_eq!(p.learned().len(), 1);
     first.published(p.learned());
     first.save().await.unwrap();
 
     let learned = Arc::new(
-        LearnedIndex::load(ports.fs.clone(), ports.cpu.clone(), ports.clock.clone(), dir)
-            .await
-            .unwrap(),
+        LearnedIndex::load(
+            Arc::clone(&ports.fs),
+            Arc::clone(&ports.cpu),
+            Arc::clone(&ports.clock),
+            dir,
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(learned.len(), 1);
     let dedup = Arc::new(Dedup {
         base: None,
-        learned: Some(learned.clone()),
+        learned: Some(Arc::clone(&learned)),
     });
     let b = rewrite(&a, 2, 10, 6);
-    let (eb, p) = pack_one(&ports, Some(dedup.clone()), None, &b).await;
+    let (eb, p) = pack_one(&ports, Some(Arc::clone(&dedup)), None, &b).await;
     assert_eq!(p.stats().recipes, 1);
     assert_eq!(p.used_learned(), &[0]);
     assert_eq!(read_elsewhere(&ports, "/b", &eb).await, b);
@@ -225,12 +230,12 @@ async fn a_learned_chunk_with_bad_bytes_is_not_a_source() {
     let (ports, _, _) = sim::ports(4);
     let dir = Path::new("/learned");
     let first = Arc::new(
-        Learner::new(ports.fs.clone(), ports.clock.clone(), dir, "main")
+        Learner::new(Arc::clone(&ports.fs), Arc::clone(&ports.clock), dir, "main")
             .await
             .unwrap(),
     );
     let a = Bytes::from(noise(5, CHUNK_SIZE));
-    let (_, p) = pack_one(&ports, None, Some(first.clone()), &a).await;
+    let (_, p) = pack_one(&ports, None, Some(Arc::clone(&first)), &a).await;
     first.published(p.learned());
     first.save().await.unwrap();
     let chunks = ports
@@ -250,9 +255,14 @@ async fn a_learned_chunk_with_bad_bytes_is_not_a_source() {
         .await
         .unwrap();
 
-    let learned = LearnedIndex::load(ports.fs.clone(), ports.cpu.clone(), ports.clock.clone(), dir)
-        .await
-        .unwrap();
+    let learned = LearnedIndex::load(
+        Arc::clone(&ports.fs),
+        Arc::clone(&ports.cpu),
+        Arc::clone(&ports.clock),
+        dir,
+    )
+    .await
+    .unwrap();
     let dedup = Arc::new(Dedup {
         base: None,
         learned: Some(Arc::new(learned)),
@@ -265,23 +275,26 @@ async fn a_learned_chunk_with_bad_bytes_is_not_a_source() {
 async fn an_unpublished_run_leaves_nothing_learned() {
     let (ports, _, _) = sim::ports(5);
     let dir = Path::new("/learned");
-    let l = Learner::new(ports.fs.clone(), ports.clock.clone(), dir, "main")
+    let l = Learner::new(Arc::clone(&ports.fs), Arc::clone(&ports.clock), dir, "main")
         .await
         .unwrap();
     let a = Bytes::from(noise(5, CHUNK_SIZE));
     assert!(
-        l.keep(
-            Hash::of(&a),
-            pando_format::Loc::default(),
-            &a,
-            &pando_format::BlockKeys::of(&a)
-        )
-        .is_some()
+        l.keep(Hash::of(&a), pando_format::Loc::default(), &a, &BlockKeys::of(&a))
+            .is_some()
     );
     l.discard().await;
-    assert!(ports.fs.list(dir).await.unwrap().is_empty());
-    let learned = LearnedIndex::load(ports.fs.clone(), ports.cpu.clone(), ports.clock.clone(), dir)
-        .await
-        .unwrap();
+    assert_eq!(
+        ports.fs.list(dir).await.unwrap(),
+        Vec::<crate::ports::DirEntry>::new()
+    );
+    let learned = LearnedIndex::load(
+        Arc::clone(&ports.fs),
+        Arc::clone(&ports.cpu),
+        Arc::clone(&ports.clock),
+        dir,
+    )
+    .await
+    .unwrap();
     assert_eq!(learned.len(), 0);
 }

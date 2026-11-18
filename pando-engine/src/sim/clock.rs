@@ -12,8 +12,10 @@ pub struct SimClock {
 }
 
 impl SimClock {
-    pub const EPOCH: Duration = Duration::from_secs(1_800_000_000);
+    /// The wall time at the start, after the Unix epoch.
+    pub const EPOCH: Duration = Duration::from_hours(500_000);
 
+    /// A clock at [`Self::EPOCH`] now; it must be made inside a Tokio runtime.
     pub fn new() -> SimClock {
         SimClock {
             start: Instant::now(),

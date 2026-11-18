@@ -30,30 +30,6 @@ provider "aws" {
   }
 }
 
-variable "region" {
-  description = "Region of the state bucket and the bench."
-  type        = string
-  default     = "eu-north-1"
-}
-
-variable "github_repository" {
-  description = "Repository allowed to assume the bench role, as owner/name."
-  type        = string
-  default     = "usespotlightai/pando"
-}
-
-variable "github_environment" {
-  description = "GitHub environment the bench workflow runs in."
-  type        = string
-  default     = "bench"
-}
-
-variable "create_oidc_provider" {
-  description = "Create the token.actions.githubusercontent.com identity provider. False when the account already has it."
-  type        = bool
-  default     = true
-}
-
 data "aws_caller_identity" "current" {}
 
 locals {
@@ -287,24 +263,4 @@ resource "aws_iam_user_policy" "store" {
       Resource = [local.bench_buckets, "${local.bench_buckets}/*"]
     }]
   })
-}
-
-output "role_arn" {
-  description = "Repository variable AWS_ROLE_ARN."
-  value       = aws_iam_role.github.arn
-}
-
-output "state_bucket" {
-  description = "Repository variable BENCH_STATE_BUCKET."
-  value       = aws_s3_bucket.state.bucket
-}
-
-output "host_permissions_boundary" {
-  description = "Repository variable BENCH_HOST_BOUNDARY."
-  value       = aws_iam_policy.host_boundary.arn
-}
-
-output "store_user" {
-  description = "Create this user's access key in the console for the S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY secrets."
-  value       = aws_iam_user.store.name
 }

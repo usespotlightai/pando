@@ -1,6 +1,6 @@
 use crate::{ENTRY_SIZE, Entry, FormatError, SegId, SegmentIndex};
 
-pub const RECORDING_MAGIC: &[u8; 4] = b"rec1";
+const RECORDING_MAGIC: &[u8; 4] = b"rec1";
 
 /// The chunks a root's earlier mounts read first, in that order, and the indexes of the
 /// segments that hold them. With the indexes, one GET of the recording is enough to fetch those
@@ -12,18 +12,29 @@ pub const RECORDING_MAGIC: &[u8; 4] = b"rec1";
 /// `[segment id][index length u32][index]` per segment to the end.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Recording {
+    /// The recorded objects, in first-read order.
     pub entries: Vec<Entry>,
+    /// Per entry, the mounts since one last read it; a missing age encodes as 0.
     pub ages: Vec<u8>,
+    /// Per entry, whether it is a tree node; a missing flag encodes as false.
     pub nodes: Vec<bool>,
+    /// The indexes of the segments that hold the entries.
     pub indexes: Vec<(SegId, SegmentIndex)>,
 }
 
 impl Recording {
+    /// The encoding described on [`Recording`]. `ages` and `nodes` are cut or padded to the
+    /// length of `entries`.
     pub fn encode(&self) -> Vec<u8> {
         let n = self.entries.len();
         let mut b = Vec::with_capacity(8 + n * (ENTRY_SIZE + 2));
         b.extend_from_slice(RECORDING_MAGIC);
-        b.extend_from_slice(&(n as u32).to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "writers cap a recording at tens of thousands of entries, far below u32::MAX"
+        )]
+        let count = n as u32;
+        b.extend_from_slice(&count.to_le_bytes());
         for e in &self.entries {
             b.extend_from_slice(&e.to_bytes());
         }
@@ -31,20 +42,29 @@ impl Recording {
         b.extend((0..n).map(|i| u8::from(self.nodes.get(i).copied().unwrap_or(false))));
         for (id, idx) in &self.indexes {
             let enc = idx.encode();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a segment index is 8 bytes per frame of a segment of at most 4 GiB, far below \
+                          u32::MAX bytes"
+            )]
+            let len = enc.len() as u32;
             b.extend_from_slice(&id.0);
-            b.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+            b.extend_from_slice(&len.to_le_bytes());
             b.extend_from_slice(&enc);
         }
         b
     }
 
+    /// Decodes a recording; a node byte other than 1 decodes as false.
     pub fn decode(b: &[u8]) -> Result<Recording, FormatError> {
         let bad = |why: &str| FormatError::malformed("recording", why.to_string());
-        if b.len() < 8 || &b[..4] != RECORDING_MAGIC {
+        let Some((&[m0, m1, m2, m3, n0, n1, n2, n3], mut rest)) = b.split_first_chunk::<8>() else {
+            return Err(bad("bad magic"));
+        };
+        if [m0, m1, m2, m3] != *RECORDING_MAGIC {
             return Err(bad("bad magic"));
         }
-        let n = u32::from_le_bytes(b[4..8].try_into().expect("4 bytes")) as usize;
-        let mut rest = &b[8..];
+        let n = u32::from_le_bytes([n0, n1, n2, n3]) as usize;
         if rest.len() < n * (ENTRY_SIZE + 2) {
             return Err(bad("short entries"));
         }
@@ -56,14 +76,15 @@ impl Recording {
         rest = r;
         let mut indexes = Vec::new();
         while !rest.is_empty() {
-            if rest.len() < 20 {
+            let Some((&[ref id @ .., l0, l1, l2, l3], r)) = rest.split_first_chunk::<20>() else {
                 return Err(bad("short segment record"));
-            }
-            let id = SegId(rest[..16].try_into().expect("16 bytes"));
-            let len = u32::from_le_bytes(rest[16..20].try_into().expect("4 bytes")) as usize;
-            let enc = rest.get(20..20 + len).ok_or_else(|| bad("short segment index"))?;
-            indexes.push((id, SegmentIndex::decode(enc)?));
-            rest = &rest[20 + len..];
+            };
+            let len = u32::from_le_bytes([l0, l1, l2, l3]) as usize;
+            let (enc, r) = r
+                .split_at_checked(len)
+                .ok_or_else(|| bad("short segment index"))?;
+            indexes.push((SegId(*id), SegmentIndex::decode(enc)?));
+            rest = r;
         }
         Ok(Recording {
             entries,

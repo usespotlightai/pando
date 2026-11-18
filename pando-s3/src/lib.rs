@@ -1,12 +1,13 @@
 //! Pando's [`Store`] port over any S3-compatible object store, through `object_store`.
 //!
 //! Refs need conditional writes: `If-None-Match: *` for create and `If-Match: <etag>` for
-//! update. AWS S3, Cloudflare R2 and MinIO support both.
+//! update. AWS S3, Cloudflare R2 and `MinIO` support both.
 
 #![forbid(unsafe_code)]
 
+use parking_lot::Mutex;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -29,15 +30,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// this crate reads.
 #[derive(Clone, Default)]
 pub struct S3Config {
+    /// The bucket the store lives in.
     pub bucket: String,
     /// Keys go under this prefix; empty for the bucket root.
     pub prefix: String,
-    /// The endpoint URL for a store other than AWS S3, such as R2 or MinIO.
+    /// The endpoint URL for a store other than AWS S3, such as R2 or `MinIO`.
     pub endpoint: Option<String>,
+    /// The region requests are signed for.
     pub region: String,
+    /// The access key ID requests are signed with.
     pub access_key_id: String,
+    /// The secret for `access_key_id`. [`S3Config`]'s `Debug` leaves it out.
     pub secret_access_key: String,
-    /// Allows a plain-HTTP endpoint, for a local MinIO.
+    /// Allows a plain-HTTP endpoint, for a local `MinIO`.
     pub allow_http: bool,
 }
 
@@ -52,6 +57,8 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
+/// The [`Store`] port over one bucket and key prefix. Refs use conditional writes, so the
+/// backend must support `If-None-Match` and `If-Match` on PUT.
 #[derive(Debug)]
 pub struct S3Store {
     inner: Client,
@@ -74,7 +81,7 @@ impl Client {
         let built = self
             .ready
             .get_or_init(|| async {
-                let rx = self.building.lock().expect("client lock").take();
+                let rx = self.building.lock().take();
                 match rx {
                     Some(rx) => rx
                         .await
@@ -91,6 +98,8 @@ impl Client {
 }
 
 impl S3Store {
+    /// The port over the store `c` names. It returns before the client is built; the first
+    /// request waits for the build and fails with [`StoreError::Other`] if the build failed.
     pub fn new(c: &S3Config) -> Result<S3Store, StoreError> {
         let mut b = AmazonS3Builder::new()
             .with_bucket_name(&c.bucket)
@@ -110,7 +119,7 @@ impl S3Store {
             .spawn(move || {
                 let built = b
                     .build()
-                    .map(|s| Arc::new(s) as Arc<dyn ObjectStore>)
+                    .map(|s| -> Arc<dyn ObjectStore> { Arc::new(s) })
                     .map_err(|e| map_err(&bucket, e).to_string());
                 let _ = tx.send(built);
             })
@@ -183,7 +192,15 @@ fn map_err(key: &str, e: object_store::Error) -> StoreError {
             key,
             source: Box::new(e),
         },
-        e => StoreError::Other {
+        e @ (object_store::Error::InvalidPath { .. }
+        | object_store::Error::JoinError { .. }
+        | object_store::Error::NotSupported { .. }
+        | object_store::Error::NotModified { .. }
+        | object_store::Error::NotImplemented { .. }
+        | object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. }
+        | object_store::Error::UnknownConfigurationKey { .. }
+        | _) => StoreError::Other {
             key,
             source: Box::new(e),
         },

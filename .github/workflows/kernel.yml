@@ -3,7 +3,9 @@ name: kernel
 # The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
 # container (tests/kernel). fio verify, the crash checks and discard run on every push to main;
 # xfstests and the dm-log-writes tests run each night, since the quick group takes hours. Start
-# any of them by hand from the Actions tab.
+# any of them by hand from the Actions tab. The nightly run also builds pando with
+# AddressSanitizer and runs fio verify, the crash checks and discard against that build; any
+# sanitizer report fails the job.
 
 on:
   push:
@@ -16,6 +18,10 @@ on:
         description: "Tests to run, from tests/kernel"
         type: string
         default: "fio-verify crash discard"
+      asan:
+        description: "Build pando with AddressSanitizer"
+        type: boolean
+        default: false
 
 concurrency:
   group: kernel-${{ github.ref }}
@@ -29,6 +35,7 @@ env:
 
 jobs:
   kernel:
+    name: Kernel tests
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
@@ -62,13 +69,12 @@ jobs:
           ls -l /dev/ublk-control
           sudo dmsetup targets
 
-      - name: Toolchain from rust-toolchain.toml
-        run: rustup toolchain install
+      - uses: ./.github/actions/tools
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build pando
-        run: cargo build --release -p pando
+        run: tools/check.sh release
 
       - name: Run the tests
         env:
@@ -85,5 +91,60 @@ jobs:
         if: always()
         with:
           name: kernel-results-${{ github.run_id }}
+          path: ${{ runner.temp }}/kernel-results
+          if-no-files-found: warn
+
+  asan:
+    name: Kernel tests under AddressSanitizer
+    if: github.event_name == 'schedule' || inputs.asan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Kernel modules
+        run: |
+          modules=(ublk_drv dm_mod loop)
+          if ! sudo modprobe -a "${modules[@]}"; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a "${modules[@]}"
+          fi
+
+      - uses: ./.github/actions/tools
+        with:
+          nightly: "true"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: asan
+
+      - name: Build pando with AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo "+$(cat tools/nightly)" build --release --locked -p pando --target x86_64-unknown-linux-gnu
+
+      - name: fio verify and the crash checks against the sanitized build
+        env:
+          PANDO: target/x86_64-unknown-linux-gnu/release/pando
+          RESULTS: ${{ runner.temp }}/kernel-results
+          DATA: /mnt/pando-tests
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:log_path=/results/asan
+        run: |
+          sudo mkdir -p "$DATA"
+          status=0
+          tests/kernel/host.sh fio-verify crash discard || status=$?
+          if compgen -G "$RESULTS/asan.*" > /dev/null; then
+            cat "$RESULTS"/asan.*
+            exit 1
+          fi
+          exit "$status"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: kernel-asan-results-${{ github.run_id }}
           path: ${{ runner.temp }}/kernel-results
           if-no-files-found: warn

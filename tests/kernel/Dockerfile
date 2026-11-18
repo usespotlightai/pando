@@ -1,11 +1,11 @@
 # The kernel tests: fio, e2fsprogs, device-mapper tools, xfstests built from a pinned tag, and
 # MinIO built from its last source release as the store: the tests write gigabytes, more than
 # the AWS emulator keeps. Build with tests/kernel as the context.
-FROM golang:1.25-trixie AS minio
+FROM golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73 AS minio
 ARG MINIO_COMMIT=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
 RUN CGO_ENABLED=0 GOBIN=/out go install github.com/minio/minio@$MINIO_COMMIT
 
-FROM debian:trixie
+FROM debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
 ARG XFSTESTS_REF=v2026.10.15
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 	fio e2fsprogs xfsprogs dmsetup util-linux kmod procps psmisc curl ca-certificates openssl \
@@ -18,10 +18,12 @@ RUN for try in 1 2 3 4 5; do \
 		rm -rf /opt/xfstests; \
 		if [ "$try" = 5 ]; then echo "xfstests $XFSTESTS_REF: clone failed 5 times" >&2; exit 1; fi; \
 		sleep $((try * 15)); \
-	done \
-	&& cd /opt/xfstests && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 \
+	done
+WORKDIR /opt/xfstests
+RUN make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 \
 	&& test -x /var/lib/xfstests/check && test -x /var/lib/xfstests/ltp/fsstress \
 	&& test -x /var/lib/xfstests/src/log-writes/replay-log
+WORKDIR /
 RUN useradd -m fsgqa && useradd -m fsgqa2 && useradd 123456-fsgqa && groupadd -f fsgqa
 COPY --from=minio /out/minio /usr/local/bin/minio
 COPY . /tests

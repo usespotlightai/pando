@@ -1,8 +1,9 @@
 //! Chunks an absorb read and hashed, made ready for the next upload, so the upload neither
 //! reads nor hashes them again.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use pando_format::Hash;
@@ -50,14 +51,14 @@ impl PreparedChunks {
     /// does nothing when the budget is spent.
     pub(crate) async fn add(&self, h: Hash, b: &[u8], dedup: Option<Arc<Dedup>>, flush: u64) {
         {
-            let m = self.chunks.lock().expect("prepared lock");
+            let m = self.chunks.lock();
             if m.0.contains_key(&h) || m.1 + b.len() > self.budget {
                 return;
             }
         }
         let chunk = prepare(dedup.as_deref(), h, Bytes::copy_from_slice(b)).await;
         let n = chunk.held_bytes();
-        let mut m = self.chunks.lock().expect("prepared lock");
+        let mut m = self.chunks.lock();
         if m.0.contains_key(&h) || m.1 + n > self.budget {
             return;
         }
@@ -67,7 +68,7 @@ impl PreparedChunks {
 
     /// Takes chunk `h` when it was prepared with `dedup`.
     pub(crate) fn take(&self, h: &Hash, dedup: Option<&Arc<Dedup>>) -> Option<Prepared> {
-        let mut m = self.chunks.lock().expect("prepared lock");
+        let mut m = self.chunks.lock();
         let s = m.0.remove(h)?;
         m.1 -= s.chunk.held_bytes();
         same(s.dedup.as_ref(), dedup).then_some(s.chunk)
@@ -75,7 +76,7 @@ impl PreparedChunks {
 
     /// Drops the chunks of flushes up to `flush`, which an upload has published.
     pub(crate) fn drop_through(&self, flush: u64) {
-        let mut m = self.chunks.lock().expect("prepared lock");
+        let mut m = self.chunks.lock();
         let (chunks, bytes) = &mut *m;
         chunks.retain(|_, s| {
             let keep = s.flush > flush;
@@ -87,6 +88,6 @@ impl PreparedChunks {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.chunks.lock().expect("prepared lock").0.len()
+        self.chunks.lock().0.len()
     }
 }

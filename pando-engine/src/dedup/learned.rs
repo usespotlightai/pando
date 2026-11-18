@@ -14,34 +14,36 @@
 //!
 //! Files, per run: `<stem>.chunks` holds the chunk bytes by slot, `<stem>.lrn` the records.
 
-use std::collections::HashMap;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use pando_format::{
     BLOCK_SIZE, BLOCKS_PER_CHUNK, BlockKey, BlockKeys, CHUNK_SIZE, ENTRY_SIZE, Entry, Hash, Loc, is_zero,
+    u64_from,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::BlockAt;
-use crate::local::{read_file, write_atomic};
+use crate::local::{read_file, take, write_atomic};
 use crate::ports::{Clock, Cpu, CpuClass, LocalFile, LocalFs, Open, on_cpu};
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"lrn2";
 /// A host forgets a learned chunk this long after it was last published.
-pub(crate) const MAX_AGE: Duration = Duration::from_secs(12 * 3600);
+pub(crate) const MAX_AGE: Duration = Duration::from_hours(12);
 /// Learned chunks a run loads at most, the most recently published first.
 const MAX_CHUNKS: usize = 16384;
 /// Chunks waiting for the writer; past it, chunks are not learned, so learning never slows an
 /// upload.
 const QUEUE: usize = 256;
 const RECORD: usize = 4 + ENTRY_SIZE + 2 + BLOCKS_PER_CHUNK * 8 + 8;
-const CHUNK: u64 = CHUNK_SIZE as u64;
+const CHUNK: u64 = u64_from(CHUNK_SIZE);
 
 /// One learned chunk: its published entry, its slot in the run's chunk file, the keys of its
 /// non-zero blocks, and when it was last published (Unix ns).
@@ -54,10 +56,12 @@ pub(crate) struct LearnedRec {
     pub(crate) used: i64,
 }
 
-fn encode(rs: &[LearnedRec]) -> Vec<u8> {
+fn encode(rs: &[LearnedRec]) -> Result<Bytes> {
+    let n = u32::try_from(rs.len())
+        .map_err(|_| Error::Corrupt(format!("{} learned chunks in one record file", rs.len())))?;
     let mut b = Vec::with_capacity(8 + rs.len() * RECORD);
     b.extend_from_slice(MAGIC);
-    b.extend_from_slice(&(rs.len() as u32).to_le_bytes());
+    b.extend_from_slice(&n.to_le_bytes());
     for r in rs {
         b.extend_from_slice(&r.slot.to_le_bytes());
         b.extend_from_slice(&r.entry.to_bytes());
@@ -67,7 +71,7 @@ fn encode(rs: &[LearnedRec]) -> Vec<u8> {
         }
         b.extend_from_slice(&r.used.to_le_bytes());
     }
-    b
+    Ok(Bytes::from(b))
 }
 
 fn decode(b: &[u8]) -> Option<Vec<LearnedRec>> {
@@ -78,31 +82,35 @@ fn decode(b: &[u8]) -> Option<Vec<LearnedRec>> {
     if records.len() != n || !tail.is_empty() {
         return None;
     }
-    let le64 = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
-    Some(
-        records
-            .iter()
-            .map(|r| {
-                let mut keys = [BlockKey::default(); BLOCKS_PER_CHUNK];
-                let at = 4 + ENTRY_SIZE + 2;
-                for (blk, k) in keys.iter_mut().enumerate() {
-                    *k = BlockKey(le64(&r[at + blk * 8..at + blk * 8 + 8]));
-                }
-                LearnedRec {
-                    slot: u32::from_le_bytes(r[..4].try_into().expect("4 bytes")),
-                    entry: Entry::from_bytes(r[4..4 + ENTRY_SIZE].try_into().expect("entry size")),
-                    mask: u16::from_le_bytes(r[4 + ENTRY_SIZE..at].try_into().expect("2 bytes")),
-                    keys,
-                    used: le64(&r[RECORD - 8..]) as i64,
-                }
+    records
+        .iter()
+        .map(|r| {
+            let mut r: &[u8] = r;
+            let slot = u32::from_le_bytes(take(&mut r)?);
+            let entry = Entry::from_bytes(&take(&mut r)?);
+            let mask = u16::from_le_bytes(take(&mut r)?);
+            let mut keys = [BlockKey::default(); BLOCKS_PER_CHUNK];
+            for k in &mut keys {
+                *k = BlockKey(u64::from_le_bytes(take(&mut r)?));
+            }
+            let used = i64::from_le_bytes(take(&mut r)?);
+            Some(LearnedRec {
+                entry,
+                slot,
+                mask,
+                keys,
+                used,
             })
-            .collect(),
-    )
+        })
+        .collect()
+}
+
+fn nanos(d: Duration) -> i64 {
+    i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
 }
 
 fn unix_nanos(t: SystemTime) -> i64 {
-    t.duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64)
+    t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, nanos)
 }
 
 fn with_suffix(stem: &Path, suffix: &str) -> PathBuf {
@@ -147,7 +155,7 @@ impl Learner {
             .await?;
         let (tx, mut rx) = mpsc::channel::<(u32, Bytes)>(QUEUE);
         let written = Arc::new(AtomicU32::new(0));
-        let w = written.clone();
+        let w = Arc::clone(&written);
         let writer = tokio::spawn(async move {
             while let Some((slot, b)) = rx.recv().await {
                 if f.write_at(vec![b], u64::from(slot) * CHUNK).await.is_err() {
@@ -178,7 +186,7 @@ impl Learner {
     /// Queues full chunk `h`, uploaded as itself at `loc`. The record counts once its upload is
     /// published.
     pub(crate) fn keep(&self, h: Hash, loc: Loc, b: &Bytes, keys: &BlockKeys) -> Option<LearnedRec> {
-        let mut s = self.state.lock().expect("learner lock");
+        let mut s = self.state.lock();
         if !s.open || s.next as usize >= MAX_CHUNKS || b.len() != CHUNK_SIZE {
             return None;
         }
@@ -206,21 +214,18 @@ impl Learner {
 
     /// Chunks not learned because the writer was behind.
     pub(crate) fn skipped(&self) -> usize {
-        self.state.lock().expect("learner lock").skipped
+        self.state.lock().skipped
     }
 
     /// Counts the records of an upload whose ref moved.
     pub(crate) fn published(&self, rs: &[LearnedRec]) {
-        self.state
-            .lock()
-            .expect("learner lock")
-            .done
-            .extend_from_slice(rs);
+        self.state.lock().done.extend_from_slice(rs);
     }
 
     async fn stop(&self) {
-        drop(self.state.lock().expect("learner lock").queue.take());
-        if let Some(w) = self.writer.lock().await.take() {
+        drop(self.state.lock().queue.take());
+        let mut writer = self.writer.lock().await;
+        if let Some(w) = writer.take() {
             let _ = w.await;
         }
     }
@@ -230,7 +235,7 @@ impl Learner {
     pub(crate) async fn save(&self) -> Result<()> {
         self.stop().await;
         let done = {
-            let mut s = self.state.lock().expect("learner lock");
+            let mut s = self.state.lock();
             if !std::mem::take(&mut s.open) {
                 return Ok(());
             }
@@ -249,18 +254,13 @@ impl Learner {
         self.fs
             .rename(&self.chunks_tmp(), &with_suffix(&self.stem, ".chunks"))
             .await?;
-        Ok(write_atomic(
-            self.fs.as_ref(),
-            &with_suffix(&self.stem, ".lrn"),
-            Bytes::from(encode(&rs)),
-        )
-        .await?)
+        Ok(write_atomic(self.fs.as_ref(), &with_suffix(&self.stem, ".lrn"), encode(&rs)?).await?)
     }
 
     /// Drops what this run kept, after an upload that never published.
     pub(crate) async fn discard(&self) {
         self.stop().await;
-        if std::mem::take(&mut self.state.lock().expect("learner lock").open) {
+        if std::mem::take(&mut self.state.lock().open) {
             let _ = self.fs.remove(&self.chunks_tmp()).await;
         }
     }
@@ -280,7 +280,7 @@ struct Index {
     checked: Vec<AtomicU8>,
     files: Vec<Arc<dyn LocalFile>>,
     stems: Vec<PathBuf>,
-    used_at: HashMap<u32, i64>,
+    used_at: BTreeMap<u32, i64>,
     /// The file of this run's own chunks, once a published upload added some; its slots below
     /// `own_written` are on disk.
     own: Option<usize>,
@@ -289,15 +289,19 @@ struct Index {
 
 impl Index {
     fn add(&mut self, file: usize, r: &LearnedRec) {
-        let slot = self.sources.len() as u32;
+        let Ok(slot) = u32::try_from(self.sources.len()) else {
+            return;
+        };
         self.slot_of.entry(r.entry.hash).or_insert(slot);
         self.sources.push(r.entry);
         self.file_of.push(file);
         self.local.push(r.slot);
         self.checked.push(AtomicU8::new(UNCHECKED));
         for (blk, k) in r.keys.iter().enumerate() {
-            if r.mask & (1 << blk) != 0 {
-                self.map.entry(*k).or_insert(BlockAt::new(u64::from(slot), blk));
+            if r.mask & (1 << blk) != 0
+                && let Some(at) = BlockAt::new(u64::from(slot), blk)
+            {
+                self.map.entry(*k).or_insert(at);
             }
         }
     }
@@ -305,7 +309,7 @@ impl Index {
     fn at(&self, slot: u32) -> (Arc<dyn LocalFile>, u64) {
         let s = slot as usize;
         (
-            self.files[self.file_of[s]].clone(),
+            Arc::clone(&self.files[self.file_of[s]]),
             u64::from(self.local[s]) * CHUNK,
         )
     }
@@ -341,7 +345,10 @@ impl LearnedIndex {
         let mut stems = Vec::new();
         for de in &entries {
             let p = dir.join(&de.name);
-            if de.name.ends_with(".tmp") {
+            if Path::new(&de.name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+            {
                 if now.duration_since(de.modified).is_ok_and(|age| age > MAX_AGE) {
                     let _ = fs.remove(&p).await;
                 }
@@ -351,6 +358,7 @@ impl LearnedIndex {
         }
         stems.sort_unstable_by(|a, b| b.cmp(a));
         let now_ns = unix_nanos(now);
+        let max_age = nanos(MAX_AGE);
         let mut all: Vec<(usize, LearnedRec)> = Vec::new();
         for (i, stem) in stems.iter().enumerate() {
             let Some(b) = read_file(fs.as_ref(), &with_suffix(stem, ".lrn")).await? else {
@@ -363,7 +371,7 @@ impl LearnedIndex {
             };
             let fresh = rs
                 .into_iter()
-                .filter(|r| now_ns.saturating_sub(r.used) <= MAX_AGE.as_nanos() as i64);
+                .filter(|r| now_ns.saturating_sub(r.used) <= max_age);
             all.extend(fresh.map(|r| (i, r)));
         }
         all.sort_by_key(|(_, r)| std::cmp::Reverse(r.used));
@@ -398,11 +406,11 @@ impl LearnedIndex {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.index.read().expect("learned lock").sources.len()
+        self.index.read().sources.len()
     }
 
-    pub(crate) fn lookup(&self, k: &BlockKey) -> Option<BlockAt> {
-        self.index.read().expect("learned lock").map.get(k).copied()
+    pub(crate) fn lookup(&self, k: BlockKey) -> Option<BlockAt> {
+        self.index.read().map.get(&k).copied()
     }
 
     /// Makes chunks this run published sources for its later uploads.
@@ -410,7 +418,7 @@ impl LearnedIndex {
         if rs.is_empty() {
             return;
         }
-        let own = self.index.read().expect("learned lock").own;
+        let own = self.index.read().own;
         let opened = match own {
             Some(_) => None,
             None => match self.fs.open(&l.chunks_tmp(), Open::Read).await {
@@ -418,7 +426,7 @@ impl LearnedIndex {
                 Err(_) => return,
             },
         };
-        let mut ix = self.index.write().expect("learned lock");
+        let mut ix = self.index.write();
         let own = match (ix.own, opened) {
             (Some(o), _) => o,
             (None, Some(f)) => {
@@ -426,7 +434,7 @@ impl LearnedIndex {
                 ix.files.push(f);
                 ix.stems.push(l.stem.clone());
                 ix.own = Some(o);
-                ix.own_written = Some(l.written.clone());
+                ix.own_written = Some(Arc::clone(&l.written));
                 o
             }
             (None, None) => return,
@@ -438,7 +446,7 @@ impl LearnedIndex {
 
     /// Adds the learned slots behind `es` to `out`, except this run's own.
     pub(crate) fn slots_of(&self, out: &mut Vec<u32>, es: &[Entry]) {
-        let ix = self.index.read().expect("learned lock");
+        let ix = self.index.read();
         for e in es {
             if let Some(&slot) = ix.slot_of.get(&e.hash)
                 && ix.sources[slot as usize] == *e
@@ -455,7 +463,7 @@ impl LearnedIndex {
             return;
         }
         let now = unix_nanos(self.clock.wall());
-        let mut ix = self.index.write().expect("learned lock");
+        let mut ix = self.index.write();
         for s in slots {
             ix.used_at.insert(*s, now);
         }
@@ -465,9 +473,9 @@ impl LearnedIndex {
     /// many records moved.
     pub(crate) async fn save_uses(&self) -> Result<usize> {
         let by_file = {
-            let mut ix = self.index.write().expect("learned lock");
+            let mut ix = self.index.write();
             let uses = std::mem::take(&mut ix.used_at);
-            let mut by_file: HashMap<usize, HashMap<u32, i64>> = HashMap::new();
+            let mut by_file: BTreeMap<usize, HashMap<u32, i64>> = BTreeMap::new();
             for (slot, t) in uses {
                 let s = slot as usize;
                 by_file.entry(ix.file_of[s]).or_default().insert(ix.local[s], t);
@@ -496,7 +504,7 @@ impl LearnedIndex {
                     n += 1;
                 }
             }
-            write_atomic(self.fs.as_ref(), &path, Bytes::from(encode(&rs))).await?;
+            write_atomic(self.fs.as_ref(), &path, encode(&rs)?).await?;
         }
         Ok(n)
     }
@@ -504,7 +512,7 @@ impl LearnedIndex {
     /// The entry of learned chunk `slot` once its bytes on this host match its hash.
     pub(crate) async fn source(&self, slot: u32) -> Option<Entry> {
         let (file, off, entry) = {
-            let ix = self.index.read().expect("learned lock");
+            let ix = self.index.read();
             let s = slot as usize;
             if Some(ix.file_of[s]) == ix.own
                 && ix.local[s] >= ix.own_written.as_ref().map_or(0, |w| w.load(Ordering::Acquire))
@@ -528,15 +536,17 @@ impl LearnedIndex {
             }
             _ => false,
         };
-        let ix = self.index.read().expect("learned lock");
+        let ix = self.index.read();
         ix.checked[slot as usize].store(if good { GOOD } else { BAD }, Ordering::Release);
         good.then_some(entry)
     }
 
     /// `n` blocks of learned chunk `slot` from block `blk` on.
     pub(crate) async fn read(&self, slot: u32, blk: usize, n: usize) -> Result<Bytes> {
-        let (f, off) = self.index.read().expect("learned lock").at(slot);
-        let b = f.read_at(n * BLOCK_SIZE, off + (blk * BLOCK_SIZE) as u64).await?;
+        let (f, off) = self.index.read().at(slot);
+        let b = f
+            .read_at(n * BLOCK_SIZE, off + u64_from(blk * BLOCK_SIZE))
+            .await?;
         if b.len() != n * BLOCK_SIZE {
             return Err(Error::BeyondEnd);
         }
@@ -560,8 +570,8 @@ mod tests {
             keys: [BlockKey(9); BLOCKS_PER_CHUNK],
             used: 1_700_000_000_000_000_000,
         };
-        assert_eq!(decode(&encode(&[r, r])).unwrap(), vec![r, r]);
-        assert!(decode(&encode(&[r])[..20]).is_none());
+        assert_eq!(decode(&encode(&[r, r]).unwrap()).unwrap(), vec![r, r]);
+        assert!(decode(&encode(&[r]).unwrap()[..20]).is_none());
         assert!(decode(b"lrn1\0\0\0\0").is_none());
     }
 }

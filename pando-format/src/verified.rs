@@ -14,6 +14,7 @@ pub struct Verified {
 }
 
 impl Verified {
+    /// `bytes` as verified, when they hash to `hash`.
     pub fn check(hash: Hash, bytes: Bytes) -> Result<Verified, IntegrityError> {
         if Hash::of(&bytes) == hash {
             Ok(Verified { hash, bytes })
@@ -30,14 +31,17 @@ impl Verified {
         }
     }
 
+    /// The hash of the bytes.
     pub fn hash(&self) -> Hash {
         self.hash
     }
 
+    /// The verified bytes.
     pub fn bytes(&self) -> &Bytes {
         &self.bytes
     }
 
+    /// The verified bytes, giving up the proof.
     pub fn into_bytes(self) -> Bytes {
         self.bytes
     }

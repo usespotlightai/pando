@@ -2,7 +2,7 @@
 //! the background it admits few, so the workload on the branch keeps the CPU; while someone
 //! waits for a checkpoint it admits many, because then the wait is the workload.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use tokio::sync::Notify;
 
@@ -30,8 +30,8 @@ pub(crate) struct Pass<'a>(&'a Gate);
 pub(crate) struct Hurry<'a>(&'a Gate);
 
 impl Gate {
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().expect("gate lock")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, State> {
+        self.state.lock()
     }
 
     pub(crate) async fn enter(&self) -> Pass<'_> {
@@ -88,7 +88,7 @@ mod tests {
         let (now, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let mut tasks = Vec::new();
         for _ in 0..32 {
-            let (g, now, peak) = (g.clone(), now.clone(), peak.clone());
+            let (g, now, peak) = (Arc::clone(&g), Arc::clone(&now), Arc::clone(&peak));
             tasks.push(tokio::spawn(async move {
                 let _p = g.enter().await;
                 peak.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
@@ -105,8 +105,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_gate_admits_few_in_the_background_and_many_in_a_hurry() {
         let g = Arc::new(Gate::default());
-        assert_eq!(peak(g.clone()).await, BACKGROUND_PARALLEL);
+        assert_eq!(peak(Arc::clone(&g)).await, BACKGROUND_PARALLEL);
         let _h = g.hurry();
-        assert_eq!(peak(g.clone()).await, HURRY_PARALLEL);
+        assert_eq!(peak(Arc::clone(&g)).await, HURRY_PARALLEL);
     }
 }

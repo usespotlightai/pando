@@ -8,8 +8,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 PANDO=${PANDO:?set PANDO to the pando binary}
 RESULTS=${RESULTS:-$PWD/kernel-results}
 mkdir -p "$RESULTS"
-[ $# -gt 0 ] || set -- fio-verify crash discard
+[[ $# -gt 0 ]] || set -- fio-verify crash discard
 docker build -q -t pando-kernel-tests "$here" >/dev/null
-data=(); [ -n "${DATA:-}" ] && data=(-v "$DATA":/data)
-docker run --rm --privileged -v /dev:/dev "${data[@]}" -v "$(readlink -f "$PANDO")":/pando:ro -v "$RESULTS":/results \
-	-e MODES -e TESTS -e DEVS pando-kernel-tests "$@"
+data=()
+[[ -n ${DATA:-} ]] && data=(-v "$DATA":/data)
+pando=$(readlink -f "$PANDO")
+docker run --rm --privileged -v /dev:/dev "${data[@]}" -v "$pando":/pando:ro -v "$RESULTS":/results \
+	-e MODES -e TESTS -e DEVS -e ASAN_OPTIONS pando-kernel-tests "$@"

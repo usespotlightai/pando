@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use pando_format::CHUNK_SIZE;
+use pando_format::{CHUNK_SIZE, u64_from, usize_from};
 
 use super::adopt::{adopt_leftovers, rejoin};
 use super::*;
@@ -60,7 +60,7 @@ impl Host {
 
     async fn open(&self) -> Arc<Volume> {
         Arc::new(
-            Volume::open(&self.ports, self.cache.clone(), Path::new("/v"), "main")
+            Volume::open(&self.ports, Arc::clone(&self.cache), Path::new("/v"), "main")
                 .await
                 .unwrap(),
         )
@@ -68,7 +68,7 @@ impl Host {
 
     async fn serve(&self, v: &Arc<Volume>) {
         self.devices
-            .add_block(Path::new(FRONT), Arc::new(VolBlock(v.clone())));
+            .add_block(Path::new(FRONT), Arc::new(VolBlock(Arc::clone(v))));
         if self.devices.live_target(DM).await.unwrap().is_none() {
             self.devices.create(DM, Path::new(FRONT), SIZE).await.unwrap();
         }
@@ -76,7 +76,7 @@ impl Host {
 
     async fn write(&self, at_chunk: u64, fill: u8) {
         self.devices
-            .write(DM, &vec![fill; CHUNK_SIZE + 100], at_chunk * CHUNK_SIZE as u64)
+            .write(DM, &vec![fill; CHUNK_SIZE + 100], at_chunk * u64_from(CHUNK_SIZE))
             .await
             .unwrap();
     }
@@ -87,7 +87,7 @@ impl Host {
         let v = Volume::open(&self.ports, c, Path::new("/fresh-v"), "main")
             .await
             .unwrap();
-        let mut b = vec![0; SIZE as usize];
+        let mut b = vec![0; usize_from(SIZE)];
         v.read_at(&mut b, 0).await.unwrap();
         v.close().await;
         let _ = self.ports.fs.remove(Path::new("/fresh-v/state/main")).await;
@@ -96,9 +96,9 @@ impl Host {
 }
 
 fn expect(writes: &[(u64, u8)]) -> Vec<u8> {
-    let mut b = vec![0; SIZE as usize];
+    let mut b = vec![0; usize_from(SIZE)];
     for &(at, fill) in writes {
-        let off = at as usize * CHUNK_SIZE;
+        let off = usize_from(at) * CHUNK_SIZE;
         b[off..off + CHUNK_SIZE + 100].fill(fill);
     }
     b
@@ -126,7 +126,7 @@ async fn a_handoff_moves_the_device_to_the_image_and_detach_publishes_its_writes
     host.write(9, 0x99).await;
     host.write(1, 0x12).await;
     let want = expect(&[(1, 0x11), (5, 0x55), (9, 0x99), (1, 0x12)]);
-    let mut got = vec![0; SIZE as usize];
+    let mut got = vec![0; usize_from(SIZE)];
     host.devices.read(DM, &mut got, 0).await.unwrap();
     assert_eq!(got, want);
 

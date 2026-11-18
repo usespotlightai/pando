@@ -2,30 +2,37 @@
 
 use crate::{Hash, SegId};
 
+/// The prefix, before a `/`, of the keys of segments and their indexes.
 pub const SEGMENTS: &str = "segments";
+/// The prefix, before a `/`, of the keys of refs.
 pub const REFS: &str = "refs";
+/// The prefix, before a `/`, of the keys of change lists.
 pub const CHANGES: &str = "changes";
-pub const HINTS: &str = "hints";
+const HINTS: &str = "hints";
 /// A key no object has; a GET of it opens connections before a fetch needs them.
 pub const WARM: &str = "warm";
 
+/// The key of segment `id`'s data.
 pub fn segment(id: SegId) -> String {
     format!("{SEGMENTS}/{id}")
 }
 
+/// The key of segment `id`'s [`SegmentIndex`](crate::SegmentIndex).
 pub fn segment_index(id: SegId) -> String {
     format!("{SEGMENTS}/{id}.idx")
 }
 
+/// The key of the [`Ref`](crate::Ref) of branch `name`.
 pub fn reference(name: &str) -> String {
     format!("{REFS}/{name}")
 }
 
+/// The key of the [`ChangeList`](crate::ChangeList) from root `from` to root `root`.
 pub fn change_list(root: Hash, from: Hash) -> String {
     format!("{CHANGES}/{root}.{from}")
 }
 
-pub fn hints(key: &str) -> String {
+fn hints(key: &str) -> String {
     format!("{HINTS}/{key}")
 }
 

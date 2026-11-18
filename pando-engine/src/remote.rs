@@ -1,22 +1,28 @@
 //! The store as Pando sees it: segments, refs, change lists and hints over [`Store`].
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use pando_format::{Hash, Recording, Ref, SegId, SegmentIndex, keys};
+use pando_format::{Hash, Recording, Ref, SegId, SegmentIndex, keys, u64_from};
 
 use crate::ports::{Store, StoreError, Version};
 use crate::{Error, Result};
 
+/// Counts of the store requests one [`Remote`] made since it was opened.
 #[derive(Debug, Default)]
 pub struct RemoteStats {
+    /// Successful GETs, ranged or whole.
     pub gets: AtomicU64,
+    /// The body bytes those GETs returned.
     pub get_bytes: AtomicU64,
+    /// Objects written, counting a segment's data and index apart.
     pub puts: AtomicU64,
+    /// The body bytes of those writes.
     pub put_bytes: AtomicU64,
+    /// Ref updates that took effect.
     pub ref_puts: AtomicU64,
 }
 
@@ -55,12 +61,12 @@ impl Remote {
 
     fn got(&self, n: usize) {
         self.stats.gets.fetch_add(1, Ordering::Relaxed);
-        self.stats.get_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.stats.get_bytes.fetch_add(u64_from(n), Ordering::Relaxed);
     }
 
     fn put_done(&self, n: usize) {
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
-        self.stats.put_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.stats.put_bytes.fetch_add(u64_from(n), Ordering::Relaxed);
     }
 
     /// Stores a segment and its index; neither may exist yet.
@@ -216,9 +222,9 @@ impl Remote {
     }
 
     /// Every stored segment. A segment whose data is missing shows its index.
-    pub(crate) async fn list_segments(&self) -> Result<HashMap<SegId, SegmentInfo>> {
+    pub(crate) async fn list_segments(&self) -> Result<BTreeMap<SegId, SegmentInfo>> {
         let prefix = format!("{}/", keys::SEGMENTS);
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         for o in self.store.list(keys::SEGMENTS).await? {
             let Some(name) = o.key.strip_prefix(&prefix) else {
                 continue;
@@ -230,10 +236,13 @@ impl Remote {
                 size: o.size,
                 modified: o.modified,
             };
-            if !name.ends_with(".idx") {
-                out.insert(id, info);
-            } else {
+            if std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("idx"))
+            {
                 out.entry(id).or_insert(info);
+            } else {
+                out.insert(id, info);
             }
         }
         Ok(out)

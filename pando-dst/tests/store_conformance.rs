@@ -1,3 +1,5 @@
+//! The store conformance suite against each [`Store`](pando_engine::ports::Store) adapter.
+
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
@@ -15,8 +17,8 @@ async fn s3_adapter_conforms_over_an_in_memory_backend() {
     store_conformance::check(&S3Store::over(Arc::new(InMemory::new()), "prefix/a")).await;
 }
 
-/// Runs against a real store named by S3_BUCKET, S3_REGION, S3_ENDPOINT, S3_ACCESS_KEY_ID and
-/// S3_SECRET_ACCESS_KEY, under a fresh prefix it removes afterwards.
+/// Runs against a real store named by `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID` and
+/// `S3_SECRET_ACCESS_KEY`, under a fresh prefix it removes afterwards.
 #[tokio::test]
 #[ignore = "needs S3_* variables for a real store"]
 async fn s3_store_conforms() {

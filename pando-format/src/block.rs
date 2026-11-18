@@ -4,6 +4,7 @@ use xxhash_rust::xxh3::xxh3_64;
 pub const CHUNK_SIZE: usize = 64 << 10;
 /// The file system block size. Recipes and block keys work in blocks of this size.
 pub const BLOCK_SIZE: usize = 4 << 10;
+/// The number of blocks in a chunk, and so the length of [`BlockKeys`].
 pub const BLOCKS_PER_CHUNK: usize = CHUNK_SIZE / BLOCK_SIZE;
 
 /// A fast, non-cryptographic fingerprint (XXH3-64) of a block. It only finds candidates:
@@ -12,10 +13,12 @@ pub const BLOCKS_PER_CHUNK: usize = CHUNK_SIZE / BLOCK_SIZE;
 pub struct BlockKey(pub u64);
 
 impl BlockKey {
+    /// The key of `block`: its XXH3-64.
     pub fn of(block: &[u8]) -> BlockKey {
         BlockKey(xxh3_64(block))
     }
 
+    /// The key of a block of [`BLOCK_SIZE`] zero bytes.
     pub fn zero() -> BlockKey {
         BlockKey::of(&[0; BLOCK_SIZE])
     }
@@ -26,6 +29,8 @@ impl BlockKey {
 pub struct BlockKeys(pub [BlockKey; BLOCKS_PER_CHUNK]);
 
 impl BlockKeys {
+    /// The keys of the blocks of `chunk`, in block order.
+    ///
     /// # Panics
     /// When `chunk` is not [`CHUNK_SIZE`] bytes.
     pub fn of(chunk: &[u8]) -> BlockKeys {
@@ -38,6 +43,7 @@ impl BlockKeys {
     }
 }
 
+/// Whether every byte of `b` is zero; true for an empty slice.
 pub fn is_zero(b: &[u8]) -> bool {
     b.iter().all(|&x| x == 0)
 }
