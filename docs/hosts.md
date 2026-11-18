@@ -32,11 +32,13 @@ branch again.
 **Drain (SIGTERM or SIGINT).** The daemon stops serving control requests and publishes what
 the branch holds, snapshotting a handed-off image first, while the device keeps serving. It waits
 at most `--drain-wait` (60 s) for the store to hold every write acknowledged before the signal.
-A second signal, a failed upload or the deadline ends the wait early; the daemon then commits the
-writes durably on this host instead. It exits with status 75 and leaves the device in place: the
-kernel holds its I/O until the next daemon takes over, so a mounted file system waits rather than
-fails. If even the local commit fails, it exits with status 1, and the next daemon replays the
-journal. `systemctl stop` alone leaves the device waiting; `detach` is what ends a branch.
+A second signal, a failed upload or the deadline ends the wait early. Either way the daemon then
+commits every write acknowledged so far durably on this host. It exits with status 75 and leaves
+the device in place: the kernel holds its I/O until the next daemon takes over, so a mounted file
+system waits rather than fails. If even the local commit fails, it exits with status 1, and the
+next daemon replays the journal. A signal that comes before the device serves ends the daemon at
+once, as a crash would. `systemctl stop` alone leaves the device waiting; `detach` is what ends a
+branch.
 
 **Upgrade.** Replace the binary, then run `systemctl restart pando-attach@<name>` for each
 branch. The old daemon drains, and the new binary takes the device over with `--recover=auto`.

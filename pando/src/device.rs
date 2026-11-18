@@ -201,7 +201,6 @@ mod linux {
         if a.images.is_some() && a.dm.is_none() {
             bail!("--images needs --dm");
         }
-        let mut signals = Signals::new()?;
         let recover = takes_over(&a, id).await?;
         let t0 = Instant::now();
         let switch: Arc<dyn DeviceSwitch> = Arc::new(DmSwitch::new());
@@ -244,6 +243,7 @@ mod linux {
                 ""
             }
         );
+        let mut signals = Signals::new()?;
         notify("READY=1");
         let (stop, stopping) = watch::channel(false);
         let control = match listen(id) {
@@ -359,7 +359,7 @@ mod linux {
     }
 
     /// Publishes what the branch holds while the device serves, for at most `wait` or until a
-    /// second signal; then, or if publishing fails, it makes the branch durable on this host.
+    /// second signal, then makes every write acknowledged so far durable on this host.
     async fn drain(att: &Attachment, name: &str, wait: Duration, signals: &mut Signals) -> Result<()> {
         let t0 = Instant::now();
         println!("draining {name}: publishing for at most {wait:.0?}");
@@ -374,42 +374,44 @@ mod linux {
             },
             () = signals.next() => false,
         };
+        att.volume()
+            .flush()
+            .await
+            .with_context(|| format!("drain {name}: commit the writes locally"))?;
         if published {
             println!(
                 "drained {name} in {:.1?}: the store holds every write acknowledged before the signal",
                 t0.elapsed()
             );
-            return Ok(());
+        } else {
+            println!(
+                "drained {name} in {:.1?}: the writes are on this host; `attach --recover` publishes them",
+                t0.elapsed()
+            );
         }
-        att.volume()
-            .flush()
-            .await
-            .with_context(|| format!("drain {name}: commit the writes locally"))?;
-        println!(
-            "drained {name} in {:.1?}: the writes are on this host; `attach --recover` publishes them",
-            t0.elapsed()
-        );
         Ok(())
     }
 
     /// Tells systemd, when it started this daemon with `Type=notify`, how the daemon stands.
     fn notify(state: &str) {
+        if let Some(to) = std::env::var_os("NOTIFY_SOCKET")
+            && let Err(e) = notify_to(&to, state)
+        {
+            eprintln!("tell systemd {state}: {e}");
+        }
+    }
+
+    /// Sends `state` to the systemd notify socket `to`: a path, or an abstract name after `@`.
+    fn notify_to(to: &std::ffi::OsStr, state: &str) -> std::io::Result<()> {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::net::{SocketAddr, UnixDatagram};
-        let Some(to) = std::env::var_os("NOTIFY_SOCKET") else {
-            return;
+        let addr = match to.as_bytes().strip_prefix(b"@") {
+            Some(name) => SocketAddr::from_abstract_name(name)?,
+            None => SocketAddr::from_pathname(to)?,
         };
-        let sent = UnixDatagram::unbound().and_then(|s| {
-            let addr = match to.as_bytes().strip_prefix(b"@") {
-                Some(name) => SocketAddr::from_abstract_name(name)?,
-                None => SocketAddr::from_pathname(&to)?,
-            };
-            s.send_to_addr(state.as_bytes(), &addr)
-        });
-        if let Err(e) = sent {
-            eprintln!("tell systemd {state}: {e}");
-        }
+        UnixDatagram::unbound()?.send_to_addr(state.as_bytes(), &addr)?;
+        Ok(())
     }
 
     /// Warms `att`, then, with `hand_off`, moves its device to a local image.
@@ -624,6 +626,26 @@ mod linux {
             assert!(parse_request("grow\n").is_err());
             assert!(parse_request("shrink 4096\n").is_err());
             assert!(parse_request("grow -1\n").is_err());
+        }
+
+        #[test]
+        fn systemd_hears_on_a_path_socket_and_an_abstract_one() {
+            use std::os::linux::net::SocketAddrExt;
+            use std::os::unix::net::{SocketAddr, UnixDatagram};
+            let tag = format!("pando-notify-{}", std::process::id());
+            let path = std::env::temp_dir().join(&tag);
+            let _ = std::fs::remove_file(&path);
+            let at_path = UnixDatagram::bind(&path).unwrap();
+            let abstract_addr = SocketAddr::from_abstract_name(tag.as_bytes()).unwrap();
+            let at_name = UnixDatagram::bind_addr(&abstract_addr).unwrap();
+            let mut buf = [0; 64];
+            notify_to(path.as_os_str(), "READY=1").unwrap();
+            let n = at_path.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"READY=1");
+            notify_to(format!("@{tag}").as_ref(), "STOPPING=1").unwrap();
+            let n = at_name.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"STOPPING=1");
+            std::fs::remove_file(&path).unwrap();
         }
 
         #[test]
