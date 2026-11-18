@@ -178,6 +178,9 @@ struct Mem {
     track: Option<HashSet<u64>>,
     /// Flushes committed so far.
     flush_seq: u64,
+    /// The journal generation of a commit whose state write failed: the state on disk still
+    /// names an older root, and the journal below this generation is still needed.
+    unpersisted: Option<u64>,
     /// Per file, the last flush that recorded a chunk as a reference into it.
     ref_seq: HashMap<PathBuf, u64>,
 }
@@ -197,6 +200,7 @@ impl Mem {
             dirty_ref: BTreeMap::new(),
             track: None,
             flush_seq: 0,
+            unpersisted: None,
             ref_seq: HashMap::new(),
         }
     }
@@ -1436,7 +1440,8 @@ impl Inner {
     }
 
     /// Commits the dirty set whenever it passes [`DIRTY_COMMIT`], until the volume stops. A
-    /// failed commit leaves the writes dirty, for the next flush to report.
+    /// commit that fails leaves its writes dirty, or its state unwritten, for the next flush to
+    /// repeat and report.
     async fn committer(self: Arc<Self>) {
         let mut stop = self.stop.subscribe();
         loop {
@@ -1492,11 +1497,23 @@ impl Inner {
         for s in &self.stripes {
             guards.push(s.write().await);
         }
-        {
+        let unpersisted = {
             let m = self.mem.lock();
-            if m.dirty.is_empty() || m.dirty.bytes < min {
+            if !m.dirty.is_empty() && m.dirty.bytes >= min {
+                None
+            } else if let Some(g) = m.unpersisted {
+                Some((g, m.flush_seq, m.size))
+            } else {
                 return Ok(m.flush_seq);
             }
+        };
+        if let Some((generation, seq, size)) = unpersisted {
+            drop(guards);
+            self.persist_commit(generation).await?;
+            let chunks = Vec::new();
+            self.queue_flush(log::Flushed { seq, size, chunks }, false);
+            self.kick.notify_one();
+            return Ok(seq);
         }
         let generation = self.journal.rotate().await?;
         let (snapshot, refs, tree, root) = {
@@ -1515,7 +1532,7 @@ impl Inner {
         drop(guards);
         match self.commit_snapshot(&tree, &snapshot, &refs, &root).await {
             Ok((new_root, updates)) => {
-                let (seq, size) = {
+                let (seq, size, after_unpersisted) = {
                     let mut m = self.mem.lock();
                     m.root = new_root;
                     m.flushing = None;
@@ -1525,16 +1542,15 @@ impl Inner {
                     for r in refs.into_values() {
                         m.ref_seq.insert(r.path, seq);
                     }
-                    (seq, m.size)
+                    (seq, m.size, m.unpersisted.replace(generation).is_some())
                 };
                 self.committed(seq);
-                self.persist().await?;
-                self.journal.drop_below(generation).await;
+                self.persist_commit(generation).await?;
                 let chunks = updates
                     .into_iter()
                     .map(|(idx, e)| (idx, (!e.is_empty()).then(|| (e.hash, snapshot[&idx].clone()))))
                     .collect();
-                self.queue_flush(log::Flushed { seq, size, chunks }, min == 0);
+                self.queue_flush(log::Flushed { seq, size, chunks }, min == 0 && !after_unpersisted);
                 if min == 0 {
                     self.kick.notify_one();
                 }
@@ -1554,6 +1570,15 @@ impl Inner {
                 Err(e)
             }
         }
+    }
+
+    /// Writes the state of a commit at journal generation `generation`, then drops the journal
+    /// below it. Until the state write succeeds, every later commit and flush repeats it first.
+    async fn persist_commit(&self, generation: u64) -> Result<()> {
+        self.persist().await?;
+        self.mem.lock().unpersisted = None;
+        self.journal.drop_below(generation).await;
+        Ok(())
     }
 
     async fn commit_snapshot(
@@ -2024,6 +2049,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read(&other, 0, w.len()).await, w, "the upload has every write");
+        other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_repeats_the_state_write_a_commit_could_not_make() {
+        let (ports, _, fs) = sim::ports(10);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        let state = Path::new("/a/state");
+        fs.remove(state).await.unwrap();
+        fs.open(state, Open::Create).await.unwrap();
+        v.write_at(&data(2, 100), 0).await.unwrap();
+        assert!(v.flush().await.is_err());
+        assert!(v.flush().await.is_err(), "the state is still unwritten");
+        fs.remove(state).await.unwrap();
+        fs.create_dir_all(state).await.unwrap();
+        v.flush().await.unwrap();
+        assert_eq!(v.inner.mem.lock().unpersisted, None);
+        v.checkpoint().await.unwrap();
+        v.close().await;
+        let other = Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "main")
+            .await
+            .unwrap();
+        assert_eq!(read(&other, 0, 100).await, data(2, 100));
         other.close().await;
     }
 

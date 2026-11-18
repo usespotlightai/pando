@@ -29,8 +29,8 @@ pub fn io_flusher() -> std::io::Result<()> {
 /// returns its memory to the kernel at once. By default glibc raises that threshold to the size
 /// of each such buffer freed, up to 32 MiB, and then keeps large buffers in its per-thread
 /// arenas, which hold on to freed memory; a daemon whose large buffers come and go as data is
-/// written would hold more memory the more it writes. Call it before starting threads. Does
-/// nothing without glibc.
+/// written would hold more memory the more it writes. For a daemon that serves a device; call
+/// it before starting threads. Does nothing without glibc.
 pub fn tune_malloc() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     linux::tune_malloc();
