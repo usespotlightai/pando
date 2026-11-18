@@ -56,6 +56,11 @@ impl Request {
     fn has_data(&self) -> bool {
         matches!(self.op(), OP_READ | OP_WRITE)
     }
+
+    /// Whether the queue can serve it: data fits a tag's buffer and the length fits the result.
+    fn fits(&self) -> bool {
+        (!self.has_data() || self.len <= MAX_IO) && i32::try_from(self.len).is_ok()
+    }
 }
 
 /// The data buffer of one tag, handed to the engine runtime while the request runs.
@@ -93,9 +98,10 @@ async fn handle(vol: &Volume, r: Request, buf: Option<&mut [u8]>) -> i32 {
     result(done, done_len(r))
 }
 
-/// The result that completes `r`: its length, which [`MAX_IO`] bounds for a request with data.
+/// The result that completes `r`: its length. The queue fails a request that does not
+/// [`Request::fits`] before it runs, so the fallback is never reported.
 fn done_len(r: Request) -> i32 {
-    i32::try_from(r.len).unwrap_or(i32::MAX)
+    i32::try_from(r.len).unwrap_or(-libc::EINVAL)
 }
 
 fn result(done: pando_engine::Result<()>, ok: i32) -> i32 {
@@ -323,7 +329,7 @@ impl Queue {
                     }
                     continue;
                 }
-                let Ok(tag) = u16::try_from(user) else {
+                let Some(tag) = u16::try_from(user).ok().filter(|&t| t < self.depth) else {
                     failed.get_or_insert_with(|| {
                         io::Error::other(format!("ublk queue {}: completion of unknown tag {user}", self.q))
                     });
@@ -347,7 +353,7 @@ impl Queue {
                     len: ((head >> 32) as usize) << 9,
                     off: descs.read_u64(at + 8) << 9,
                 };
-                if req.has_data() && req.len > MAX_IO {
+                if !req.fits() {
                     if let Err(e) = r.io_cmd(IO_COMMIT_AND_FETCH, tag, -libc::EINVAL) {
                         failed.get_or_insert(e);
                     }
@@ -393,5 +399,20 @@ mod tests {
     fn descriptor_areas_are_page_aligned() {
         assert_eq!(round_up(64 * DESC_LEN, 4096), 4096);
         assert_eq!(round_up(MAX_QUEUE_DEPTH * DESC_LEN, 4096), 24 * 4096);
+    }
+
+    #[test]
+    fn requests_fit_a_buffer_and_a_result() {
+        let r = |op, len| Request {
+            op_flags: op,
+            off: 0,
+            len,
+        };
+        assert!(r(OP_READ, MAX_IO).fits());
+        assert!(!r(OP_WRITE, MAX_IO + 512).fits());
+        assert!(r(OP_DISCARD, 1 << 30).fits());
+        assert!(!r(OP_DISCARD, (u32::MAX as usize) << 9).fits());
+        assert!(!r(OP_WRITE_ZEROES, 1 << 31).fits());
+        assert!(r(OP_FLUSH, 0).fits());
     }
 }

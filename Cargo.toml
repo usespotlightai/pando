@@ -112,4 +112,3 @@ future_not_send = "warn"
 [profile.release]
 debug = "line-tables-only"
 overflow-checks = true
-panic = "abort"
