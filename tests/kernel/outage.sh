@@ -46,6 +46,7 @@ check() {
 	*)
 		say "$what: FAILED: $got"
 		fails=$((fails + 1))
+		[[ -n $pid ]] && ps -L -o tid=,stat=,pcpu=,wchan:32=,comm= -p "$pid" >>"$R/$TEST.threads" 2>&1
 		;;
 	esac
 }
@@ -166,5 +167,8 @@ else
 	check "a fresh host reads every write" "attach: $(tail -1 "$W/f.log" || true)"
 fi
 
+if [[ $fails != 0 ]]; then
+	for f in "$W"/*.log; do cp "$f" "$R/$TEST.$(basename "$f")"; done
+fi
 if [[ $fails = 0 ]]; then say "RESULT pass"; else say "RESULT FAIL ($fails checks)"; fi
 [[ $fails = 0 ]]
