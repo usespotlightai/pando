@@ -168,6 +168,8 @@ if memory_cgroup "$cg"; then
 	mount -o noatime "$dev" "$W/mnt"
 	if timeout 300 dd if=/dev/urandom of="$W/mnt/big" bs=1M count=1536 conv=fsync status=none; then
 		pressure=ok
+	elif grep -q "^oom_kill [1-9]" "$cg/memory.events"; then
+		pressure="the daemon was OOM-killed: its anonymous memory grows with the data written"
 	else
 		pressure="the writes did not complete in 300 s"
 	fi
@@ -218,5 +220,29 @@ fi
 
 k=$(kernel_errors "$TEST start $$")
 check_is "no kernel I/O errors" 0 "$k"
+
+# Last, as the file system it leaves behind fails its I/O: a signal ends the daemon under a
+# mounted ext4 whose writes were never synced, and they still reach the branch.
+pando "$W/cache-s" init s "$SIZE"
+up s cache-s s || say "attach for the signal FAILED: $(tail -3 "$W/s.log" || true)"
+mkfs.ext4 -q -F "$dev"
+mount -o noatime "$dev" "$W/mnt"
+head -c $((64 << 20)) /dev/urandom >"$W/mnt/late"
+want=$(sha256sum "$W/mnt/late")
+want=${want%% *}
+kill -TERM "$pid"
+exited "$pid" 120 || kill -9 "$pid"
+wait "$pid"
+pid=
+umount -l "$W/mnt"
+synced=$(grep -c "^synced 1 file systems" "$W/s.log" || true)
+check_is "a signal syncs the file system on the loop device" 1 "$synced"
+up s cache-t t || say "re-attach after the signal FAILED: $(tail -3 "$W/t.log" || true)"
+mount -o ro,noatime "$dev" "$W/mnt"
+got=$(sha256sum "$W/mnt/late" 2>/dev/null || true)
+check_is "writes made before the signal reach the branch" "$want" "${got%% *}"
+umount "$W/mnt"
+down t || say "detach after the signal FAILED: $(tail -1 "$W/detach.log" || true)"
+
 if [[ $fails = 0 ]]; then say "RESULT pass"; else say "RESULT FAIL ($fails)"; fi
 [[ $fails = 0 ]]

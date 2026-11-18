@@ -398,8 +398,12 @@ enum Exit {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let flushers = matches!(cli.command, Command::Attach(_) | Command::Serve);
-    if flushers {
-        let _ = pando_host::io_flusher();
+    if flushers && let Err(e) = pando_host::io_flusher() {
+        eprintln!(
+            "warning: the threads that serve the device are not I/O flushers ({e}); with much \
+             dirty data and little free memory, writes to the device can stall, so set \
+             --dirty-limit"
+        );
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

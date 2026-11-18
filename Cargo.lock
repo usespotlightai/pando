@@ -1216,6 +1216,7 @@ dependencies = [
  "io-uring",
  "libc",
  "pando-engine",
+ "pando-host",
  "parking_lot 0.13.0",
  "tempfile",
  "tokio",

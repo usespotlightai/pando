@@ -75,8 +75,9 @@ pub(crate) struct AttachArgs {
     pub(crate) device: Option<PathBuf>,
     /// Serve the branch as the file disk.img in a FUSE mount at this directory, bound to a
     /// free loop device, for a kernel without ublk. The attach prints the loop device; make
-    /// and mount the file system on it. Works without --dm and --images; `detach --fuse`
-    /// publishes the branch.
+    /// and mount the file system on it. Works without --dm and --images; unmount it, then
+    /// `detach --fuse` publishes the branch. A signal syncs the file system and publishes,
+    /// but the mount ends with the daemon, so unmount first.
     #[arg(long)]
     pub(crate) fuse: Option<PathBuf>,
     /// Mount through this device-mapper device, /dev/mapper/<NAME>, over the ublk device.
@@ -406,13 +407,6 @@ mod linux {
                 return Err(e).with_context(|| format!("serve {} over FUSE", dir.display()));
             }
         };
-        if let Some(why) = fe.not_flusher() {
-            out.err(format!(
-                "{}: the FUSE threads are not I/O flushers ({why}); with much dirty data and \
-                 little free memory, the file system on the loop device can stall",
-                dir.display()
-            ));
-        }
         limit_dirty(fe.device(), a.dirty_limit, out).await;
         out.line(format!(
             "attached {} as {} in {:.1?}: {}, {}",
@@ -446,6 +440,9 @@ mod linux {
             }
             () = signals.next() => true,
         };
+        if drained {
+            sync_users(&fe, a.drain_wait, out).await;
+        }
         wind_down(uploads, &stop, background, control, &front).await;
         drop(front);
         if drained {
@@ -785,8 +782,23 @@ mod linux {
         Path::new(CONTROL_DIR).join(format!("ublkb{id}.sock"))
     }
 
-    /// The control socket of the daemon that serves a branch in the FUSE mount at `dir`.
+    /// Writes out the file systems on a FUSE attach's loop device before a signal ends the
+    /// daemon, which ends the FUSE mount under them.
+    async fn sync_users(fe: &FuseFrontend, wait: Duration, out: &Out) {
+        match tokio::time::timeout(wait, fe.sync_users()).await {
+            Ok(Ok(n)) => out.line(format!("synced {n} file systems on {}", fe.device().display())),
+            Ok(Err(e)) => out.err(format!("sync the file systems on {}: {e}", fe.device().display())),
+            Err(_) => out.err(format!(
+                "sync the file systems on {}: not done in {wait:?}",
+                fe.device().display()
+            )),
+        }
+    }
+
+    /// The control socket of the daemon that serves a branch in the FUSE mount at `dir`, the
+    /// same for every spelling of the path.
     fn fuse_control_path(dir: &Path) -> PathBuf {
+        let dir: PathBuf = dir.components().collect();
         let h = Hash::of(dir.as_os_str().as_encoded_bytes()).short();
         Path::new(CONTROL_DIR).join(format!("fuse-{h}.sock"))
     }
@@ -1124,6 +1136,14 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn every_spelling_of_a_fuse_directory_names_one_socket() {
+            let want = fuse_control_path(Path::new("/mnt/x"));
+            assert_eq!(fuse_control_path(Path::new("/mnt/x/")), want);
+            assert_eq!(fuse_control_path(Path::new("/mnt/./x")), want);
+            assert_ne!(fuse_control_path(Path::new("/mnt/y")), want);
+        }
 
         #[test]
         fn a_grow_request_names_its_size() {

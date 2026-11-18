@@ -128,7 +128,6 @@ pub struct FuseFrontend {
     device: PathBuf,
     direct_io: bool,
     seq: String,
-    flusher: Option<String>,
     conn: Arc<Conn>,
     loop_fd: Mutex<Option<OwnedFd>>,
     threads: Mutex<Vec<JoinHandle<io::Result<()>>>>,
@@ -163,9 +162,12 @@ impl FuseFrontend {
         self.direct_io
     }
 
-    /// Why the serving threads are not I/O flushers, when they are not.
-    pub fn not_flusher(&self) -> Option<&str> {
-        self.flusher.as_deref()
+    /// Writes out every file system mounted from the loop device, then the device's own
+    /// cache, so they reach the volume while the threads still serve; how many file systems
+    /// there were.
+    pub async fn sync_users(&self) -> io::Result<usize> {
+        let device = self.device.clone();
+        dm::blocking(move || sync_users(&device)).await
     }
 
     /// Waits until the FUSE connection ends, which ends every thread: the mount is gone and
@@ -178,13 +180,13 @@ impl FuseFrontend {
 
     /// Lets go of the loop device, which frees itself once its last user closes it, and
     /// detaches the mount; the threads end once the loop device has let go of the file, after
-    /// it has had an answer to every request. With `force`, they end at once, and whatever
-    /// still uses the loop device gets I/O errors.
+    /// it has had an answer to every request, even when the unmount failed. With `force`,
+    /// they end at once, and whatever still uses the loop device gets I/O errors.
     pub async fn unmount(&self, force: bool) -> io::Result<()> {
         drop(self.loop_fd.lock().take());
         let dir = self.dir.clone();
         let detached = dm::blocking(move || sys::umount(&dir, libc::MNT_DETACH)).await;
-        if force || detached.is_err() {
+        if force {
             sys::eventfd_signal(&self.conn.stop);
         } else {
             let (conn, device, seq) = (Arc::downgrade(&self.conn), self.device.clone(), self.seq.clone());
@@ -219,6 +221,52 @@ impl FuseFrontend {
         let stopped = self.stopped().await;
         unmounted.and(stopped)
     }
+}
+
+fn sync_users(device: &Path) -> io::Result<usize> {
+    use std::os::unix::fs::MetadataExt;
+    let rdev = fs::metadata(device)?.rdev();
+    let id = format!("{}:{}", libc::major(rdev), libc::minor(rdev));
+    let mut synced = 0;
+    for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let (Some(&dev), Some(&at)) = (fields.get(2), fields.get(4)) else {
+            continue;
+        };
+        if dev != id {
+            continue;
+        }
+        let dir = fs::File::open(unescape_mount_path(at))?;
+        sys::syncfs(dir.as_raw_fd())?;
+        synced += 1;
+    }
+    fs::File::open(device)?.sync_all()?;
+    Ok(synced)
+}
+
+/// A mount point as /proc/self/mountinfo writes it, with space, tab, newline and backslash
+/// as three octal digits after a backslash.
+fn unescape_mount_path(s: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        let octal = b
+            .get(i + 1..i + 4)
+            .filter(|d| c == b'\\' && d.iter().all(|x| (b'0'..=b'7').contains(x)));
+        if let Some(d) = octal {
+            out.push(
+                d.iter()
+                    .fold(0u8, |n, x| n.wrapping_mul(8).wrapping_add(x - b'0')),
+            );
+            i += 4;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
 }
 
 const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -280,7 +328,6 @@ fn start(rt: &Handle, vol: &Arc<Volume>, dir: PathBuf, opts: FuseOptions) -> io:
         device: PathBuf::new(),
         direct_io: false,
         seq: String::new(),
-        flusher: sys::io_flusher().err().map(|e| e.to_string()),
         conn: Arc::clone(&conn),
         loop_fd: Mutex::new(None),
         threads: Mutex::new(Vec::new()),
@@ -337,7 +384,7 @@ fn join(threads: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
 
 /// Reads and answers requests until the connection ends or the frontend stops.
 fn serve(conn: &Arc<Conn>, rt: &Handle, vol: &Arc<Volume>) -> io::Result<()> {
-    let _ = sys::io_flusher();
+    let _ = pando_host::io_flusher();
     let mut buf = vec![0u8; BUF_LEN];
     let fds = [conn.fd.as_raw_fd(), conn.stop.as_raw_fd()];
     loop {
@@ -831,9 +878,9 @@ mod tests {
         b
     }
 
-    fn decoded(opcode: u32, node: u64, body: &[u8]) -> Option<Request<'static>> {
-        let b: &'static [u8] = Box::leak(request(opcode, node, body).into_boxed_slice());
-        decode(header(b)?, b)
+    fn decodes(opcode: u32, node: u64, body: &[u8], want: Option<Request<'_>>) {
+        let b = request(opcode, node, body);
+        assert_eq!(header(&b).and_then(|h| decode(h, &b)), want);
     }
 
     #[test]
@@ -842,15 +889,17 @@ mod tests {
         body[8..16].copy_from_slice(&8192u64.to_ne_bytes());
         body[16..20].copy_from_slice(&4u32.to_ne_bytes());
         body.extend_from_slice(b"abcd");
-        assert_eq!(
-            decoded(op::WRITE, FILE, &body),
+        decodes(
+            op::WRITE,
+            FILE,
+            &body,
             Some(Request::Write {
                 offset: 8192,
-                data: b"abcd"
-            })
+                data: b"abcd",
+            }),
         );
         body.truncate(42);
-        assert_eq!(decoded(op::WRITE, FILE, &body), None);
+        decodes(op::WRITE, FILE, &body, None);
     }
 
     #[test]
@@ -859,49 +908,63 @@ mod tests {
         body[8..16].copy_from_slice(&4096u64.to_ne_bytes());
         body[16..24].copy_from_slice(&(1u64 << 20).to_ne_bytes());
         body[24..28].copy_from_slice(&(FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE).to_ne_bytes());
-        assert_eq!(
-            decoded(op::FALLOCATE, FILE, &body),
+        decodes(
+            op::FALLOCATE,
+            FILE,
+            &body,
             Some(Request::Fallocate {
                 offset: 4096,
                 len: 1 << 20,
-                mode: FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE
-            })
+                mode: FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE,
+            }),
         );
-        assert_eq!(decoded(op::FSYNC, FILE, &[0; 16]), Some(Request::Sync));
-        assert_eq!(decoded(op::FLUSH, FILE, &[0; 24]), Some(Request::Sync));
+        decodes(op::FSYNC, FILE, &[0; 16], Some(Request::Sync));
+        decodes(op::FLUSH, FILE, &[0; 24], Some(Request::Sync));
     }
 
     #[test]
     fn changes_to_the_tree_are_refused_and_unknown_requests_are_not_implemented() {
-        assert_eq!(
-            decoded(op::UNLINK, ROOT, b"disk.img\0"),
-            Some(Request::Refused(libc::EPERM))
+        decodes(
+            op::UNLINK,
+            ROOT,
+            b"disk.img\0",
+            Some(Request::Refused(libc::EPERM)),
         );
-        assert_eq!(
-            decoded(op::CREATE, ROOT, &[0; 24]),
-            Some(Request::Refused(libc::EPERM))
-        );
-        assert_eq!(decoded(999, ROOT, &[]), Some(Request::Refused(libc::ENOSYS)));
-        assert_eq!(decoded(op::FORGET, FILE, &[0; 8]), Some(Request::NoReply));
+        decodes(op::CREATE, ROOT, &[0; 24], Some(Request::Refused(libc::EPERM)));
+        decodes(999, ROOT, &[], Some(Request::Refused(libc::ENOSYS)));
+        decodes(op::FORGET, FILE, &[0; 8], Some(Request::NoReply));
     }
 
     #[test]
     fn a_lookup_names_the_file_and_a_setattr_its_size() {
-        assert_eq!(
-            decoded(op::LOOKUP, ROOT, b"disk.img\0"),
-            Some(Request::Lookup { name: b"disk.img" })
+        decodes(
+            op::LOOKUP,
+            ROOT,
+            b"disk.img\0",
+            Some(Request::Lookup { name: b"disk.img" }),
         );
         let mut body = vec![0u8; 88];
         body[0..4].copy_from_slice(&FATTR_SIZE.to_ne_bytes());
         body[16..24].copy_from_slice(&(1u64 << 30).to_ne_bytes());
-        assert_eq!(
-            decoded(op::SETATTR, FILE, &body),
-            Some(Request::SetAttr { size: Some(1 << 30) })
+        decodes(
+            op::SETATTR,
+            FILE,
+            &body,
+            Some(Request::SetAttr { size: Some(1 << 30) }),
         );
         body[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        decodes(op::SETATTR, FILE, &body, Some(Request::SetAttr { size: None }));
+    }
+
+    #[test]
+    fn mount_points_unescape_like_mountinfo_escapes_them() {
         assert_eq!(
-            decoded(op::SETATTR, FILE, &body),
-            Some(Request::SetAttr { size: None })
+            unescape_mount_path("/mnt/a\\040b\\134c"),
+            PathBuf::from("/mnt/a b\\c")
+        );
+        assert_eq!(
+            unescape_mount_path("/mnt/plain\\9"),
+            PathBuf::from("/mnt/plain\\9")
         );
     }
 

@@ -210,13 +210,10 @@ pub(crate) fn ids() -> (u32, u32) {
     (uid, gid)
 }
 
-/// Marks the calling thread as one that writes data out for the kernel (`PR_SET_IO_FLUSHER`):
-/// its allocations do not wait for I/O to free memory, and it is throttled only on its own
-/// device's dirty data. Needs `CAP_SYS_RESOURCE` and Linux 5.6.
-pub(crate) fn io_flusher() -> io::Result<()> {
-    const PR_SET_IO_FLUSHER: libc::c_int = 57;
-    // SAFETY: PR_SET_IO_FLUSHER takes integers only.
-    check(unsafe { libc::prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0) }).map(drop)
+/// Writes out the dirty data of the file system that `fd` is in.
+pub(crate) fn syncfs(fd: RawFd) -> io::Result<()> {
+    // SAFETY: syncfs takes a descriptor only.
+    check(unsafe { libc::syncfs(fd) }).map(drop)
 }
 
 pub(crate) fn page_size() -> usize {
