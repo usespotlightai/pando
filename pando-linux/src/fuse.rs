@@ -666,10 +666,12 @@ fn fallocate(
     });
 }
 
-/// 0 for success; for an error, `-EIO` after it is logged.
+/// 0 for success; `-ENOSPC` for a write, zero or flush that failed for want of room on the
+/// cache's disk; for another error, `-EIO` after it is logged.
 fn errno(r: pando_engine::Result<()>, what: &str) -> i32 {
     match r {
         Ok(()) => 0,
+        Err(e) if what != "read" && e.is_no_room() => -libc::ENOSPC,
         Err(e) => {
             log(format_args!("fuse {what}: {e}"));
             -libc::EIO

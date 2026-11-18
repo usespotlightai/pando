@@ -35,7 +35,8 @@ const ZERO_CHUNK: u32 = 1 << 31;
 /// [`ZERO_CHUNK`] and no data for a chunk that became zeros. Appends to one
 /// shard queue while a write is in flight and go out together in the next one, written on the
 /// calling thread: the page cache takes them without a wait, so a hop to the blocking pool
-/// would cost more than the write.
+/// would cost more than the write. An append whose write fails leaves nothing of itself in
+/// the file.
 #[derive(Debug)]
 pub(crate) struct Journal {
     fs: Arc<dyn LocalFs>,
@@ -56,34 +57,51 @@ struct Shard {
 }
 
 /// The records waiting for a shard's next write. While `writing`, one caller writes them.
+/// `torn` says that a failed write may have left bytes past `end`.
 #[derive(Debug, Default)]
 struct Queue {
     end: u64,
     records: BytesMut,
     waiters: Vec<oneshot::Sender<Result<(), Arc<Error>>>>,
     writing: bool,
+    torn: bool,
 }
 
 impl Shard {
-    /// Writes the queued records until none are left.
-    fn drain(&self) {
+    /// Writes the queued records until none are left. It runs as a task of its own, so a
+    /// cancelled append never leaves `writing` set with no writer. A write that fails, as on a full disk,
+    /// may have written part of its records: the file is cut back to its end before anything
+    /// else is written, so a replay never reads that part, or stops at it, in front of
+    /// records written later.
+    async fn drain(&self) {
         loop {
-            let (batch, waiters, at) = {
+            let (batch, waiters, at, torn) = {
                 let mut q = self.queue.lock();
                 if q.records.is_empty() {
                     q.writing = false;
                     return;
                 }
-                (q.records.split().freeze(), std::mem::take(&mut q.waiters), q.end)
+                (
+                    q.records.split().freeze(),
+                    std::mem::take(&mut q.waiters),
+                    q.end,
+                    q.torn,
+                )
             };
-            let n = u64_from(batch.len());
-            let done = self
-                .file
-                .write_at_now(&batch, at)
-                .map_err(|e| Arc::new(Error::Io(e)));
-            if done.is_ok() {
-                self.queue.lock().end += n;
-            }
+            let cut = if torn { self.file.set_len(at).await } else { Ok(()) };
+            let done = match cut.and_then(|()| self.file.write_at_now(&batch, at)) {
+                Ok(()) => {
+                    let mut q = self.queue.lock();
+                    q.end += u64_from(batch.len());
+                    q.torn = false;
+                    Ok(())
+                }
+                Err(e) => {
+                    let cut = self.file.set_len(at).await;
+                    self.queue.lock().torn = cut.is_err();
+                    Err(Arc::new(Error::Io(e)))
+                }
+            };
             for w in waiters {
                 let _ = w.send(done.clone());
             }
@@ -208,7 +226,8 @@ impl Journal {
         let Some(g) = self.current.read().clone() else {
             return Err(Error::Corrupt("an append to a journal not started".into()));
         };
-        let shard = &g.shards[usize_from(idx % u64_from(SHARDS))];
+        let at = usize_from(idx % u64_from(SHARDS));
+        let shard = &g.shards[at];
         let (tx, rx) = oneshot::channel();
         let lead = {
             let mut q = shard.queue.lock();
@@ -221,7 +240,8 @@ impl Journal {
             !std::mem::replace(&mut q.writing, true)
         };
         if lead {
-            shard.drain();
+            let g = Arc::clone(&g);
+            tokio::spawn(async move { g.shards[at].drain().await });
         }
         match rx.await {
             Ok(done) => done.map_err(Error::Shared),
@@ -341,6 +361,52 @@ mod tests {
         assert_eq!(n, 64);
         seen.sort_unstable();
         assert_eq!(seen, (0..64).map(|i| i * u64_from(SHARDS)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn an_append_that_finds_the_disk_full_leaves_nothing_and_later_ones_replay() {
+        let fs = SimFs::default();
+        let j = Journal::open(Arc::new(fs.clone()), Path::new("/j"))
+            .await
+            .unwrap();
+        j.start(1).await.unwrap();
+        j.append(0, 0, Bytes::from_static(b"kept")).await.unwrap();
+        let used = fs
+            .open(&j.path(1, 0), Open::Read)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap();
+        fs.set_capacity(Some(used + 30));
+        let e = j.append(16, 0, Bytes::from(vec![7; 100])).await.unwrap_err();
+        assert!(e.is_no_room(), "{e}");
+        assert_eq!(
+            fs.open(&j.path(1, 0), Open::Read)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            used,
+            "the failed append was cut off"
+        );
+        fs.set_capacity(None);
+        j.append(32, 0, Bytes::from_static(b"after")).await.unwrap();
+        let mut seen = Vec::new();
+        j.replay(0, |i, r| {
+            seen.push((i, r));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                (0, Record::Data(0, Bytes::from_static(b"kept"))),
+                (32, Record::Data(0, Bytes::from_static(b"after"))),
+            ]
+        );
     }
 
     #[tokio::test]

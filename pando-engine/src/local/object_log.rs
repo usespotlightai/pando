@@ -27,8 +27,12 @@ const WRITEBACK_BYTES: u64 = 8 << 20;
 /// file must not change while records name it; once it is dropped, its records read as misses.
 ///
 /// `<log>.synced` says how much of the log is durable, so an open after a crash checks the
-/// hashes of the records beyond it only. A record with the zero hash is padding: the space of
-/// an append whose write failed. One process at a time opens the log: `<log>.lock`.
+/// hashes of the records beyond it only. Padding fills the space of an append whose write
+/// failed: a header whose hash is [`pad_hash`] of its offset and length, which a scan checks
+/// and skips wherever it is. A record with the zero hash is padding of earlier releases, which
+/// a scan trusts only below `<log>.synced`. When the padding cannot be written either, as on
+/// a full disk, [`ObjectLog::sync`] writes it before it reports the log durable, and fails
+/// until it can. One process at a time opens the log: `<log>.lock`.
 #[derive(Debug)]
 pub(crate) struct ObjectLog {
     fs: Arc<dyn LocalFs>,
@@ -37,10 +41,12 @@ pub(crate) struct ObjectLog {
     end: AtomicU64,
     shards: Vec<RwLock<HashMap<Hash, Arc<Loc>>>>,
     /// Where appends are still writing. An append that could not write its record or its
-    /// padding stays here, and the log is poisoned.
+    /// padding stays here until its padding is written.
     in_flight: Arc<Mutex<BTreeSet<u64>>>,
     landed: Arc<Notify>,
-    poisoned: Arc<AtomicBool>,
+    /// Where appends that could write neither their record nor their padding start, with
+    /// the length of the padding they need.
+    unpadded: Arc<Mutex<BTreeMap<u64, u32>>>,
     _lock: Box<dyn FileLock>,
     files: Mutex<BTreeMap<PathBuf, Arc<ExtFile>>>,
     unwritten: AtomicU64,
@@ -149,6 +155,16 @@ impl Window {
     }
 }
 
+/// The hash in the header of padding of `len` bytes at `off`: bound to both, so a stale or
+/// torn header does not pass for padding.
+fn pad_hash(off: u64, len: u32) -> Hash {
+    let mut b = Vec::with_capacity(36);
+    b.extend_from_slice(b"pando object log pad");
+    b.extend_from_slice(&off.to_le_bytes());
+    b.extend_from_slice(&len.to_le_bytes());
+    Hash::of(&b)
+}
+
 fn header(h: Hash, len: u32) -> Bytes {
     let mut b = Vec::with_capacity(HEADER);
     b.extend_from_slice(&h.0);
@@ -178,7 +194,7 @@ impl ObjectLog {
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             in_flight: Arc::default(),
             landed: Arc::default(),
-            poisoned: Arc::default(),
+            unpadded: Arc::default(),
             _lock: lock,
             files: Mutex::default(),
             unwritten: AtomicU64::new(0),
@@ -222,6 +238,10 @@ impl ObjectLog {
             let body = off + HEADER_LEN;
             if body + plen > size {
                 break;
+            }
+            if n & REF_FLAG == 0 && h == pad_hash(off, n) {
+                off = body + plen;
+                continue;
             }
             if h == Hash::ZERO {
                 if off >= synced {
@@ -329,24 +349,24 @@ impl ObjectLog {
             f.insert(at);
             at
         };
-        let (file, in_flight, landed, poisoned) = (
+        let (file, in_flight, landed, unpadded) = (
             Arc::clone(&self.file),
             Arc::clone(&self.in_flight),
             Arc::clone(&self.landed),
-            Arc::clone(&self.poisoned),
+            Arc::clone(&self.unpadded),
         );
         let task = tokio::spawn(async move {
             let r = file.write_at(vec![hdr, body], at).await;
             let settled = if let Ok(()) = r {
                 true
             } else {
-                let pad = header(Hash::ZERO, pad_len);
+                let pad = header(pad_hash(at, pad_len), pad_len);
                 file.write_at(vec![pad], at).await.is_ok()
             };
             if settled {
                 in_flight.lock().remove(&at);
             } else {
-                poisoned.store(true, Ordering::Release);
+                unpadded.lock().insert(at, pad_len);
             }
             landed.notify_waiters();
             r
@@ -496,6 +516,25 @@ impl ObjectLog {
         Ok(Some(b))
     }
 
+    /// Writes the padding that failed appends could not write.
+    async fn pad(&self) -> Result<()> {
+        let pending: Vec<(u64, u32)> = self.unpadded.lock().iter().map(|(a, n)| (*a, *n)).collect();
+        for (at, len) in pending {
+            if let Err(e) = self.file.write_at(vec![header(pad_hash(at, len), len)], at).await {
+                return Err(Error::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "the object log {} cannot pad a failed write at {at}: {e}",
+                        self.path.display()
+                    ),
+                )));
+            }
+            self.unpadded.lock().remove(&at);
+            self.in_flight.lock().remove(&at);
+        }
+        Ok(())
+    }
+
     pub(crate) fn hold_writeback(&self) -> WritebackHold<'_> {
         self.holds.fetch_add(1, Ordering::AcqRel);
         WritebackHold(self)
@@ -529,12 +568,7 @@ impl ObjectLog {
             let landed = self.landed.notified();
             tokio::pin!(landed);
             landed.as_mut().enable();
-            if self.poisoned.load(Ordering::Acquire) {
-                return Err(Error::Io(io::Error::other(format!(
-                    "the object log {} lost a write",
-                    self.path.display()
-                ))));
-            }
+            self.pad().await?;
             let first = self.in_flight.lock().first().copied();
             if first.is_none_or(|f| f >= end) {
                 break;
@@ -617,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn padding_is_skipped_below_the_synced_mark_and_ends_the_log_above_it() {
+    async fn zero_hash_padding_is_skipped_below_the_synced_mark_and_ends_the_log_above_it() {
         let fs = SimFs::default();
         let path = Path::new("/c/objects");
         let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
@@ -646,6 +680,39 @@ mod tests {
         let synced = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         assert!(synced.has(&h1) && !synced.has(&Hash::ZERO));
         assert_eq!(synced.get(&h2).await.unwrap(), Some(b2));
+    }
+
+    #[tokio::test]
+    async fn a_put_on_a_full_disk_fails_and_the_log_syncs_once_there_is_room() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let ((h1, b1), (h2, b2), (h3, b3)) = (obj(1), obj(2), obj(3));
+        log.put(h1, b1.clone()).await.unwrap();
+        log.sync().await.unwrap();
+        let big = u64::MAX / 2;
+        fs.set_capacity(Some(big));
+        let used = big - fs.available(Path::new("/c")).await.unwrap();
+        fs.set_capacity(Some(used + 20));
+        let e = log.put(h2, b2).await.unwrap_err();
+        assert!(e.is_no_room(), "{e}");
+        assert!(!log.has(&h2));
+        let e = log.sync().await.unwrap_err();
+        assert!(e.is_no_room(), "the padding does not fit either: {e}");
+
+        fs.set_capacity(None);
+        log.put(h3, b3.clone()).await.unwrap();
+        log.sync().await.unwrap();
+        drop(log);
+        fs.crash();
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(again.get(&h1).await.unwrap(), Some(b1));
+        assert_eq!(
+            again.get(&h3).await.unwrap(),
+            Some(b3),
+            "the padding is skipped although the crash lost the synced mark"
+        );
+        assert!(!again.has(&h2));
     }
 
     #[tokio::test]

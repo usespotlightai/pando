@@ -99,6 +99,18 @@ in [a host that never comes back](#a-host-that-never-comes-back). A `detach` dur
 fails after `--publish-wait`, with the device stopped and the daemon still publishing; run
 `detach` again to wait for it.
 
+**Full disk.** The cache directory keeps a 128 MiB file, `reserve`, that holds room for
+commits. When a write finds the disk of the cache or the state full, the daemon removes the
+reserve, logs that the disk is full and sets its systemd status to `degraded`. From then on
+writes and discards fail at once with ENOSPC and change nothing, while reads and flushes go on:
+a flush commits into the reserve's room, so every write acknowledged before it stays durable.
+A file system on the device usually turns read-only at the first failed write of its own
+journal; unmount it, and mount it again once there is room. Once the disk has 256 MiB free, the
+daemon allocates the reserve again, logs that the disk has room and takes writes; until then a
+`detach` still publishes. The reserve covers the cache's file system only: keep `--state` on
+the same one. Reads of chunks this host has not fetched fail with EIO while the disk is full,
+since the cache cannot keep them.
+
 ## A host that never comes back
 
 The store holds the branch as of its last upload. Before a handoff the daemon uploads within

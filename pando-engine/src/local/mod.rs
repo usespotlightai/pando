@@ -2,6 +2,7 @@
 
 mod journal;
 mod object_log;
+mod space;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use bytes::Bytes;
 pub(crate) use journal::{Journal, Record};
 pub(crate) use object_log::{ObjectLog, WritebackHold};
 use pando_format::usize_from;
+pub(crate) use space::{Space, no_room};
 
 use crate::ports::{LocalFs, Open};
 

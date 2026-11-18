@@ -515,10 +515,10 @@ mod linux {
     }
 
     /// Reports when the uploads of branch `name` fall more than [`LAGGING`] behind its flushes,
-    /// as they do while the store is unreachable, and when they catch up; returns once they stop
-    /// for good.
+    /// as they do while the store is unreachable, and when they catch up, and when the cache's
+    /// disk fills and has room again; returns once the uploads stop for good.
     async fn watch_lag(v: &Volume, name: &str, out: &Out) {
-        let mut lagging = false;
+        let (mut lagging, mut full) = (false, false);
         loop {
             tokio::select! {
                 e = v.upload_stopped() => {
@@ -528,20 +528,32 @@ mod linux {
                 () = tokio::time::sleep(LAG_CHECK) => {}
             }
             let lag = v.upload_lag();
+            let was = (lagging, full);
             if !lagging && lag >= LAGGING {
                 lagging = true;
                 out.err(format!(
                     "uploads of {name} are {lag:.0?} behind the flushes: the writes since are on this host only"
                 ));
-                if out.is_stdio() {
-                    notify(&format!("STATUS=degraded: uploads {lag:.0?} behind"));
-                }
             } else if lagging && lag < CAUGHT_UP {
                 lagging = false;
                 out.line(format!("uploads of {name} caught up"));
-                if out.is_stdio() {
-                    notify("STATUS=serving");
+            }
+            if v.disk_full().await != full {
+                full = !full;
+                if full {
+                    out.err(format!(
+                        "the cache's disk is full: writes to {name} fail with ENOSPC until it has room; flushes go on"
+                    ));
+                } else {
+                    out.line(format!("the cache's disk has room again: writes to {name} go on"));
                 }
+            }
+            if out.is_stdio() && was != (lagging, full) {
+                notify(&match (lagging, full) {
+                    (_, true) => "STATUS=degraded: the cache's disk is full".to_owned(),
+                    (true, false) => format!("STATUS=degraded: uploads {lag:.0?} behind"),
+                    (false, false) => "STATUS=serving".to_owned(),
+                });
             }
         }
     }
