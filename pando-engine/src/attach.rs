@@ -81,12 +81,15 @@ pub struct WarmReport {
 }
 
 /// What [`Attachment::finish`] did.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FinishReport {
     /// Chunks taken back from the image.
     pub absorbed: usize,
     /// Chunks the saved recording lists.
     pub recorded: usize,
+    /// Why the write log was left open, when closing it failed. The branch is published all
+    /// the same; the next open reads the log and seals it.
+    pub log_open: Option<String>,
 }
 
 /// What the background snapshots of a handoff did.
@@ -386,8 +389,10 @@ impl Attachment {
         if done.is_ok() {
             done = v.checkpoint().await;
         }
-        if done.is_ok() {
-            let _ = v.close_log().await;
+        if done.is_ok()
+            && let Err(e) = v.close_log().await
+        {
+            report.log_open = Some(e.to_string());
         }
         let learner = self.learner.lock().take();
         if let Some(l) = learner {

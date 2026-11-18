@@ -11,7 +11,7 @@ mod config;
 mod device;
 mod serve;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -135,6 +135,40 @@ enum Command {
     /// Grows an attached branch and the devices over it while it serves. The file system on
     /// it keeps its size until it is grown too, with resize2fs for ext4.
     Resize(device::ResizeArgs),
+}
+
+impl Cli {
+    /// Makes every path argument absolute, against `cwd` where it is relative.
+    fn resolve(&mut self, cwd: &Path) {
+        let abs = |p: &mut PathBuf| *p = cwd.join(&*p);
+        if let Some(c) = &mut self.cache {
+            abs(c);
+        }
+        match &mut self.command {
+            Command::Import { image, .. } => abs(image),
+            Command::Base { dir, .. } | Command::Follow { dir, .. } => abs(dir),
+            Command::Attach(a) => {
+                abs(&mut a.device);
+                abs(&mut a.state);
+                if let Some(i) = &mut a.images {
+                    abs(i);
+                }
+            }
+            Command::Detach(d) => abs(&mut d.device),
+            Command::Resize(r) => abs(&mut r.device),
+            Command::Refs
+            | Command::Init { .. }
+            | Command::Branch { .. }
+            | Command::Checkpoint { .. }
+            | Command::Checkpoints
+            | Command::DeleteCheckpoint { .. }
+            | Command::Serve
+            | Command::Advance { .. }
+            | Command::Delete { .. }
+            | Command::Gc { .. }
+            | Command::Stat => {}
+        }
+    }
 }
 
 /// Parses durations such as `500ms`, `15s`, `10m` and `24h`.
@@ -400,6 +434,23 @@ async fn refs(ports: &Ports, out: &Out) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_resolve_against_the_client_directory() {
+        let mut cli = Cli::try_parse_from(["pando", "--cache", "c", "import", "x", "disk.img"]).unwrap();
+        cli.resolve(Path::new("/home/u"));
+        assert_eq!(cli.cache.as_deref(), Some(Path::new("/home/u/c")));
+        let Command::Import { image, .. } = cli.command else {
+            panic!("not import")
+        };
+        assert_eq!(image, Path::new("/home/u/disk.img"));
+        let mut cli = Cli::try_parse_from(["pando", "base", "x", "--dir", "/abs"]).unwrap();
+        cli.resolve(Path::new("/home/u"));
+        let Command::Base { dir, .. } = cli.command else {
+            panic!("not base")
+        };
+        assert_eq!(dir, Path::new("/abs"));
+    }
 
     #[test]
     fn durations_parse_with_their_units() {

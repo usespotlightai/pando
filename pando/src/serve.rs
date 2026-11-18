@@ -6,7 +6,8 @@
 //! with the command's exit code. S3 settings and credentials stay with the daemon.
 //!
 //! A request is the argument count on a line, then each argument as its length in bytes on a
-//! line followed by its bytes. The answer is lines: `o<text>` for standard output, `e<text>` for
+//! line followed by its bytes. The first argument is the client's working directory, against
+//! which the daemon makes relative path arguments absolute. The answer is lines: `o<text>` for standard output, `e<text>` for
 //! standard error, and last `x<code>`. A client that goes away cancels its command, except an
 //! `attach`, whose device keeps serving until `detach`. Devices the daemon serves stop when
 //! the daemon stops; `attach --recover` takes them over.
@@ -14,8 +15,8 @@
 use std::ffi::OsString;
 use std::fs::Permissions;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -86,22 +87,41 @@ pub(crate) async fn serve(host: Arc<Host>, socket: &Path) -> Result<()> {
     }
 }
 
-/// Binds `socket`, readable only by this user, unless a live daemon serves it already.
+/// Binds `socket`, usable only by this user from the start, unless a live daemon serves it
+/// already. A stale socket there is replaced; anything else there is an error.
 async fn listen(socket: &Path) -> Result<UnixListener> {
     if UnixStream::connect(socket).await.is_ok() {
         bail!("a daemon serves {} already", socket.display());
     }
-    if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-    match std::fs::remove_file(socket) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("remove {}", socket.display()));
+    let dir = socket
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    match std::fs::symlink_metadata(socket) {
+        Ok(m) if m.file_type().is_socket() => {
+            std::fs::remove_file(socket).with_context(|| format!("remove {}", socket.display()))?;
         }
-        _ => {}
+        Ok(_) => bail!("{} is there and is not a socket", socket.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("inspect {}", socket.display())),
     }
-    let l = UnixListener::bind(socket).with_context(|| format!("bind {}", socket.display()))?;
-    std::fs::set_permissions(socket, Permissions::from_mode(0o600))?;
+    let private = dir.join(format!(".pando-serve-{}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&private)
+        .with_context(|| format!("create {}", private.display()))?;
+    let bound = bind_in(&private, socket);
+    let _ = std::fs::remove_dir_all(&private);
+    bound
+}
+
+/// Binds a socket in the private directory `private`, then moves it to `socket`.
+fn bind_in(private: &Path, socket: &Path) -> Result<UnixListener> {
+    let inner = private.join("s");
+    let l = UnixListener::bind(&inner).with_context(|| format!("bind {}", inner.display()))?;
+    std::fs::set_permissions(&inner, Permissions::from_mode(0o600))?;
+    std::fs::rename(&inner, socket).with_context(|| format!("move the socket to {}", socket.display()))?;
     Ok(l)
 }
 
@@ -111,11 +131,12 @@ async fn answer(host: Arc<Host>, c: UnixStream) -> Result<()> {
     if r.fill_buf().await?.is_empty() {
         return Ok(());
     }
-    let args = read_args(&mut r).await?;
+    let mut args = read_args(&mut r).await?;
+    let cwd = (!args.is_empty()).then(|| PathBuf::from(args.remove(0)));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (job, keep) = {
         let out = Out(Some(tx));
-        match request(&host, args) {
+        match request(&host, cwd, args) {
             Ok(cli) => {
                 let keep = matches!(cli.command, Command::Attach(_));
                 let job = tokio::spawn(async move {
@@ -179,9 +200,13 @@ enum Refused {
 }
 
 /// The command a request asks for, when this daemon may run it.
-fn request(host: &Host, args: Vec<OsString>) -> Result<Cli, Refused> {
-    let cli = Cli::try_parse_from(args).map_err(Refused::Clap)?;
+fn request(host: &Host, cwd: Option<PathBuf>, args: Vec<OsString>) -> Result<Cli, Refused> {
     let other = |why: String| Err(Refused::Other(anyhow::anyhow!(why)));
+    let Some(cwd) = cwd.filter(|c| c.is_absolute()) else {
+        return other("the request names no absolute working directory".into());
+    };
+    let mut cli = Cli::try_parse_from(args).map_err(Refused::Clap)?;
+    cli.resolve(&cwd);
     if matches!(cli.command, Command::Serve) {
         return other("the daemon is serving already".into());
     }
@@ -246,9 +271,11 @@ fn encode_args(args: &[OsString]) -> Vec<u8> {
     b
 }
 
-/// Sends `args`, this process's arguments, to the daemon on `socket` and prints what it
-/// answers. The exit code is the command's.
+/// Sends this process's working directory and `args`, its arguments, to the daemon on
+/// `socket` and prints what it answers. The exit code is the command's.
 pub(crate) async fn client(socket: &Path, args: Vec<OsString>) -> Result<ExitCode> {
+    let cwd = std::env::current_dir().context("the working directory")?;
+    let args: Vec<OsString> = std::iter::once(cwd.into_os_string()).chain(args).collect();
     let c = UnixStream::connect(socket).await.with_context(|| {
         format!(
             "connect to the daemon on {}; is `pando serve` running?",
@@ -298,6 +325,29 @@ mod tests {
                 .is_err()
         );
         assert!(read_args(&mut BufReader::new(&b"x\n"[..])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_file_at_the_socket_path_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("pando-serve-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-socket");
+        std::fs::File::create(&file).unwrap();
+        assert!(listen(&file).await.is_err());
+        assert!(file.is_file());
+
+        let socket = dir.join("sock");
+        drop(listen(&socket).await.unwrap());
+        let m = std::fs::symlink_metadata(&socket).unwrap();
+        assert!(m.file_type().is_socket());
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+        drop(listen(&socket).await.unwrap());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no private directory is left"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

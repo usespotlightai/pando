@@ -234,8 +234,9 @@ impl Remote {
         }
     }
 
-    /// Creates a log record; `false` when one is there already. When the store's reply is lost,
-    /// the record is read back: if it holds `body`, the create took effect.
+    /// Creates a log record; `false` when another record is there already. A record that is
+    /// there already, or a create whose reply is lost, is read back: if it holds `body`, an
+    /// earlier try of this create took effect.
     pub(crate) async fn create_log_record(
         &self,
         name: &str,
@@ -253,7 +254,10 @@ impl Remote {
                 self.put_done(len);
                 Ok(true)
             }
-            Err(StoreError::AlreadyExists { .. }) => Ok(false),
+            Err(StoreError::AlreadyExists { .. }) => Ok(self
+                .get_log_record(name, generation, n)
+                .await?
+                .is_some_and(|now| now == body)),
             Err(e @ StoreError::Transient { .. }) => match self.get_log_record(name, generation, n).await {
                 Ok(Some(now)) if now == body => Ok(true),
                 _ => Err(e.into()),
@@ -266,8 +270,8 @@ impl Remote {
         Ok(self.store.delete(&keys::log_record(name, generation, n)).await?)
     }
 
-    /// The generation and number of every record in branch `name`'s write log.
-    pub(crate) async fn list_log(&self, name: &str) -> Result<Vec<(u64, u64)>> {
+    /// The generation, number and size of every record in branch `name`'s write log.
+    pub(crate) async fn list_log(&self, name: &str) -> Result<Vec<(u64, u64, u64)>> {
         let dir = keys::log_branch(name);
         let prefix = format!("{dir}/");
         Ok(self
@@ -275,7 +279,10 @@ impl Remote {
             .list(&dir)
             .await?
             .into_iter()
-            .filter_map(|o| keys::parse_log_record(o.key.strip_prefix(&prefix)?))
+            .filter_map(|o| {
+                let (g, n) = keys::parse_log_record(o.key.strip_prefix(&prefix)?)?;
+                Some((g, n, o.size))
+            })
             .collect())
     }
 

@@ -9,12 +9,15 @@
 //! not applied, nor anything after it, so what an open applies is a prefix of the flushes.
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use pando_format::{CHUNK_SIZE, Hash, LogBody, LogPos, LogRecord, LogWrites, Ref, u64_from};
+use pando_format::{
+    CHUNK_SIZE, Hash, LOG_CHUNKS_MAX, LOG_DATA_CHUNKS_MAX, LOG_SEAL_LEN, LogBody, LogPos, LogRecord,
+    LogWrites, Ref, u64_from,
+};
 use tokio::sync::{Notify, watch};
 
 use super::{Inner, RETRY_AFTER, UPLOAD_EVERY, fail_with, is_transient};
@@ -38,7 +41,7 @@ pub enum LogMode {
 /// How long a write-behind shipper gathers flushes into one record.
 const GATHER: Duration = Duration::from_millis(50);
 /// The chunk bytes one record holds at most; a larger flush is left to the uploader.
-const RECORD_MAX: usize = 64 << 20;
+const RECORD_MAX: usize = LOG_DATA_CHUNKS_MAX * CHUNK_SIZE;
 /// The chunk bytes that may wait for the log; past it, waiting flushes are left to the uploader.
 const PENDING_MAX: usize = 256 << 20;
 /// Records an open reads at most.
@@ -111,10 +114,13 @@ impl Queue {
             return None;
         }
         let mut batch = Vec::new();
-        let mut bytes = 0;
+        let (mut bytes, mut count) = (0, 0);
         while let Some(f) = self.pending.front() {
             let n = chunk_bytes(f);
-            if f.seq > base && !batch.is_empty() && bytes + n > RECORD_MAX {
+            if f.seq > base
+                && !batch.is_empty()
+                && (bytes + n > RECORD_MAX || count + f.chunks.len() > LOG_CHUNKS_MAX)
+            {
                 break;
             }
             let Some(f) = self.pending.pop_front() else {
@@ -123,6 +129,7 @@ impl Queue {
             self.bytes -= n;
             if f.seq > base {
                 bytes += n;
+                count += f.chunks.len();
                 batch.push(f);
             }
         }
@@ -250,7 +257,7 @@ impl Inner {
         }
         let n = chunk_bytes(&f);
         let mut q = self.log.queue.lock();
-        if n > RECORD_MAX || q.bytes + n > PENDING_MAX {
+        if n > RECORD_MAX || f.chunks.len() > LOG_CHUNKS_MAX || q.bytes + n > PENDING_MAX {
             q.pending.clear();
             q.bytes = 0;
             q.dropped = f.seq;
@@ -483,7 +490,7 @@ impl Inner {
     }
 
     /// Deletes the records the published root covers, and once this writer has published,
-    /// what earlier writers left in the log. Best effort.
+    /// what earlier writers left in the log except the seals that fence them. Best effort.
     async fn trim_log(&self) {
         let (from, to, older) = {
             let mut q = self.log.queue.lock();
@@ -505,7 +512,15 @@ impl Inner {
         }
         self.log.queue.lock().trimmed = done;
         if older && let Ok(all) = self.remote.list_log(&self.name).await {
-            for (g, n) in all.into_iter().filter(|(g, _)| *g < self.generation) {
+            let mut last: BTreeMap<u64, u64> = BTreeMap::new();
+            for &(g, n, _) in &all {
+                let l = last.entry(g).or_insert(n);
+                *l = (*l).max(n);
+            }
+            for (g, n, size) in all.into_iter().filter(|r| r.0 < self.generation) {
+                if last.get(&g) == Some(&n) && size == u64_from(LOG_SEAL_LEN) {
+                    continue;
+                }
                 let _ = self.remote.delete_log_record(&self.name, g, n).await;
             }
         }
@@ -587,7 +602,7 @@ mod tests {
         assert_eq!(read(&b, data(1).len()).await, data(1));
         b.checkpoint().await.unwrap();
         b.close_log().await.unwrap();
-        assert!(log_keys(&store).is_empty(), "{:?}", log_keys(&store));
+        assert_eq!(log_keys(&store), [keys::log_record("main", 1, 1)], "a's seal");
         b.close().await;
     }
 
@@ -652,6 +667,73 @@ mod tests {
         assert!(a.flush().await.is_err());
         assert_eq!(read(&b, data(5).len()).await, data(5));
         a.close().await;
+        b.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_open_at_a_time_writes_from_a_local_state() {
+        let (ports, _, _) = sim::ports(11);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let a = open(&ports, "/a", LogMode::Behind).await;
+        let cache = Arc::new(Cache::open(&ports, Path::new("/x/cache")).await.unwrap());
+        let again = Volume::open_logged(&ports, cache, Path::new("/a"), "main", LogMode::Behind).await;
+        assert!(again.is_err());
+        a.close().await;
+        drop(a);
+        open(&ports, "/a", LogMode::Behind).await.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_seal_outlasts_the_trim_of_the_writer_it_fenced() {
+        let (ports, store, _) = sim::ports(9);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let a = open(&ports, "/a", LogMode::Strict).await;
+        block_uploads(&store);
+        a.write_at(&data(5), 1000).await.unwrap();
+        a.flush().await.unwrap();
+        store.clear_faults();
+
+        let b = open(&ports, "/b", LogMode::Strict).await;
+        b.write_at(&data(6), 1000).await.unwrap();
+        b.checkpoint().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let a_log = format!("{}/{:020}/", keys::log_branch("main"), 1);
+        assert_eq!(
+            log_keys(&store).iter().filter(|k| k.starts_with(&a_log)).count(),
+            1,
+            "only the seal of a's log is left: {:?}",
+            log_keys(&store)
+        );
+        a.write_at(&data(7), 1000).await.unwrap();
+        assert!(a.flush().await.is_err());
+        assert_eq!(read(&b, data(6).len()).await, data(6));
+        a.close().await;
+        b.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_whose_create_reply_was_lost_is_the_writers_own() {
+        let (ports, store, _) = sim::ports(10);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let a = open(&ports, "/a", LogMode::Strict).await;
+        block_uploads(&store);
+        store.inject(Fault {
+            op: StoreOp::Create,
+            applied: true,
+        });
+        store.inject(Fault {
+            op: StoreOp::Get,
+            applied: false,
+        });
+        a.write_at(&data(8), 1000).await.unwrap();
+        a.flush().await.unwrap();
+        a.write_at(&data(9), 1000).await.unwrap();
+        a.flush().await.unwrap();
+        a.close().await;
+        store.clear_faults();
+
+        let b = open(&ports, "/b", LogMode::Strict).await;
+        assert_eq!(read(&b, data(9).len()).await, data(9));
         b.close().await;
     }
 

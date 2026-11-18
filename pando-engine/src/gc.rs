@@ -183,6 +183,7 @@ pub async fn collect(cache: &Arc<Cache>, clock: &dyn Clock, opts: &GcOptions) ->
     let live = mark(remote, cache).await?;
     let mut current: HashMap<[u8; 8], u32> = HashMap::new();
     let mut roots: HashSet<Hash> = HashSet::new();
+    let logs = remote.list_all_logs().await?;
     let mut names: HashSet<Hash> = HashSet::new();
     for name in remote.list_refs().await? {
         names.insert(Hash::of(name.as_bytes()));
@@ -253,7 +254,7 @@ pub async fn collect(cache: &Arc<Cache>, clock: &dyn Clock, opts: &GcOptions) ->
             remote.delete_change_list(l.root, l.from).await?;
         }
     }
-    for (key, branch, modified) in remote.list_all_logs().await? {
+    for (key, branch, modified) in logs {
         if names.contains(&branch) || young(modified) {
             continue;
         }
@@ -388,7 +389,7 @@ mod tests {
         for name in ["main", "gone"] {
             c.remote().create_log_record(name, 1, 0, seal(0)).await.unwrap();
         }
-        branch::delete(&ports, "gone").await.unwrap();
+        c.remote().delete_ref("gone").await.unwrap();
         tokio::time::sleep(Duration::from_hours(25)).await;
         let r = collect(
             &c,
@@ -401,7 +402,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.stale_log_records, 1);
-        assert_eq!(c.remote().list_log("main").await.unwrap(), [(1, 0)]);
+        let main: Vec<_> = c
+            .remote()
+            .list_log("main")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(g, n, _)| (g, n))
+            .collect();
+        assert_eq!(main, [(1, 0)]);
         assert_eq!(c.remote().list_log("gone").await.unwrap(), []);
     }
 }

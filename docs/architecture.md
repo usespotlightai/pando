@@ -50,9 +50,12 @@ recorded. Two background tasks then take it to the store:
 An open that does not resume this host's own state reads the records the ref does not cover, from
 the ref's log position through the last writer's log, and applies them as writes. It seals each
 log it read by creating a seal record at its first free number, so a writer that is still running
-fails its next append and stops. A record that would leave a gap is not applied, nor anything
+fails its next append and stops. Once the new writer publishes, it deletes what earlier writers
+left in the log except those seals. A record that would leave a gap is not applied, nor anything
 after it: an open always sees a prefix of the flushes. A detach marks the ref's log as closed, and
-the next open then reads no records.
+the next open then reads no records. An open that resumes this host's own state reads and seals
+nothing: a lock on that state means the process that wrote it has stopped. Deleting a branch
+deletes its log, so a branch made later under the same name starts with none.
 
 With `--log behind`, the default, a flush returns once it is durable on the host, and the shipper
 creates its record within about 50 ms. With `--log strict`, a flush returns once its record is
@@ -62,7 +65,8 @@ then flushes the image without Pando. With `--log off`, only uploads reach the s
 ## Host daemon
 
 `pando serve` runs every command a client sends it in one process, on one cache. A request is the
-client's arguments; the answer streams the command's output and ends with its exit code. Store
+client's working directory and arguments, and relative paths in the arguments resolve against
+that directory; the answer streams the command's output and ends with its exit code. Store
 settings and credentials stay in the daemon, which refuses a request for another store or cache.
 A client that disconnects cancels its command, except `attach`, whose device keeps serving until
 `detach`. Devices stop with the daemon; `attach --recover` takes them over.

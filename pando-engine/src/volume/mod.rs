@@ -29,7 +29,7 @@ use crate::flight::bounded;
 use crate::gate::Gate;
 use crate::local::{Journal, Record, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
-use crate::ports::{Cpu, CpuClass, LocalFs, Version, on_cpu};
+use crate::ports::{Cpu, CpuClass, FileLock, LocalFs, Version, on_cpu};
 use crate::remote::Remote;
 use crate::tree::Tree;
 use crate::{Error, Ports, Result};
@@ -162,6 +162,7 @@ struct Inner {
     writer: Arc<Writer>,
     journal: Journal,
     state_path: PathBuf,
+    state_lock: Mutex<Option<Box<dyn FileLock>>>,
     opened: Entry,
     stripes: Vec<RwLock<()>>,
     mem: Mutex<Mem>,
@@ -294,8 +295,9 @@ impl Volume {
             .await?
             .ok_or_else(|| Error::Corrupt(format!("open {name}: no such branch")))?;
         let generation = r.generation + 1;
-        let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
         let state_path = dir.join("state").join(name);
+        let state_lock = lock_state(ports.fs.as_ref(), &state_path).await?;
+        let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
         let state = read_file(ports.fs.as_ref(), &state_path)
             .await?
             .and_then(|b| VolState::decode(&b));
@@ -335,6 +337,7 @@ impl Volume {
             writer: Arc::new(Writer::new(WriterId::new(name, generation), ports.rng.next_u32())),
             journal,
             state_path,
+            state_lock: Mutex::new(Some(state_lock)),
             opened: mem.root,
             stripes: (0..STRIPES).map(|_| RwLock::new(())).collect(),
             mem: Mutex::new(mem),
@@ -609,14 +612,32 @@ impl Volume {
         self.inner.close_log().await
     }
 
-    /// Stops the uploader after any upload in flight finishes.
+    /// Stops the uploader after any upload in flight finishes, then releases the local state
+    /// for another open.
     pub async fn close(&self) {
         self.inner.stop.send_replace(true);
         let tasks = std::mem::take(&mut *self.tasks.lock());
         for t in tasks {
             let _ = t.await;
         }
+        drop(self.inner.state_lock.lock().take());
     }
+}
+
+/// Locks the local state at `state_path`, so one process at a time writes the branch from it
+/// and a writer that resumes the state knows the one before it is gone.
+async fn lock_state(fs: &dyn LocalFs, state_path: &Path) -> Result<Box<dyn FileLock>> {
+    if let Some(dir) = state_path.parent() {
+        fs.create_dir_all(dir).await?;
+    }
+    let mut lock_path = state_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    fs.try_lock(Path::new(&lock_path)).await.map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("the branch state {} is in use: {e}", state_path.display()),
+        ))
+    })
 }
 
 /// The chunk pieces of `len` bytes at `off`: chunk, offset in it, offset in the buffer, length.

@@ -4,6 +4,13 @@ use crate::{CHUNK_SIZE, FormatError, Hash, Verified};
 
 /// The first bytes of every log record.
 pub const LOG_MAGIC: &[u8; 4] = b"plg1";
+/// The most chunks one log record lists.
+pub const LOG_CHUNKS_MAX: usize = 1 << 16;
+/// The most chunks with data one log record holds: 64 MiB.
+pub const LOG_DATA_CHUNKS_MAX: usize = 1024;
+/// The size of a seal record.
+/// The size of a seal record.
+pub const LOG_SEAL_LEN: usize = HEADER + 32;
 /// The zstd level log records are written with: a record is on the path of a durable flush,
 /// so it favours speed.
 pub const LOG_ZSTD_LEVEL: i32 = 1;
@@ -86,7 +93,11 @@ impl LogRecord {
         size: u64,
         chunks: &[(u64, Option<(Hash, Bytes)>)],
     ) -> Result<Vec<u8>, FormatError> {
-        let mut raw = Vec::with_capacity(chunks.len() * (CHUNK_HEAD + 32 + CHUNK_SIZE));
+        let data = chunks.iter().filter(|c| c.1.is_some()).count();
+        if chunks.len() > LOG_CHUNKS_MAX || data > LOG_DATA_CHUNKS_MAX {
+            return Err(FormatError::malformed("log record", "too many chunks"));
+        }
+        let mut raw = Vec::with_capacity(chunks.len() * CHUNK_HEAD + data * (32 + CHUNK_SIZE));
         for (idx, c) in chunks {
             raw.extend_from_slice(&idx.to_le_bytes());
             match c {
@@ -166,9 +177,10 @@ fn decode_writes(r: &mut Cursor<'_>) -> Option<Result<LogWrites, FormatError>> {
 
 fn writes_chunks(frame: &[u8], count: usize) -> Result<Vec<(u64, Option<Verified>)>, FormatError> {
     let bad = |why: &str| FormatError::malformed("log record", why.to_string());
-    let limit = count
-        .checked_mul(CHUNK_HEAD + 32 + CHUNK_SIZE)
-        .ok_or_else(|| bad("chunk count"))?;
+    if count > LOG_CHUNKS_MAX {
+        return Err(bad("too many chunks"));
+    }
+    let limit = count * CHUNK_HEAD + count.min(LOG_DATA_CHUNKS_MAX) * (32 + CHUNK_SIZE);
     let raw = zstd::bulk::decompress(frame, limit)?;
     let mut r = Cursor(&raw);
     let mut chunks = Vec::with_capacity(count);
@@ -228,6 +240,7 @@ fn seal_with_hash(b: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::u64_from;
 
     fn chunk(seed: u8) -> (Hash, Bytes) {
         let b = Bytes::from(
@@ -267,6 +280,20 @@ mod tests {
             assert!(LogRecord::decode(&b).is_err(), "flipped byte {at}");
         }
         assert!(LogRecord::decode(&enc[..enc.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_record_that_lists_too_many_chunks_is_rejected() {
+        let mut b = header(WRITES, 1, 0);
+        for v in [0u64, 1, 4096] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&zstd::bulk::compress(&[], LOG_ZSTD_LEVEL).unwrap());
+        seal_with_hash(&mut b);
+        assert!(LogRecord::decode(&b).is_err());
+        let zeros: Vec<_> = (0..=u64_from(LOG_CHUNKS_MAX)).map(|i| (i, None)).collect();
+        assert!(LogRecord::encode_writes(1, 0, 0, 1, 4096, &zeros).is_err());
     }
 
     #[test]

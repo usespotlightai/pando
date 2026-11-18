@@ -178,9 +178,15 @@ pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
     remote.put_ref(dst, &to, &version).await.map(drop)
 }
 
-/// Deletes branch `name`. Its segments go at the next GC that finds them unreached.
+/// Deletes branch `name`, then its write log, so a branch made later under the name starts
+/// with none. Its segments go at the next GC that finds them unreached.
 pub async fn delete(ports: &Ports, name: &str) -> Result<()> {
-    Remote::new(Arc::clone(&ports.store)).delete_ref(name).await
+    let remote = Remote::new(Arc::clone(&ports.store));
+    remote.delete_ref(name).await?;
+    for (generation, n, _) in remote.list_log(name).await? {
+        remote.delete_log_record(name, generation, n).await?;
+    }
+    Ok(())
 }
 
 /// The names of every branch.
@@ -204,7 +210,7 @@ mod tests {
     use pando_format::CHUNK_SIZE;
 
     use super::*;
-    use crate::{Cache, Volume, sim};
+    use crate::{Cache, LogMode, Volume, sim};
 
     async fn write(ports: &Ports, cache: &Arc<Cache>, name: &str, seed: u8) {
         let v = Volume::open(ports, Arc::clone(cache), Path::new("/v"), name)
@@ -281,6 +287,58 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         copy(&ports, "main", "b", None).await.unwrap();
         assert_eq!(t0.elapsed(), Duration::from_millis(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_branch_made_again_under_a_deleted_name_starts_with_no_log() {
+        let (ports, store, _) = sim::ports(4);
+        Volume::create(&ports, "main", 1 << 20).await.unwrap();
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let cache = Arc::new(Cache::open(&ports, Path::new("/c")).await.unwrap());
+        write(&ports, &cache, "main", 1).await;
+        let dead = Volume::open_logged(
+            &ports,
+            Arc::clone(&cache),
+            Path::new("/d"),
+            "foo",
+            LogMode::Strict,
+        )
+        .await
+        .unwrap();
+        dead.wait_generation().await.unwrap();
+        for _ in 0..10_000 {
+            store.inject(sim::Fault {
+                op: sim::StoreOp::Update,
+                applied: false,
+            });
+        }
+        dead.write_at(&vec![9; CHUNK_SIZE], 0).await.unwrap();
+        dead.flush().await.unwrap();
+        dead.close().await;
+        store.clear_faults();
+
+        delete(&ports, "foo").await.unwrap();
+        assert_eq!(
+            store.keys(&pando_format::keys::log_branch("foo")),
+            Vec::<String>::new()
+        );
+        copy(&ports, "main", "foo", None).await.unwrap();
+        let v = Volume::open_logged(
+            &ports,
+            Arc::clone(&cache),
+            Path::new("/e"),
+            "foo",
+            LogMode::Strict,
+        )
+        .await
+        .unwrap();
+        v.wait_generation().await.unwrap();
+        let mut b = [0; 1];
+        v.read_at(&mut b, 0).await.unwrap();
+        assert_eq!(b[0], 1);
+        v.write_at(&vec![2; CHUNK_SIZE], 0).await.unwrap();
+        v.flush().await.unwrap();
+        v.close().await;
     }
 
     #[tokio::test(start_paused = true)]

@@ -34,7 +34,10 @@ pub use frame::{DecodedFrame, FRAME_MAX, FrameBuilder, ZSTD_LEVEL, decode_frame}
 pub use hash::Hash;
 pub use ids::{SegId, Writer, WriterId};
 pub use index::SegmentIndex;
-pub use log::{LOG_MAGIC, LOG_ZSTD_LEVEL, LogBody, LogPos, LogRecord, LogWrites};
+pub use log::{
+    LOG_CHUNKS_MAX, LOG_DATA_CHUNKS_MAX, LOG_MAGIC, LOG_SEAL_LEN, LOG_ZSTD_LEVEL, LogBody, LogPos, LogRecord,
+    LogWrites,
+};
 pub use node::{FANOUT, Node, depth_for, digit};
 pub use recipe::{Pick, RECIPE_SOURCES_MAX, Recipe, RecipeError, Run};
 pub use recording::Recording;

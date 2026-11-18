@@ -442,6 +442,11 @@ mod linux {
             out.line(format!("snapshots of {name}: {s:?}"));
         }
         let r = att.finish().await.with_context(|| format!("publish {name}"))?;
+        if let Some(e) = &r.log_open {
+            out.err(format!(
+                "{name}: the write log stays open, so the next open reads it: {e}"
+            ));
+        }
         out.line(format!("published {name} in {:.1?}: {r:?}", t0.elapsed()));
         Ok(())
     }
