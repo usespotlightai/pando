@@ -1,10 +1,11 @@
 name: kernel
 
 # The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
-# container (tests/kernel). fio verify, the crash checks, discard, drain, the store outage and
-# the FUSE frontend run on every push to main; the dm-log-writes tests run each night. xfstests
-# has its own workflow, xfstests.yml. The FUSE frontend also runs on an aarch64 runner, the
-# architecture of AgentCore Runtime, whose kernels offer FUSE and loop devices but not ublk.
+# container (tests/kernel). fio verify, the crash checks, discard, drain, the store outage, the
+# FUSE frontend and the daemon's memory in a small cgroup run on every push to main; the
+# dm-log-writes tests run each night. xfstests has its own workflow, xfstests.yml. The FUSE
+# frontend and the memory test also run on an aarch64 runner, the architecture of AgentCore
+# Runtime, whose kernels offer FUSE and loop devices but not ublk.
 # The systemd test also runs on every push: on the runner itself, it installs pando with
 # packaging/install.sh and runs a branch under the pando-attach@ unit (tests/systemd).
 # Start any of them by hand from the Actions tab. The nightly run also builds pando with
@@ -21,7 +22,7 @@ on:
       tests:
         description: "Tests to run, from tests/kernel, or systemd"
         type: string
-        default: "fio-verify crash discard drain outage fuse systemd"
+        default: "fio-verify crash discard drain outage fuse memory systemd"
       asan:
         description: "Build pando with AddressSanitizer"
         type: boolean
@@ -56,7 +57,7 @@ jobs:
           case $EVENT in
             schedule) tests="log-writes" ;;
             workflow_dispatch) tests=$ASKED ;;
-            *) tests="fio-verify crash discard drain outage fuse systemd" ;;
+            *) tests="fio-verify crash discard drain outage fuse memory systemd" ;;
           esac
           case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel, or systemd" >&2; exit 2 ;; esac
           inside=
@@ -142,14 +143,14 @@ jobs:
       - name: Build pando
         run: tools/check.sh release
 
-      - name: Run the FUSE test
+      - name: Run the FUSE and memory tests
         env:
           PANDO: target/release/pando
           RESULTS: ${{ runner.temp }}/kernel-results
           DATA: /mnt/pando-tests
         run: |
           sudo mkdir -p "$DATA"
-          tests/kernel/host.sh fuse
+          tests/kernel/host.sh fuse memory
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

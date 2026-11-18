@@ -1,6 +1,6 @@
 #![expect(
     unsafe_code,
-    reason = "the host ports call file ioctls and sync_file_range directly"
+    reason = "the host ports call file ioctls, sync_file_range and mallopt directly"
 )]
 
 use std::fs::{File, OpenOptions};
@@ -20,6 +20,16 @@ pub(crate) fn read_nowait(f: &File, buf: &mut [u8], offset: u64) -> io::Result<O
         Err(Errno::AGAIN | Errno::OPNOTSUPP) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Allocations of this many bytes or more get a mapping of their own.
+#[cfg(target_env = "gnu")]
+const MMAP_THRESHOLD: libc::c_int = 128 << 10;
+
+#[cfg(target_env = "gnu")]
+pub(crate) fn tune_malloc() {
+    // SAFETY: mallopt only changes the allocator's settings, which it reads under its own locks.
+    unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD) };
 }
 
 pub(crate) fn start_writeback(f: &File) {

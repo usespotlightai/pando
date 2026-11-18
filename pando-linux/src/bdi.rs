@@ -7,9 +7,21 @@ use std::path::{Path, PathBuf};
 const SYS_BLOCK: &str = "/sys/class/block";
 
 /// The sysfs directory, under `sys_block`, of the writeback limits of block device `dev`, a
-/// path that may go through a symlink such as `/dev/mapper/NAME`.
+/// path that may go through a symlink such as `/dev/mapper/NAME`. A device the kernel has added
+/// but whose node is not in `/dev` yet is found by its own name.
 fn bdi_dir(sys_block: &Path, dev: &Path) -> io::Result<PathBuf> {
-    let real = fs::canonicalize(dev)?;
+    let real = match fs::canonicalize(dev) {
+        Ok(p) => p,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let named = dev.file_name().map(|n| sys_block.join(n));
+            if named.as_deref().is_some_and(Path::exists) {
+                dev.to_path_buf()
+            } else {
+                return Err(e);
+            }
+        }
+        Err(e) => return Err(e),
+    };
     let name = real.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -82,6 +94,16 @@ mod tests {
         limit_dirty_in(&f.sys_block, &f.link, 64 << 20).unwrap();
         assert_eq!(f.read("strict_limit"), "1");
         assert_eq!(f.read("max_bytes"), (64u64 << 20).to_string());
+    }
+
+    #[test]
+    fn a_device_without_its_node_yet_is_found_by_its_name() {
+        let f = Fixture::new("node");
+        let dev = f.dir.join("dev").join("dm-7");
+        limit_dirty_in(&f.sys_block, &dev, 32 << 20).unwrap();
+        assert_eq!(f.read("max_bytes"), (32u64 << 20).to_string());
+        let e = limit_dirty_in(&f.sys_block, &f.dir.join("dev").join("dm-8"), 1).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
