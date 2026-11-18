@@ -8,7 +8,7 @@ use std::sync::Arc;
 use pando_format::{CHUNK_SIZE, Entry, Hash, is_zero};
 use tokio::sync::watch;
 
-use super::{CHUNK, ChunkRef, Volume};
+use super::{CHUNK, ChunkRef, Dirty, Volume};
 use crate::Result;
 use crate::dedup::PreparedChunks;
 use crate::flight::bounded;
@@ -203,15 +203,11 @@ impl Volume {
     async fn take_write(&self, idx: u64, buf: Vec<u8>, r: Option<ChunkRef>) {
         let _g = self.inner.stripe(idx).write().await;
         let mut m = self.inner.mem.lock().expect("mem lock");
-        m.dirty.insert(idx, buf);
-        m.touched.insert(idx);
-        if let Some(t) = &mut m.track {
-            t.insert(idx);
+        m.written(idx);
+        m.dirty.insert(idx, Dirty::Bytes(buf));
+        if let Some(r) = r {
+            m.dirty_ref.insert(idx, r);
         }
-        match r {
-            Some(r) => m.dirty_ref.insert(idx, r),
-            None => m.dirty_ref.remove(&idx),
-        };
     }
 
     /// Whether a flush recorded chunks as references into the file at `path` that no upload

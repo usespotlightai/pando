@@ -1,9 +1,9 @@
 name: kernel
 
 # The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
-# container (tests/kernel). fio verify and the crash checks run on every push to main; xfstests
-# and the dm-log-writes tests run each night, since the quick group takes hours. Start any of
-# them by hand from the Actions tab.
+# container (tests/kernel). fio verify, the crash checks and discard run on every push to main;
+# xfstests and the dm-log-writes tests run each night, since the quick group takes hours. Start
+# any of them by hand from the Actions tab.
 
 on:
   push:
@@ -15,7 +15,7 @@ on:
       tests:
         description: "Tests to run, from tests/kernel"
         type: string
-        default: "fio-verify crash"
+        default: "fio-verify crash discard"
 
 concurrency:
   group: kernel-${{ github.ref }}
@@ -45,7 +45,7 @@ jobs:
           case $EVENT in
             schedule) tests="xfstests log-writes" ;;
             workflow_dispatch) tests=$ASKED ;;
-            *) tests="fio-verify crash" ;;
+            *) tests="fio-verify crash discard" ;;
           esac
           case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel only" >&2; exit 2 ;; esac
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
