@@ -53,6 +53,7 @@ struct State {
     objects: BTreeMap<String, Stored>,
     next_version: u64,
     faults: VecDeque<Fault>,
+    refused: Vec<StoreOp>,
     latency: Duration,
 }
 
@@ -79,6 +80,17 @@ impl SimStore {
     /// Queues `fault`: the next call of its kind fails, once.
     pub fn inject(&self, fault: Fault) {
         self.state.lock().faults.push_back(fault);
+    }
+
+    /// Fails every call of kind `op` with [`StoreError::Permanent`], as a store that refuses
+    /// it does, until [`SimStore::accept`].
+    pub fn refuse(&self, op: StoreOp) {
+        self.state.lock().refused.push(op);
+    }
+
+    /// Ends every refusal of [`SimStore::refuse`].
+    pub fn accept(&self) {
+        self.state.lock().refused.clear();
     }
 
     /// Drops every injected fault no call has returned yet.
@@ -117,6 +129,13 @@ impl SimStore {
     }
 
     fn fault(state: &mut State, op: StoreOp) -> Option<Fault> {
+        if state.refused.contains(&op) {
+            return Some(Fault {
+                op,
+                applied: false,
+                permanent: true,
+            });
+        }
         let i = state.faults.iter().position(|f| f.op == op)?;
         state.faults.remove(i)
     }

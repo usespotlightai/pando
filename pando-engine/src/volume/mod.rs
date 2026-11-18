@@ -48,6 +48,10 @@ const _: () = assert!(CHUNK_LEN as usize == CHUNK_SIZE);
 const UPLOAD_EVERY: Duration = Duration::from_secs(2);
 /// After a failed upload the uploader waits this long before the next try.
 const RETRY_AFTER: Duration = Duration::from_secs(1);
+/// Uploads in a row the store may refuse before the uploader stops. The wait before each next
+/// try doubles from [`RETRY_AFTER`], so a refusal that passes within about two minutes, such
+/// as a policy that is still propagating, does not stop it.
+const REFUSED_TRIES: u32 = 8;
 /// How often an open tries to take the writer generation when the store fails transiently.
 const GENERATION_TRIES: usize = 10;
 /// Chunks a flush hashes and stores at once.
@@ -1232,25 +1236,37 @@ impl Inner {
                 _ = changed.changed() => {}
             }
         }
+        let mut refused = 0;
         loop {
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => return,
                 () = self.kick.notified() => {}
                 () = tokio::time::sleep(UPLOAD_EVERY) => {}
             }
-            if let Err(e) = self.upload().await {
-                if matches!(e.kind(), Error::Fenced { .. } | Error::ChunkLost { .. }) {
-                    return;
+            let e = match self.upload().await {
+                Ok(()) => {
+                    refused = 0;
+                    continue;
                 }
-                if is_permanent(&e) {
+                Err(e) => e,
+            };
+            if matches!(e.kind(), Error::Fenced { .. } | Error::ChunkLost { .. }) {
+                return;
+            }
+            let wait = if is_permanent(&e) {
+                refused += 1;
+                if refused >= REFUSED_TRIES {
                     fail_with(&mut self.up.lock(), e);
                     self.notify();
                     return;
                 }
-                tokio::select! {
-                    _ = stop.wait_for(|s| *s) => return,
-                    () = tokio::time::sleep(RETRY_AFTER) => {}
-                }
+                RETRY_AFTER * (1 << (refused - 1))
+            } else {
+                RETRY_AFTER
+            };
+            tokio::select! {
+                _ = stop.wait_for(|s| *s) => return,
+                () = tokio::time::sleep(wait) => {}
             }
         }
     }
@@ -1794,7 +1810,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_refused_upload_stops_the_uploader_and_fails_the_checkpoint() {
+    async fn a_lasting_refusal_stops_the_uploader_and_fails_the_checkpoint() {
         let (ports, store, _) = sim::ports(5);
         branch(&ports, "main").await;
         let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
@@ -1803,21 +1819,44 @@ mod tests {
         v.write_at(&data(1, 100), 0).await.unwrap();
         v.checkpoint().await.unwrap();
         let published = v.published();
-        store.inject(Fault {
-            op: StoreOp::Create,
-            applied: false,
-            permanent: true,
-        });
+        store.refuse(StoreOp::Create);
         v.write_at(&data(2, 100), 0).await.unwrap();
         let refused = |e: &Error| matches!(e.kind(), Error::Store(StoreError::Permanent { .. }));
         let e = v.checkpoint().await.unwrap_err();
         assert!(refused(&e), "{e}");
         let stopped = v.upload_stopped().await;
         assert!(refused(&stopped), "{stopped}");
+        store.accept();
         tokio::time::sleep(UPLOAD_EVERY * 30).await;
-        assert_eq!(v.published(), published, "no upload ran after the refusal");
+        assert_eq!(
+            v.published(),
+            published,
+            "no upload ran after the uploader stopped"
+        );
         let again = v.checkpoint().await.unwrap_err();
         assert!(refused(&again), "{again}");
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_passes_does_not_stop_the_uploader() {
+        let (ports, store, _) = sim::ports(6);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        for _ in 1..REFUSED_TRIES {
+            store.inject(Fault {
+                op: StoreOp::Update,
+                applied: false,
+                permanent: true,
+            });
+        }
+        v.write_at(&data(2, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        assert_eq!(v.published(), v.root());
         v.close().await;
     }
 

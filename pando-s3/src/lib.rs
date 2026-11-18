@@ -15,8 +15,8 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::client::{
-    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
-    ReqwestConnector,
+    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpResponseBody,
+    HttpService, ReqwestConnector,
 };
 use object_store::path::Path;
 use object_store::{
@@ -103,7 +103,7 @@ impl Client {
 
 impl S3Store {
     /// The port over the store `c` names. It returns before the client is built; the first
-    /// request waits for the build and fails with [`StoreError::Other`] if the build failed.
+    /// request waits for the build and fails with [`StoreError::Permanent`] if the build failed.
     pub fn new(c: &S3Config) -> Result<S3Store, StoreError> {
         let mut b = AmazonS3Builder::new()
             .with_bucket_name(&c.bucket)
@@ -258,7 +258,7 @@ impl HttpService for RefusalService {
             return Ok(r);
         }
         let (parts, body) = r.into_parts();
-        let body = body.bytes().await?;
+        let body = head(body).await?;
         let text = String::from_utf8_lossy(&body).into_owned();
         if !refuses(status.as_u16(), &text) {
             return Ok(HttpResponse::from_parts(parts, body.into()));
@@ -272,6 +272,23 @@ impl HttpService for RefusalService {
             },
         ))
     }
+}
+
+/// The most of a client error's body that is read and kept.
+const BODY_MAX: usize = 4 << 10;
+
+/// The first [`BODY_MAX`] bytes of `body`.
+async fn head(body: HttpResponseBody) -> Result<Bytes, HttpError> {
+    let mut chunks = body.bytes_stream();
+    let mut head = Vec::new();
+    while head.len() < BODY_MAX {
+        match chunks.try_next().await? {
+            Some(c) => head.extend_from_slice(&c),
+            None => break,
+        }
+    }
+    head.truncate(BODY_MAX);
+    Ok(Bytes::from(head))
 }
 
 fn refused(e: &object_store::Error) -> bool {
@@ -428,8 +445,9 @@ mod tests {
             "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
-        c.write_all(reply.as_bytes()).await.unwrap();
-        c.shutdown().await.unwrap();
+        if c.write_all(reply.as_bytes()).await.is_ok() {
+            let _ = c.shutdown().await;
+        }
     }
 
     async fn answering(status: &'static str, body: &'static str) -> (S3Store, Arc<AtomicUsize>) {
@@ -468,6 +486,25 @@ mod tests {
         assert!(matches!(e, StoreError::Permanent { .. }), "{e}");
         assert!(e.to_string().contains("ValidationException"), "{e}");
         assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_keeps_only_the_head_of_a_long_body() {
+        let body: &'static str = Box::leak(
+            format!(
+                "<Error><Code>InvalidArgument</Code>{}</Error>",
+                "x".repeat(1 << 20)
+            )
+            .into_boxed_str(),
+        );
+        let (s, _) = answering("400 Bad Request", body).await;
+        let e = s.put("k", Bytes::from_static(b"v")).await.unwrap_err();
+        assert!(matches!(e, StoreError::Permanent { .. }), "{e}");
+        assert!(
+            e.to_string().len() < 2 * BODY_MAX,
+            "{} bytes",
+            e.to_string().len()
+        );
     }
 
     #[tokio::test]

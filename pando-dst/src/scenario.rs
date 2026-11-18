@@ -227,9 +227,10 @@ fn refused(e: &Error) -> bool {
     matches!(e.kind(), Error::Store(StoreError::Permanent { .. }))
 }
 
-/// The store refuses one request of the uploader for good at a random step, after a write that
-/// must be uploaded. Every checkpoint from then on fails with the refusal, and the uploader
-/// stops. Nothing is lost: once the store accepts again, a restart publishes every write.
+/// From a random step on, the store refuses every segment create or every ref update, after a
+/// write that must be uploaded. Every checkpoint from then on fails with the refusal, and the
+/// uploader stops. Nothing is lost: once the store accepts again, a restart publishes every
+/// write.
 pub async fn a_refusing_store(seed: u64, steps: usize) -> Result<Report, String> {
     let (ports, store, fs) = sim::ports(seed);
     Volume::create(&ports, BRANCH, u64_from(SIZE))
@@ -254,11 +255,7 @@ pub async fn a_refusing_store(seed: u64, steps: usize) -> Result<Report, String>
             } else {
                 StoreOp::Update
             };
-            w.store.inject(Fault {
-                op,
-                applied: false,
-                permanent: true,
-            });
+            w.store.refuse(op);
             w.report.faults += 1;
             let b = [!w.model[0]];
             v.write_at(&b, 0).await.map_err(|e| format!("{at}: write: {e}"))?;
@@ -306,6 +303,7 @@ pub async fn a_refusing_store(seed: u64, steps: usize) -> Result<Report, String>
     }
     v.close().await;
     drop(v);
+    w.store.accept();
     let v = open(&w.ports, "/host")
         .await
         .map_err(|e| format!("seed {seed}: restart: {e}"))?;
