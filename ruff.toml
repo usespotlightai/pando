@@ -15,3 +15,6 @@ ignore = [
 
 [format]
 quote-style = "double"
+
+[lint.per-file-ignores]
+"bench/agentcore/probe.py" = ["INP001"] # a standalone script copied into the probe image

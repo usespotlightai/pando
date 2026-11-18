@@ -12,3 +12,8 @@
 /bench/infra/backend_override.tf
 /bench/infra/*.auto.tfvars.json
 __pycache__/
+/bench/agentcore/.terraform/
+/bench/agentcore/*.tfstate
+/bench/agentcore/*.tfstate.*
+/bench/agentcore/*.tfvars
+/bench/agentcore/results/
