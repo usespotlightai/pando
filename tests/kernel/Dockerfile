@@ -17,13 +17,16 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 RUN for try in 1 2 3 4 5; do \
 		for url in https://kernel.googlesource.com/pub/scm/fs/xfs/xfstests-dev \
 			https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git; do \
-			git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone -q --depth 1 --branch $XFSTESTS_REF "$url" /opt/xfstests && break 2; \
+			if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone -q --depth 1 --branch $XFSTESTS_REF "$url" /opt/xfstests; then \
+				got=$(git -C /opt/xfstests rev-parse HEAD); \
+				[ "$got" = "$XFSTESTS_COMMIT" ] && break 2; \
+				echo "xfstests $XFSTESTS_REF from $url is $got, want $XFSTESTS_COMMIT" >&2; \
+			fi; \
 			rm -rf /opt/xfstests; \
 		done; \
-		if [ "$try" = 5 ]; then echo "xfstests $XFSTESTS_REF: clone failed 5 times from each mirror" >&2; exit 1; fi; \
+		if [ "$try" = 5 ]; then echo "xfstests $XFSTESTS_REF: no mirror gave $XFSTESTS_COMMIT in 5 tries" >&2; exit 1; fi; \
 		sleep $((try * 15)); \
-	done \
-	&& test "$(git -C /opt/xfstests rev-parse HEAD)" = "$XFSTESTS_COMMIT"
+	done
 WORKDIR /opt/xfstests
 RUN make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 \
 	&& test -x /var/lib/xfstests/check && test -x /var/lib/xfstests/ltp/fsstress \
