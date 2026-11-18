@@ -13,7 +13,8 @@ mod serve;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -22,7 +23,7 @@ use pando_engine::gc::{self, GcOptions};
 use pando_engine::{Cache, Ports, Volume, base, branch};
 use pando_format::{Ref, keys};
 use serve::Out;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 
 const DEFAULT_CACHE: &str = "/data/cache";
 
@@ -203,8 +204,9 @@ pub(crate) fn parse_size(s: &str) -> Result<u64> {
         .with_context(|| format!("size {s:?} is too large"))
 }
 
-/// What the commands of one process share: the ports, the cache, opened on first use, and the
-/// checkpoints read so far.
+/// What the commands of one process share: the ports, the cache, opened on first use, the
+/// checkpoints read so far, and the devices of attaches that drained, held until the process
+/// exits.
 #[derive(Debug)]
 pub(crate) struct Host {
     ports: Ports,
@@ -213,9 +215,78 @@ pub(crate) struct Host {
     checkpoints: branch::Checkpoints,
     remote: String,
     identity: String,
+    held: Mutex<Vec<device::Held>>,
+    drain_failed: AtomicBool,
+    attaches: watch::Sender<usize>,
+}
+
+/// The error of an attach that drained: its device waits for the next daemon.
+#[derive(Debug)]
+pub(crate) struct Drained;
+
+impl std::fmt::Display for Drained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("drained; the device waits for `attach --recover`")
+    }
+}
+
+impl std::error::Error for Drained {}
+
+/// Counts an attach in [`Host::attaches`] while it lives.
+struct Attaching<'a>(&'a watch::Sender<usize>);
+
+impl Drop for Attaching<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
 }
 
 impl Host {
+    fn attaching(&self) -> Attaching<'_> {
+        self.attaches.send_modify(|n| *n += 1);
+        Attaching(&self.attaches)
+    }
+
+    /// Keeps the device of an attach that drained; [`Drained`] or the drain's error then.
+    fn ended(&self, ended: device::Ended) -> Result<()> {
+        let (held, err) = match ended {
+            device::Ended::Detached => return Ok(()),
+            device::Ended::Drained(h) => (h, anyhow::Error::new(Drained)),
+            device::Ended::DrainFailed(e, h) => {
+                self.drain_failed.store(true, Ordering::Relaxed);
+                (h, e)
+            }
+        };
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(held);
+        Err(err)
+    }
+
+    /// Whether a drained device is held; the process must then exit without closing it.
+    fn holds(&self) -> bool {
+        !self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// The exit status of a process that holds drained devices.
+    fn drained_status(&self) -> i32 {
+        if self.drain_failed.load(Ordering::Relaxed) {
+            1
+        } else {
+            device::DRAINED
+        }
+    }
+
+    /// Waits until no attach runs.
+    async fn no_attaches(&self) {
+        let _ = self.attaches.subscribe().wait_for(|n| *n == 0).await;
+    }
+
     async fn cache(&self) -> Result<Arc<Cache>> {
         let c = self
             .cache
@@ -227,10 +298,21 @@ impl Host {
     }
 }
 
+/// How the process ends: with a code, or at once with `status` while `host` still holds the
+/// devices of drained attaches.
+enum Exit {
+    Code(ExitCode),
+    Held { status: i32, host: Arc<Host> },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match start(Cli::parse()).await {
-        Ok(code) => code,
+        Ok(Exit::Code(code)) => code,
+        Ok(Exit::Held { status, host }) => {
+            let _held = host;
+            std::process::exit(status)
+        }
         Err(e) => {
             eprintln!("Error: {e:?}");
             ExitCode::FAILURE
@@ -238,10 +320,12 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn start(cli: Cli) -> Result<ExitCode> {
+async fn start(cli: Cli) -> Result<Exit> {
     let serving = matches!(cli.command, Command::Serve);
     if let Some(socket) = cli.socket.as_deref().filter(|_| !serving) {
-        return serve::client(socket, std::env::args_os().collect()).await;
+        return serve::client(socket, std::env::args_os().collect())
+            .await
+            .map(Exit::Code);
     }
     let host = Arc::new(Host {
         ports: pando_host::ports(cli.store.open()?, cli.cpu_threads)?,
@@ -250,15 +334,28 @@ async fn start(cli: Cli) -> Result<ExitCode> {
         checkpoints: branch::Checkpoints::default(),
         remote: cli.store.remote().to_owned(),
         identity: cli.store.identity(),
+        held: Mutex::default(),
+        drain_failed: AtomicBool::new(false),
+        attaches: watch::Sender::new(0),
     });
-    if serving {
+    let done = if serving {
         let socket = cli.socket.context("serve needs --socket")?;
         host.cache().await?;
-        serve::serve(host, &socket).await?;
+        serve::serve(Arc::clone(&host), &socket).await
     } else {
-        run(&host, cli.command, &Out::stdio()).await?;
+        run(&host, cli.command, &Out::stdio()).await
+    };
+    if host.holds() {
+        if let Err(e) = &done
+            && !e.is::<Drained>()
+        {
+            eprintln!("{e:#}");
+        }
+        let status = host.drained_status();
+        return Ok(Exit::Held { status, host });
     }
-    Ok(ExitCode::SUCCESS)
+    done?;
+    Ok(Exit::Code(ExitCode::SUCCESS))
 }
 
 /// Runs one command on `host`, writing its output to `out`.
@@ -341,7 +438,11 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
             };
             collect(ports, &cache().await?, &opts, out).await
         }
-        Command::Attach(a) => device::attach(ports, cache().await?, a, host.identity.clone(), out).await,
+        Command::Attach(a) => {
+            let _busy = host.attaching();
+            let ended = device::attach(ports, cache().await?, a, host.identity.clone(), out).await?;
+            host.ended(ended)
+        }
         Command::Detach(d) => device::detach(d).await,
         Command::Resize(r) => device::resize(r, out).await,
         Command::Stat => {
@@ -458,6 +559,37 @@ mod tests {
         assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
         assert_eq!(parse_duration("24h").unwrap(), Duration::from_hours(24));
         assert!(parse_duration("3d").is_err());
+    }
+
+    #[test]
+    fn recover_alone_is_always_and_never_takes_the_branch_name() {
+        use device::Recover;
+        let attach = |args: &[&str]| {
+            let all = ["pando", "attach"].into_iter().chain(args.iter().copied());
+            let parsed = Cli::try_parse_from(all).unwrap().command;
+            let a = if let Command::Attach(a) = parsed {
+                Some(a)
+            } else {
+                None
+            };
+            let a = a.unwrap();
+            (a.name, a.recover, a.drain_wait)
+        };
+        let dev = ["--device", "/dev/ublkb1"];
+        assert_eq!(
+            attach(&["main", dev[0], dev[1]]),
+            ("main".into(), Recover::Never, Duration::from_secs(60))
+        );
+        assert_eq!(attach(&["main", dev[0], dev[1], "--recover"]).1, Recover::Always);
+        assert_eq!(attach(&["--recover", "main", dev[0], dev[1]]).0, "main");
+        assert_eq!(
+            attach(&["main", dev[0], dev[1], "--recover=auto"]).1,
+            Recover::Auto
+        );
+        assert_eq!(
+            attach(&["main", dev[0], dev[1], "--drain-wait", "5m"]).2,
+            Duration::from_secs(300)
+        );
     }
 
     #[test]

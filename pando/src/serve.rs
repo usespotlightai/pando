@@ -9,8 +9,9 @@
 //! line followed by its bytes. The first argument is the client's working directory, against
 //! which the daemon makes relative path arguments absolute. The answer is lines: `o<text>` for standard output, `e<text>` for
 //! standard error, and last `x<code>`. A client that goes away cancels its command, except an
-//! `attach`, whose device keeps serving until `detach`. Devices the daemon serves stop when
-//! the daemon stops; `attach --recover` takes them over.
+//! `attach`, whose device keeps serving until `detach`. On SIGTERM or SIGINT the daemon takes
+//! no more requests, waits while its attaches drain, and exits with the status an attach that
+//! drained exits with, holding their devices for `attach --recover`.
 
 use std::ffi::OsString;
 use std::fs::Permissions;
@@ -19,15 +20,19 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 
-use crate::{Cli, Command, Host};
+use crate::{Cli, Command, Drained, Host};
 
+/// How long a daemon told twice to stop still waits for its attaches to commit their writes.
+const LAST_WAIT: Duration = Duration::from_secs(10);
 /// Arguments a request may carry, and bytes per argument.
 const MAX_ARGS: usize = 256;
 const MAX_ARG: usize = 64 << 10;
@@ -46,6 +51,11 @@ pub(crate) struct Out(Option<mpsc::UnboundedSender<(Stream, String)>>);
 impl Out {
     pub(crate) fn stdio() -> Out {
         Out(None)
+    }
+
+    /// Whether the command runs as its own process, writing to its standard output and error.
+    pub(crate) fn is_stdio(&self) -> bool {
+        self.0.is_none()
     }
 
     /// Writes one line to standard output.
@@ -69,15 +79,19 @@ impl Out {
     }
 }
 
-/// Serves requests on `socket` until the process stops.
+/// Serves requests on `socket` until SIGTERM or SIGINT. Then it takes no more requests and
+/// returns once every attach has drained, or a while after a second signal; the caller exits
+/// while the host holds the drained devices.
 pub(crate) async fn serve(host: Arc<Host>, socket: &Path) -> Result<()> {
     let l = listen(socket).await?;
+    let mut signals = Signals::new()?;
     eprintln!("serving on {}", socket.display());
+    crate::device::notify("READY=1");
     loop {
-        let (c, _) = l
-            .accept()
-            .await
-            .with_context(|| format!("accept on {}", socket.display()))?;
+        let (c, _) = tokio::select! {
+            r = l.accept() => r.with_context(|| format!("accept on {}", socket.display()))?,
+            () = signals.next() => break,
+        };
         let host = Arc::clone(&host);
         tokio::spawn(async move {
             if let Err(e) = answer(host, c).await {
@@ -85,6 +99,17 @@ pub(crate) async fn serve(host: Arc<Host>, socket: &Path) -> Result<()> {
             }
         });
     }
+    crate::device::notify("STOPPING=1");
+    drop(l);
+    let _ = std::fs::remove_file(socket);
+    eprintln!("stopping: no more requests; waiting for the attaches to drain");
+    tokio::select! {
+        () = host.no_attaches() => {}
+        () = signals.next() => {
+            let _ = tokio::time::timeout(LAST_WAIT, host.no_attaches()).await;
+        }
+    }
+    Ok(())
 }
 
 /// Binds `socket`, usable only by this user from the start, unless a live daemon serves it
@@ -142,6 +167,7 @@ async fn answer(host: Arc<Host>, c: UnixStream) -> Result<()> {
                 let job = tokio::spawn(async move {
                     match crate::run(&host, cli.command, &out).await {
                         Ok(()) => 0,
+                        Err(e) if e.is::<Drained>() => crate::device::DRAINED,
                         Err(e) => {
                             out.err(format!("Error: {e:?}"));
                             1
@@ -192,6 +218,28 @@ async fn answer(host: Arc<Host>, c: UnixStream) -> Result<()> {
         w.write_all(format!("x{code}\n").as_bytes()).await?;
     }
     Ok(())
+}
+
+/// SIGTERM and SIGINT.
+struct Signals {
+    term: Signal,
+    int: Signal,
+}
+
+impl Signals {
+    fn new() -> Result<Signals> {
+        Ok(Signals {
+            term: signal(SignalKind::terminate()).context("listen for SIGTERM")?,
+            int: signal(SignalKind::interrupt()).context("listen for SIGINT")?,
+        })
+    }
+
+    async fn next(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.int.recv() => {}
+        }
+    }
 }
 
 enum Refused {

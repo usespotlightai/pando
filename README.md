@@ -36,7 +36,9 @@ sharing one root system.
   touched, and the next run on another host prefetches them. Once the branch is local, Pando
   hands the device to the kernel through device-mapper over a loop device and leaves the I/O path.
 - **Crash safety.** ublk user recovery and a local journal preserve acknowledged writes through
-  a daemon crash. After restarting, the daemon resumes serving the device where it left off.
+  a daemon crash. After restarting, the daemon resumes serving the device where it left off. On
+  SIGTERM it publishes what it holds and leaves the device to the next daemon, so an upgrade
+  does not unmount anything. [docs/hosts.md](docs/hosts.md) covers running it under systemd.
 - **Host daemon.** `pando serve --socket PATH` keeps the store's connections, the cache and the
   checkpoints it has read. `pando --socket PATH <command>` runs the command there, so a branch or
   attach skips process start-up, credential loading and cold connections.

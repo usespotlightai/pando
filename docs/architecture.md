@@ -69,4 +69,6 @@ client's working directory and arguments, and relative paths in the arguments re
 that directory; the answer streams the command's output and ends with its exit code. Store
 settings and credentials stay in the daemon, which refuses a request for another store or cache.
 A client that disconnects cancels its command, except `attach`, whose device keeps serving until
-`detach`. Devices stop with the daemon; `attach --recover` takes them over.
+`detach`. On SIGTERM or SIGINT the daemon takes no more requests, lets each attach drain as
+a lone `attach` would, and exits with status 75 while it holds their devices; `attach --recover`
+takes them over.
