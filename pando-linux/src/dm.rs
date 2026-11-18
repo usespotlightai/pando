@@ -920,7 +920,7 @@ mod tests {
             "<blocks>",
             "<blocks><range begin=\"1\"/></blocks>",
             "<blocks><range begin=\"3\" end=\"3\"/></blocks>",
-            "<blocks><blok block=\"1\"/></blocks>",
+            "<blocks><extent block=\"1\"/></blocks>",
             "<blocks><block block=\"x\"/></blocks>",
             "<blocks>junk</blocks>",
             "<blocks></blocks><block block=\"1\"/>",
