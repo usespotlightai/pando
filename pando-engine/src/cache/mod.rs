@@ -253,9 +253,21 @@ impl Cache {
         Ok(b)
     }
 
+    /// Fetches object `e` to this host when it is not here, so a later [`Self::read`] of it
+    /// needs no store. Counts no hit.
+    pub(crate) async fn warm(&self, e: &Entry) -> Result<()> {
+        self.read_counted(e, 0, 1, false).await.map(drop)
+    }
+
     async fn read_as(&self, e: &Entry, inner: usize, len: usize) -> Result<Bytes> {
+        self.read_counted(e, inner, len, true).await
+    }
+
+    async fn read_counted(&self, e: &Entry, inner: usize, len: usize, count: bool) -> Result<Bytes> {
         if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            if count {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(b);
         }
         if let Some(b) = self.base_read(&e.hash, inner, len).await {

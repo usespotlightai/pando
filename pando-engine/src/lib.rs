@@ -48,4 +48,4 @@ pub use import::{ImportReport, import};
 pub use packer::PackStats;
 pub use ports::Ports;
 pub use remote::RemoteStats;
-pub use volume::{CheckpointReport, LogMode, PassTimes, Volume};
+pub use volume::{CheckpointReport, LogMode, PassTimes, STORE_WAIT, Volume};

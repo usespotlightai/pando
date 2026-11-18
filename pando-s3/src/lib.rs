@@ -29,6 +29,9 @@ use tokio::sync::{OnceCell, oneshot};
 /// The longest one request may take. A segment PUT shares the uplink with the other PUTs in
 /// flight, so on a slow link it takes minutes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// The longest a connection to the store may take to open, so a store that does not answer
+/// fails each try quickly and the engine's retries and waits apply.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where the store is and how to sign in. Credentials come from the caller, never from a file
 /// this crate reads.
@@ -113,6 +116,7 @@ impl S3Store {
             .with_client_options(
                 ClientOptions::new()
                     .with_timeout(REQUEST_TIMEOUT)
+                    .with_connect_timeout(CONNECT_TIMEOUT)
                     .with_allow_http(c.allow_http),
             )
             .with_http_connector(RefusalConnector)
