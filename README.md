@@ -62,6 +62,13 @@ cargo test --workspace
 checks and the tests. It also takes `asan`, `fuzz [seconds]`, `coverage`, `mutants`, or any
 single check by name, such as `clippy` or `shellcheck`. The fuzz targets are in `fuzz/`.
 
+Dependabot proposes weekly updates for the crates, actions, base images and Terraform providers
+(`.github/dependabot.yml`). A crate update passes `vet` only once each new version has an audit
+or exemption in `supply-chain/`. Dependabot moves the `rust` image only within its minor version,
+so a new Rust release is a manual change to `rust-toolchain.toml`, `rust-version` in
+`Cargo.toml`, and the `FROM` and `rustup` lines in `tools/Dockerfile`, all in one commit. The
+nightly in `tools/nightly` and `fuzz/README.md` also moves by hand.
+
 Fixtures in `pando-format/tests/fixtures` pin the byte encoding of every stored object.
 
 ## Alternatives

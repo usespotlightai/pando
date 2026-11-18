@@ -65,6 +65,11 @@ pub(crate) struct AttachArgs {
     /// Hardware queues of a new device, one thread each.
     #[arg(long, default_value_t = 2)]
     pub(crate) queues: u16,
+    /// Cap the page cache's dirty data on the device the file system sits on at this many
+    /// bytes, so writes reach the branch while it runs and a detach has little left to take;
+    /// writers wait at the cap (0: the kernel's limits).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) dirty_limit: u64,
 }
 
 /// Which device `detach` stops.
@@ -201,6 +206,7 @@ mod linux {
             }
             return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
         }
+        limit_dirty(&a).await;
         println!(
             "attached {} as {} in {:.1?}{}",
             a.name,
@@ -243,6 +249,20 @@ mod linux {
         let published = finish(att, &a.name).await;
         drop(fe);
         published
+    }
+
+    /// Caps the dirty page cache of the device `a` mounts at `a.dirty_limit` bytes, unless it
+    /// is 0. A failure leaves the kernel's limits in force.
+    async fn limit_dirty(a: &AttachArgs) {
+        if a.dirty_limit == 0 {
+            return;
+        }
+        let mounted =
+            a.dm.as_deref()
+                .map_or_else(|| a.device.clone(), pando_linux::mapper_path);
+        if let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await {
+            eprintln!("{}: the dirty limit is off: {e}", mounted.display());
+        }
     }
 
     /// Warms `att`, then, with `hand_off`, moves its device to a local image.
@@ -396,8 +416,33 @@ mod linux {
         if let Some(s) = att.snapshots() {
             println!("snapshots of {name}: {s:?}");
         }
+        let cache = Arc::clone(att.cache());
         let r = att.finish().await.with_context(|| format!("publish {name}"))?;
-        println!("published {name} in {:.1?}: {r:?}", t0.elapsed());
+        let total = t0.elapsed();
+        println!("published {name} in {total:.1?}: {r:?}");
+        let c = &r.checkpoint;
+        let last = c.last.unwrap_or_default();
+        let s = cache.stats();
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "publish times {name}: total={:.4} absorb={:.4} flush={:.4} wait={:.4} pack={:.4} ref={:.4} \
+             after={:.4} passes_before={} bytes_before={} passes={} bytes={} stalls={} stall={:.4} \
+             fetched_bytes={}",
+            total.as_secs_f64(),
+            r.absorb.as_secs_f64(),
+            c.flush.as_secs_f64(),
+            c.wait.as_secs_f64(),
+            last.pack.as_secs_f64(),
+            last.publish.as_secs_f64(),
+            r.after.as_secs_f64(),
+            c.passes_before,
+            c.bytes_before,
+            c.passes,
+            c.bytes,
+            load(&s.stalls),
+            Duration::from_nanos(load(&s.stall_nanos)).as_secs_f64(),
+            load(&s.bytes_fetched),
+        );
         Ok(())
     }
 

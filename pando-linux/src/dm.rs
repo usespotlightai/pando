@@ -263,7 +263,7 @@ fn linear(target: &Path, size: u64) -> io::Result<Vec<Target>> {
     }])
 }
 
-fn mapper_node(name: &str) -> PathBuf {
+pub(crate) fn mapper_node(name: &str) -> PathBuf {
     Path::new("/dev/mapper").join(name)
 }
 
