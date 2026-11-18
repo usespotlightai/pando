@@ -59,6 +59,21 @@ readback() {
 	cmp -s "$W/got" "$W/want"
 }
 
+# snap <label>: what holds the device and waits on it, for a run that fails.
+snap() {
+	{
+		echo "== $1 at $(date +%s.%N || true)"
+		echo "inflight: $(cat /sys/block/ublkb71/inflight 2>&1 || true)"
+		fuser -v "$A" 2>&1 || true
+		for p in /proc/[0-9]*; do
+			read -r _ _ st _ <"$p/stat" 2>/dev/null || continue
+			[[ $st = D ]] || continue
+			echo "D: ${p#/proc/} $(tr '\0' ' ' <"$p/cmdline" || true)"
+			cat "$p/stack" 2>&1 || true
+		done
+	} >>"$R/$TEST.snap" 2>&1
+}
+
 # serve <cache> <log> <device>: attaches branch o on an empty cache and waits for the device.
 serve() {
 	attach_bg "$1" "$2" o --device "$3" --state "$1.state" --record false --store-wait "${WAIT}s"
@@ -102,8 +117,13 @@ fi
 if readback "$A" 0 1 "$W/data" 0; then check "read before the outage" ok; else check "read before the outage" "differs"; fi
 
 mark "pando outage: SIGSTOP"
+snap "before SIGSTOP"
 pkill -STOP -x minio || check "stop the store" "no minio"
 t0=$(date +%s)
+(
+	sleep 3
+	snap "3 s into the cached read"
+) &
 if timeout 5 dd if="$A" of=/dev/null bs=64k count=1 iflag=direct status=none && readback "$A" 0 1 "$W/data" 0; then
 	check "cached read during the outage" ok
 else
