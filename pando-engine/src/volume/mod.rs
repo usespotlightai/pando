@@ -678,8 +678,10 @@ impl Volume {
     }
 
     /// Writes `p` at `off`; reads see it once this returns. [`Self::flush`] makes it durable
-    /// on this host. While the cache's disk is full it fails at once, before it changes
-    /// anything, with an error that [`Error::is_no_room`] reports.
+    /// on this host. While the cache's disk is full it fails at once, changing nothing, with an
+    /// error that [`Error::is_no_room`] reports. A write that fills the disk part-way fails
+    /// with that error too, and may have applied some of its chunks, as a failed write to a
+    /// disk may have written some of its sectors.
     pub async fn write_at(&self, p: &[u8], off: u64) -> Result<()> {
         if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
@@ -1518,10 +1520,13 @@ impl Inner {
     /// Commits the dirty set when it is not empty and its buffers hold at least `min` bytes.
     /// A commit with `min` above 0 only bounds memory: no caller waits for it, so it leaves
     /// the log to the uploader's next pass and does not start one. A commit that finds the
-    /// disk full frees the cache's reserve and tries once more.
+    /// disk full frees the cache's reserve and tries once more, when the reserve was freed
+    /// since it began, by it or by a write.
     async fn commit_at(&self, min: usize) -> Result<u64> {
+        let space = self.cache.space();
+        let before = space.released();
         match self.commit_once(min).await {
-            Err(e) if e.is_no_room() && self.cache.space().release().await => self.commit_once(min).await,
+            Err(e) if e.is_no_room() && space.release().await != before => self.commit_once(min).await,
             r => r,
         }
     }

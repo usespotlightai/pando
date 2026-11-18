@@ -68,7 +68,8 @@ struct Queue {
 }
 
 impl Shard {
-    /// Writes the queued records until none are left. A write that fails, as on a full disk,
+    /// Writes the queued records until none are left. It runs as a task of its own, so a
+    /// cancelled append never leaves `writing` set with no writer. A write that fails, as on a full disk,
     /// may have written part of its records: the file is cut back to its end before anything
     /// else is written, so a replay never reads that part, or stops at it, in front of
     /// records written later.
@@ -225,7 +226,8 @@ impl Journal {
         let Some(g) = self.current.read().clone() else {
             return Err(Error::Corrupt("an append to a journal not started".into()));
         };
-        let shard = &g.shards[usize_from(idx % u64_from(SHARDS))];
+        let at = usize_from(idx % u64_from(SHARDS));
+        let shard = &g.shards[at];
         let (tx, rx) = oneshot::channel();
         let lead = {
             let mut q = shard.queue.lock();
@@ -238,7 +240,8 @@ impl Journal {
             !std::mem::replace(&mut q.writing, true)
         };
         if lead {
-            shard.drain().await;
+            let g = Arc::clone(&g);
+            tokio::spawn(async move { g.shards[at].drain().await });
         }
         match rx.await {
             Ok(done) => done.map_err(Error::Shared),

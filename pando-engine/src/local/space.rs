@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::time::{Duration, Instant};
 
@@ -25,6 +25,8 @@ pub(crate) struct Space {
     path: PathBuf,
     reserve: u64,
     full: AtomicBool,
+    released: AtomicU64,
+    turn: tokio::sync::Mutex<()>,
     next_check: Mutex<Option<Instant>>,
 }
 
@@ -46,6 +48,8 @@ impl Space {
             path: dir.join(name),
             reserve,
             full: AtomicBool::new(false),
+            released: AtomicU64::new(0),
+            turn: tokio::sync::Mutex::new(()),
             next_check: Mutex::new(None),
         };
         match s.hold().await {
@@ -72,15 +76,21 @@ impl Space {
         self.full.load(Ordering::Acquire)
     }
 
-    /// Frees the reserve for the commits to come and fails writes from now on; `true` when
-    /// this call did it, `false` when the space was full already.
-    pub(crate) async fn release(&self) -> bool {
-        if self.full.swap(true, Ordering::AcqRel) {
-            return false;
+    /// How many times the reserve has been freed.
+    pub(crate) fn released(&self) -> u64 {
+        self.released.load(Ordering::Acquire)
+    }
+
+    /// Frees the reserve for the commits to come and fails writes from now on. It returns
+    /// [`Space::released`] once the reserve is gone, whether this call or another freed it.
+    pub(crate) async fn release(&self) -> u64 {
+        let _turn = self.turn.lock().await;
+        if !self.full.swap(true, Ordering::AcqRel) {
+            *self.next_check.lock() = Some(Instant::now() + CHECK_EVERY);
+            let _ = self.fs.remove(&self.path).await;
+            self.released.fetch_add(1, Ordering::AcqRel);
         }
-        *self.next_check.lock() = Some(Instant::now() + CHECK_EVERY);
-        let _ = self.fs.remove(&self.path).await;
-        true
+        self.released()
     }
 
     /// Succeeds while writes may go on: always while the space has room, and once a full
@@ -109,6 +119,10 @@ impl Space {
         let room = self.fs.available(&self.dir).await;
         if !room.is_ok_and(|n| n >= self.reserve.saturating_mul(2)) {
             return false;
+        }
+        let _turn = self.turn.lock().await;
+        if !self.is_full() {
+            return true;
         }
         if self.hold().await.is_err() {
             let _ = self.fs.remove(&self.path).await;
@@ -152,8 +166,9 @@ mod tests {
         other.allocate(900).await.unwrap();
         assert!(other.allocate(901).await.is_err());
 
-        assert!(s.release().await);
-        assert!(!s.release().await, "a second release frees nothing");
+        assert_eq!(s.released(), 0);
+        assert_eq!(s.release().await, 1);
+        assert_eq!(s.release().await, 1, "a second release frees nothing");
         assert!(s.is_full());
         other.allocate(950).await.unwrap();
         assert!(s.admit().await.is_err());
