@@ -20,7 +20,7 @@ use pando_format::{
 };
 use tokio::sync::{Notify, watch};
 
-use super::{Inner, RETRY_AFTER, UPLOAD_EVERY, backoff, fail_with, is_transient};
+use super::{Inner, RETRY_AFTER, UPLOAD_EVERY, Write, backoff, fail_with, is_transient};
 use crate::ports::{Cpu, CpuClass, on_cpu};
 use crate::remote::Remote;
 use crate::{Error, Result};
@@ -42,6 +42,8 @@ pub enum LogMode {
 const GATHER: Duration = Duration::from_millis(50);
 /// The chunk bytes one record holds at most; a larger flush is left to the uploader.
 const RECORD_MAX: usize = LOG_DATA_CHUNKS_MAX * CHUNK_SIZE;
+/// The chunks a flush may have and still keep their bytes for the log.
+pub(super) const KEPT_MAX: usize = LOG_DATA_CHUNKS_MAX;
 /// The chunk bytes that may wait for the log; past it, waiting flushes are left to the uploader.
 const PENDING_MAX: usize = 32 << 20;
 /// Records an open reads at most.
@@ -385,7 +387,7 @@ impl Inner {
             }
             for (idx, c) in w.chunks {
                 let data: &[u8] = c.as_ref().map_or(&zeros, |v| v.bytes());
-                self.write_chunk(idx, 0, data, true, false).await?;
+                self.write_chunk(idx, 0, Write::New(data), false).await?;
             }
         }
         self.commit_flush().await.map(drop)

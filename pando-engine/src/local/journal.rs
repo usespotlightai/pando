@@ -6,21 +6,72 @@ use bytes::{BufMut, Bytes, BytesMut};
 use pando_format::{CHUNK_SIZE, u64_from, usize_from};
 use tokio::sync::oneshot;
 
-use super::{read_file, take};
+use super::take;
 use crate::ports::{LocalFile, LocalFs, Open};
 use crate::{Error, Result};
 
 /// What one journal record does to its chunk.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum Record {
-    /// These bytes at an offset in the chunk.
-    Data(usize, Bytes),
+    /// The bytes of one write, where the journal keeps them.
+    Data(Extent),
     /// The whole chunk becomes zeros.
     ZeroChunk,
 }
 
+/// Where the journal keeps the bytes of one write: `len` bytes at `pos` of `file`, written at
+/// offset `at` of the chunk. The file stays readable while an extent holds it, also after
+/// [`Journal::drop_below`] removed it.
+#[derive(Clone, Debug)]
+pub(crate) struct Extent {
+    file: Arc<dyn LocalFile>,
+    pos: u64,
+    at: u32,
+    len: u32,
+}
+
+impl Extent {
+    /// The first byte of the chunk it writes.
+    pub(crate) fn at(&self) -> usize {
+        self.at as usize
+    }
+
+    /// The byte of the chunk after the last one it writes.
+    pub(crate) fn end(&self) -> usize {
+        (self.at + self.len) as usize
+    }
+
+    /// The journal bytes its record takes.
+    pub(crate) fn logged(&self) -> usize {
+        HEADER + self.len as usize
+    }
+
+    /// The `n` bytes it wrote from offset `from` of the chunk, a range inside it.
+    pub(crate) async fn read(&self, from: usize, n: usize) -> Result<Bytes> {
+        let b = self
+            .file
+            .read_at(n, self.pos + u64_from(from - self.at()))
+            .await?;
+        if b.len() != n {
+            return Err(Error::Corrupt(format!(
+                "a journal record at {} is shorter than its write",
+                self.pos
+            )));
+        }
+        Ok(b)
+    }
+
+    /// [`Self::read`] into `dst` from the page cache only: `false` when it would wait.
+    pub(crate) fn read_nowait(&self, from: usize, dst: &mut [u8]) -> Result<bool> {
+        let at = self.pos + u64_from(from - self.at());
+        Ok(self.file.read_at_nowait(dst, at)? == Some(dst.len()))
+    }
+}
+
 const HEADER: usize = 16;
 const SHARDS: usize = 16;
+/// The bytes a replay reads at once.
+const WINDOW: usize = 4 << 20;
 /// Set in a record's length field: the record zeroes a whole chunk and carries no data.
 const ZERO_CHUNK: u32 = 1 << 31;
 
@@ -62,7 +113,8 @@ struct Shard {
 struct Queue {
     end: u64,
     records: BytesMut,
-    waiters: Vec<oneshot::Sender<Result<(), Arc<Error>>>>,
+    /// Each sender learns where its batch went, and finds its record from there.
+    waiters: Vec<oneshot::Sender<Result<u64, Arc<Error>>>>,
     writing: bool,
     torn: bool,
 }
@@ -94,7 +146,7 @@ impl Shard {
                     let mut q = self.queue.lock();
                     q.end += u64_from(batch.len());
                     q.torn = false;
-                    Ok(())
+                    Ok(at)
                 }
                 Err(e) => {
                     let cut = self.file.set_len(at).await;
@@ -154,32 +206,12 @@ impl Journal {
         let mut n = 0;
         for g in self.gens().await?.into_iter().filter(|g| *g >= floor) {
             for s in 0..SHARDS {
-                let Some(b) = read_file(self.fs.as_ref(), &self.path(g, s)).await? else {
-                    continue;
+                let file = match self.fs.open(&self.path(g, s), Open::Read).await {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
                 };
-                let mut rest: &[u8] = &b;
-                while let (Some(idx), Some(inner), Some(len)) =
-                    (take::<8>(&mut rest), take::<4>(&mut rest), take::<4>(&mut rest))
-                {
-                    let idx = u64::from_le_bytes(idx);
-                    let inner = u32::from_le_bytes(inner) as usize;
-                    let len = u32::from_le_bytes(len);
-                    if len == ZERO_CHUNK && inner == 0 {
-                        apply(idx, Record::ZeroChunk)?;
-                        n += 1;
-                        continue;
-                    }
-                    let len = len as usize;
-                    let Some((body, after)) = rest.split_at_checked(len) else {
-                        break;
-                    };
-                    if inner + len > CHUNK_SIZE {
-                        break;
-                    }
-                    apply(idx, Record::Data(inner, b.slice_ref(body)))?;
-                    n += 1;
-                    rest = after;
-                }
+                n += replay_file(&file, &mut apply).await?;
             }
         }
         Ok(n)
@@ -208,43 +240,52 @@ impl Journal {
         self.current.read().as_ref().map_or(0, |g| g.number)
     }
 
-    /// Records one write. Callers keep appends for one chunk in order; no append may run while
-    /// [`Self::rotate`] does.
-    pub(crate) async fn append(&self, idx: u64, inner: usize, data: Bytes) -> Result<()> {
+    /// Records one write and returns where the journal keeps its bytes. Callers keep appends
+    /// for one chunk in order; no append may run while [`Self::rotate`] does.
+    pub(crate) async fn append(&self, idx: u64, inner: usize, data: &[u8]) -> Result<Extent> {
         let too_far = || Error::Corrupt(format!("a journal record of chunk {idx} past the chunk"));
-        let inner = u32::try_from(inner).map_err(|_| too_far())?;
+        let at = u32::try_from(inner).map_err(|_| too_far())?;
         let len = u32::try_from(data.len()).map_err(|_| too_far())?;
-        self.push(idx, inner, len, &data).await
+        let (file, pos) = self.push(idx, at, len, data).await?;
+        Ok(Extent {
+            file,
+            pos: pos + u64_from(HEADER),
+            at,
+            len,
+        })
     }
 
     /// Records that chunk `idx` became zeros, as [`Self::append`] records a write.
     pub(crate) async fn append_zero_chunk(&self, idx: u64) -> Result<()> {
-        self.push(idx, 0, ZERO_CHUNK, &[]).await
+        self.push(idx, 0, ZERO_CHUNK, &[]).await.map(drop)
     }
 
-    async fn push(&self, idx: u64, inner: u32, len: u32, data: &[u8]) -> Result<()> {
+    /// Queues one record and returns the shard file and where the record went in it.
+    async fn push(&self, idx: u64, inner: u32, len: u32, data: &[u8]) -> Result<(Arc<dyn LocalFile>, u64)> {
         let Some(g) = self.current.read().clone() else {
             return Err(Error::Corrupt("an append to a journal not started".into()));
         };
-        let at = usize_from(idx % u64_from(SHARDS));
-        let shard = &g.shards[at];
+        let n = usize_from(idx % u64_from(SHARDS));
+        let shard = &g.shards[n];
         let (tx, rx) = oneshot::channel();
-        let lead = {
+        let (off, lead) = {
             let mut q = shard.queue.lock();
+            let off = u64_from(q.records.len());
             q.records.reserve(HEADER + data.len());
             q.records.put_u64_le(idx);
             q.records.put_u32_le(inner);
             q.records.put_u32_le(len);
             q.records.put_slice(data);
             q.waiters.push(tx);
-            !std::mem::replace(&mut q.writing, true)
+            (off, !std::mem::replace(&mut q.writing, true))
         };
         if lead {
             let g = Arc::clone(&g);
-            tokio::spawn(async move { g.shards[at].drain().await });
+            tokio::spawn(async move { g.shards[n].drain().await });
         }
         match rx.await {
-            Ok(done) => done.map_err(Error::Shared),
+            Ok(Ok(at)) => Ok((Arc::clone(&shard.file), at + off)),
+            Ok(Err(e)) => Err(Error::Shared(e)),
             Err(_) => Err(Error::Cancelled),
         }
     }
@@ -279,12 +320,68 @@ impl Journal {
     }
 }
 
+/// Calls `apply` for each whole record of `file`, in order; returns how many it applied.
+async fn replay_file<F>(file: &Arc<dyn LocalFile>, apply: &mut F) -> Result<usize>
+where
+    F: FnMut(u64, Record) -> Result<()>,
+{
+    let size = file.size().await?;
+    let header = u64_from(HEADER);
+    let (mut pos, mut n) = (0, 0);
+    while pos + header <= size {
+        let window = file.read_at(WINDOW, pos).await?;
+        let mut rest: &[u8] = &window;
+        if rest.len() < HEADER {
+            break;
+        }
+        while let (Some(idx), Some(inner), Some(len)) =
+            (take::<8>(&mut rest), take::<4>(&mut rest), take::<4>(&mut rest))
+        {
+            let idx = u64::from_le_bytes(idx);
+            let at = u32::from_le_bytes(inner);
+            let len = u32::from_le_bytes(len);
+            if len == ZERO_CHUNK && at == 0 {
+                apply(idx, Record::ZeroChunk)?;
+                n += 1;
+                pos += header;
+                continue;
+            }
+            let end = pos + header + u64::from(len);
+            if at as usize + len as usize > CHUNK_SIZE || end > size {
+                return Ok(n);
+            }
+            let file = Arc::clone(file);
+            apply(
+                idx,
+                Record::Data(Extent {
+                    file,
+                    pos: pos + header,
+                    at,
+                    len,
+                }),
+            )?;
+            n += 1;
+            pos = end;
+            rest = rest.get(len as usize..).unwrap_or_default();
+        }
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 #[cfg(feature = "sim")]
 mod tests {
     use super::*;
 
     use crate::sim::SimFs;
+
+    /// What a record does, with its bytes read back.
+    async fn read(r: &Record) -> Option<(usize, Bytes)> {
+        let Record::Data(e) = r else {
+            return None;
+        };
+        Some((e.at(), e.read(e.at(), e.end() - e.at()).await.unwrap()))
+    }
 
     #[tokio::test]
     async fn replays_from_the_floor_in_write_order() {
@@ -293,10 +390,11 @@ mod tests {
             .await
             .unwrap();
         j.start(1).await.unwrap();
-        j.append(3, 0, Bytes::from_static(b"one")).await.unwrap();
-        j.append(3, 1, Bytes::from_static(b"two")).await.unwrap();
+        j.append(3, 0, b"one").await.unwrap();
+        let two = j.append(3, 1, b"two").await.unwrap();
+        assert_eq!(two.read(2, 2).await.unwrap(), Bytes::from_static(b"wo"));
         assert_eq!(j.rotate().await.unwrap(), 2);
-        j.append(19, 5, Bytes::from_static(b"three")).await.unwrap();
+        j.append(19, 5, b"three").await.unwrap();
         j.append_zero_chunk(3).await.unwrap();
 
         let again = Journal::open(Arc::new(fs.clone()), Path::new("/j"))
@@ -312,10 +410,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 4);
-        assert_eq!(seen[0], (3, Record::Data(0, Bytes::from_static(b"one"))));
-        assert_eq!(seen[1], (3, Record::Data(1, Bytes::from_static(b"two"))));
-        assert_eq!(seen[2], (19, Record::Data(5, Bytes::from_static(b"three"))));
-        assert_eq!(seen[3], (3, Record::ZeroChunk));
+        let idxs: Vec<u64> = seen.iter().map(|s| s.0).collect();
+        assert_eq!(idxs, [3, 3, 19, 3]);
+        assert_eq!(read(&seen[0].1).await, Some((0, Bytes::from_static(b"one"))));
+        assert_eq!(read(&seen[1].1).await, Some((1, Bytes::from_static(b"two"))));
+        assert_eq!(read(&seen[2].1).await, Some((5, Bytes::from_static(b"three"))));
+        assert!(matches!(seen[3].1, Record::ZeroChunk));
 
         j.drop_below(2).await;
         assert_eq!(again.replay(0, |_, _| Ok(())).await.unwrap(), 2);
@@ -334,31 +434,29 @@ mod tests {
             .map(|i| {
                 let j = Arc::clone(&j);
                 tokio::spawn(async move {
-                    j.append(
-                        i * u64_from(SHARDS),
-                        0,
-                        Bytes::from(vec![u8::try_from(i).unwrap(); 100]),
-                    )
-                    .await
+                    j.append(i * u64_from(SHARDS), 0, &[u8::try_from(i).unwrap(); 100])
+                        .await
                 })
             })
             .collect();
         for t in tasks {
             t.await.unwrap().unwrap();
         }
-        let mut seen = Vec::new();
+        let mut records = Vec::new();
         let n = j
             .replay(0, |i, r| {
-                let Record::Data(_, d) = r else {
-                    panic!("a data record")
-                };
-                assert!(d.iter().all(|&b| u64::from(b) * u64_from(SHARDS) == i));
-                seen.push(i);
+                records.push((i, r));
                 Ok(())
             })
             .await
             .unwrap();
         assert_eq!(n, 64);
+        let mut seen = Vec::new();
+        for (i, r) in &records {
+            let (_, d) = read(r).await.unwrap();
+            assert!(d.iter().all(|&b| u64::from(b) * u64_from(SHARDS) == *i));
+            seen.push(*i);
+        }
         seen.sort_unstable();
         assert_eq!(seen, (0..64).map(|i| i * u64_from(SHARDS)).collect::<Vec<_>>());
     }
@@ -370,7 +468,7 @@ mod tests {
             .await
             .unwrap();
         j.start(1).await.unwrap();
-        j.append(0, 0, Bytes::from_static(b"kept")).await.unwrap();
+        j.append(0, 0, b"kept").await.unwrap();
         let used = fs
             .open(&j.path(1, 0), Open::Read)
             .await
@@ -379,7 +477,7 @@ mod tests {
             .await
             .unwrap();
         fs.set_capacity(Some(used + 30));
-        let e = j.append(16, 0, Bytes::from(vec![7; 100])).await.unwrap_err();
+        let e = j.append(16, 0, &[7; 100]).await.unwrap_err();
         assert!(e.is_no_room(), "{e}");
         assert_eq!(
             fs.open(&j.path(1, 0), Open::Read)
@@ -392,7 +490,7 @@ mod tests {
             "the failed append was cut off"
         );
         fs.set_capacity(None);
-        j.append(32, 0, Bytes::from_static(b"after")).await.unwrap();
+        j.append(32, 0, b"after").await.unwrap();
         let mut seen = Vec::new();
         j.replay(0, |i, r| {
             seen.push((i, r));
@@ -400,13 +498,38 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [0, 32]);
+        assert_eq!(read(&seen[0].1).await, Some((0, Bytes::from_static(b"kept"))));
+        assert_eq!(read(&seen[1].1).await, Some((0, Bytes::from_static(b"after"))));
+    }
+
+    #[tokio::test]
+    async fn a_replay_reads_records_past_one_window() {
+        let fs = SimFs::default();
+        let j = Journal::open(Arc::new(fs.clone()), Path::new("/j"))
+            .await
+            .unwrap();
+        j.start(1).await.unwrap();
+        let n = 2 * WINDOW / CHUNK_SIZE + 3;
+        for i in 0..n {
+            j.append(0, 0, &vec![u8::try_from(i % 251).unwrap(); CHUNK_SIZE])
+                .await
+                .unwrap();
+        }
+        let mut records = Vec::new();
         assert_eq!(
-            seen,
-            vec![
-                (0, Record::Data(0, Bytes::from_static(b"kept"))),
-                (32, Record::Data(0, Bytes::from_static(b"after"))),
-            ]
+            j.replay(0, |_, r| {
+                records.push(r);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            n
         );
+        for (i, r) in records.iter().enumerate() {
+            let (_, d) = read(r).await.unwrap();
+            assert!(d.iter().all(|&b| usize::from(b) == i % 251), "record {i}");
+        }
     }
 
     #[tokio::test]
@@ -416,7 +539,7 @@ mod tests {
             .await
             .unwrap();
         j.start(1).await.unwrap();
-        j.append(0, 0, Bytes::from_static(b"kept")).await.unwrap();
+        j.append(0, 0, b"kept").await.unwrap();
         let f = fs.open(&j.path(1, 0), Open::ReadWrite).await.unwrap();
         let end = f.size().await.unwrap();
         f.write_at(vec![Bytes::from(vec![1; 20])], end).await.unwrap();
