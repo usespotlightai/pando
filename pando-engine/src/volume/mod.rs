@@ -678,11 +678,18 @@ impl Volume {
     }
 
     /// Writes `p` at `off`; reads see it once this returns. [`Self::flush`] makes it durable
-    /// on this host.
+    /// on this host. While the cache's disk is full it fails at once, before it changes
+    /// anything, with an error that [`Error::is_no_room`] reports.
     pub async fn write_at(&self, p: &[u8], off: u64) -> Result<()> {
         if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
+        self.inner.cache.space().admit().await?;
+        let r = self.write_parts(p, off).await;
+        self.inner.noted(r).await
+    }
+
+    async fn write_parts(&self, p: &[u8], off: u64) -> Result<()> {
         let until = self.inner.deadline();
         let mut parts = parts(off, p.len());
         let needs = parts.iter().map(|&(idx, .., n)| (idx, n < CHUNK_SIZE)).collect();
@@ -709,11 +716,18 @@ impl Volume {
         }
     }
 
-    /// Clears a range. Whole chunks that hold no data stay sparse.
+    /// Clears a range. Whole chunks that hold no data stay sparse. It fails as
+    /// [`Self::write_at`] does while the cache's disk is full.
     pub async fn zero(&self, off: u64, len: u64) -> Result<()> {
         if beyond(off, len, self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
+        self.inner.cache.space().admit().await?;
+        let r = self.zero_parts(off, len).await;
+        self.inner.noted(r).await
+    }
+
+    async fn zero_parts(&self, off: u64, len: u64) -> Result<()> {
         let mut needs = Vec::new();
         let mut pos = off;
         while pos < off + len {
@@ -828,6 +842,13 @@ impl Volume {
     /// is unreachable.
     pub fn upload_lag(&self) -> Duration {
         self.inner.upload_lag()
+    }
+
+    /// Whether writes fail because the cache's disk is full; it looks for room again first, at
+    /// most once a second. Flushes and reads go on while it is full: the cache keeps 128 MiB
+    /// for the commits, and writes resume once twice that is free.
+    pub async fn disk_full(&self) -> bool {
+        self.inner.cache.space().admit().await.is_err()
     }
 
     /// How this volume logs its flushes.
@@ -1483,10 +1504,29 @@ impl Inner {
         self.commit_at(0).await
     }
 
+    /// Frees the cache's reserve when `r` failed for want of room, so the commits that follow
+    /// find it, and writes fail until the disk has room again.
+    async fn noted<T>(&self, r: Result<T>) -> Result<T> {
+        if let Err(e) = &r
+            && e.is_no_room()
+        {
+            self.cache.space().release().await;
+        }
+        r
+    }
+
     /// Commits the dirty set when it is not empty and its buffers hold at least `min` bytes.
     /// A commit with `min` above 0 only bounds memory: no caller waits for it, so it leaves
-    /// the log to the uploader's next pass and does not start one.
+    /// the log to the uploader's next pass and does not start one. A commit that finds the
+    /// disk full frees the cache's reserve and tries once more.
     async fn commit_at(&self, min: usize) -> Result<u64> {
+        match self.commit_once(min).await {
+            Err(e) if e.is_no_room() && self.cache.space().release().await => self.commit_once(min).await,
+            r => r,
+        }
+    }
+
+    async fn commit_once(&self, min: usize) -> Result<u64> {
         let _c = self.commit.lock().await;
         if self.up.lock().fenced {
             return Err(Error::Fenced {
@@ -1899,6 +1939,106 @@ mod tests {
         );
         assert_eq!(read(&other, SIZE - 10, 10).await, vec![0; 10]);
         other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_disk_fails_writes_lets_flushes_commit_and_loses_no_acknowledged_write() {
+        let (ports, _, fs) = sim::ports(1);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let big = u64::MAX / 2;
+        fs.set_capacity(Some(big));
+        let used = big - fs.available(Path::new("/a")).await.unwrap();
+        fs.set_capacity(Some(used + (24 << 20)));
+        let mut acked = Vec::new();
+        for i in 0..SIZE >> 20 {
+            match v
+                .write_at(&data(u8::try_from(i).unwrap(), 1 << 20), i << 20)
+                .await
+            {
+                Ok(()) => acked.push(i),
+                Err(e) => {
+                    assert!(e.is_no_room(), "{e}");
+                    break;
+                }
+            }
+        }
+        assert!(
+            !acked.is_empty() && u64_from(acked.len()) < SIZE >> 20,
+            "{acked:?}"
+        );
+        assert!(v.disk_full().await);
+        v.flush().await.unwrap();
+        let e = v.write_at(&data(99, 10), 0).await.unwrap_err();
+        assert!(e.is_no_room(), "{e}");
+        let e = v.zero(0, 4096).await.unwrap_err();
+        assert!(e.is_no_room(), "{e}");
+        for &i in &acked {
+            assert_eq!(
+                read(&v, i << 20, 1 << 20).await,
+                data(u8::try_from(i).unwrap(), 1 << 20)
+            );
+        }
+
+        fs.set_capacity(None);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        v.write_at(&data(100, 10), SIZE - 10).await.unwrap();
+        assert!(!v.disk_full().await);
+        v.checkpoint().await.unwrap();
+        v.close().await;
+
+        let other = Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "main")
+            .await
+            .unwrap();
+        for &i in &acked {
+            assert_eq!(
+                read(&other, i << 20, 1 << 20).await,
+                data(u8::try_from(i).unwrap(), 1 << 20)
+            );
+        }
+        assert_eq!(read(&other, SIZE - 10, 10).await, data(100, 10));
+        other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_that_fills_the_disk_survives_a_crash_before_any_upload() {
+        let (ports, store, fs) = sim::ports(4);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        store.refuse(StoreOp::Create);
+        let n = 8;
+        for i in 0..n {
+            v.write_at(&data(i, 1 << 20), u64::from(i) << 20).await.unwrap();
+        }
+        let big = u64::MAX / 2;
+        fs.set_capacity(Some(big));
+        let used = big - fs.available(Path::new("/a")).await.unwrap();
+        fs.set_capacity(Some(used + (3 << 20) + 12_345));
+        v.flush().await.unwrap();
+        assert!(v.disk_full().await, "the flush took the reserve");
+        let _ = v.upload_stopped().await;
+        v.close().await;
+        drop(v);
+
+        crash(&fs);
+        store.accept();
+        fs.set_capacity(None);
+        let after = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        for i in 0..n {
+            assert_eq!(
+                read(&after, u64::from(i) << 20, 1 << 20).await,
+                data(i, 1 << 20),
+                "flushed write {i}"
+            );
+        }
+        after.checkpoint().await.unwrap();
+        after.close().await;
     }
 
     #[tokio::test(start_paused = true)]

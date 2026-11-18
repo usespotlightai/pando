@@ -65,6 +65,9 @@ pub trait LocalFs: Send + Sync + fmt::Debug {
     async fn lock(&self, path: &Path) -> io::Result<Box<dyn FileLock>>;
     /// [`Self::lock`], or `ResourceBusy` at once when another holder has it.
     async fn try_lock(&self, path: &Path) -> io::Result<Box<dyn FileLock>>;
+    /// The bytes a writer without special privileges can still add to the file system that
+    /// holds `dir`.
+    async fn available(&self, dir: &Path) -> io::Result<u64>;
 }
 
 /// An open file of [`LocalFs`]. Reads and writes at offsets, so callers share one handle.
@@ -84,6 +87,10 @@ pub trait LocalFile: Send + Sync + fmt::Debug {
     async fn sync_data(&self) -> io::Result<()>;
     /// Truncates or extends the file to `len` bytes; added bytes read as zeros.
     async fn set_len(&self, len: u64) -> io::Result<()>;
+    /// Gives the first `len` bytes of the file their space on the disk, extending it to `len`
+    /// bytes when it is shorter; added bytes read as zeros. Fails with `StorageFull` when the
+    /// disk lacks the space.
+    async fn allocate(&self, len: u64) -> io::Result<()>;
     /// The length in bytes; for a block device, the size of the device.
     async fn size(&self) -> io::Result<u64>;
     /// Starts writing dirty pages back, without waiting for the disk, so a later sync waits less.
