@@ -55,6 +55,12 @@ sharing one root system.
 | `pando-dst` | deterministic simulation, crash and fault scenarios, and conformance suites for every port adapter |
 | `pando` | the command-line tool |
 
+## Installing
+
+Releases have binaries for x86_64 and aarch64 Linux, checksums and build provenance.
+[docs/hosts.md](docs/hosts.md) covers installing one and upgrading a host with attached
+branches; [docs/releasing.md](docs/releasing.md) covers cutting one.
+
 ## Building
 
 Build with Rust 1.100, pinned in `rust-toolchain.toml`. The block device requires Linux with
