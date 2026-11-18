@@ -101,9 +101,9 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 ## Benchmarks
 
 > **Partly measured.** SOCI, Nydus, ZeroFS and Amazon S3 Files have every result except the
-> agent workload, which fills in as its runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
-> [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw the charts from
-> `bench/results/`.
+> agent workload, which fills in as its runs finish on the bench VM (AWS `m8id.4xlarge`,
+> eu-north-1; see [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw the
+> charts from `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
 1.4 GB and 129k files. All systems use the same VM and bucket. Results show medians of 5 runs,
