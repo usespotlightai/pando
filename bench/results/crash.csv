@@ -29,3 +29,33 @@ JuiceFS,small,crash.stall,3,0.211926,s,rep 3
 JuiceFS,small,crash.fsck,3,0,code,rep 3
 JuiceFS,small,crash.acked,3,264,count,rep 3
 JuiceFS,small,crash.correct,3,264,count,rep 3
+ZeroFS (NBD),small,crash.recovered,1,0,count,rep 1
+ZeroFS (NBD),small,crash.failed_writes,1,1,count,rep 1
+ZeroFS (NBD),small,crash.fsck,1,0,code,rep 1
+ZeroFS (NBD),small,crash.acked,1,20,count,rep 1
+ZeroFS (NBD),small,crash.correct,1,20,count,rep 1
+ZeroFS (NBD),small,crash.recovered,2,0,count,rep 2
+ZeroFS (NBD),small,crash.failed_writes,2,1,count,rep 2
+ZeroFS (NBD),small,crash.fsck,2,0,code,rep 2
+ZeroFS (NBD),small,crash.acked,2,20,count,rep 2
+ZeroFS (NBD),small,crash.correct,2,20,count,rep 2
+ZeroFS (NBD),small,crash.recovered,3,0,count,rep 3
+ZeroFS (NBD),small,crash.failed_writes,3,1,count,rep 3
+ZeroFS (NBD),small,crash.fsck,3,0,code,rep 3
+ZeroFS (NBD),small,crash.acked,3,20,count,rep 3
+ZeroFS (NBD),small,crash.correct,3,20,count,rep 3
+Amazon S3 Files,small,crash.recovered,1,1,count,rep 1
+Amazon S3 Files,small,crash.failed_writes,1,0,count,rep 1
+Amazon S3 Files,small,crash.stall,1,3.13745,s,rep 1
+Amazon S3 Files,small,crash.acked,1,352,count,rep 1
+Amazon S3 Files,small,crash.correct,1,352,count,rep 1
+Amazon S3 Files,small,crash.recovered,2,1,count,rep 2
+Amazon S3 Files,small,crash.failed_writes,2,0,count,rep 2
+Amazon S3 Files,small,crash.stall,2,3.1594,s,rep 2
+Amazon S3 Files,small,crash.acked,2,352,count,rep 2
+Amazon S3 Files,small,crash.correct,2,352,count,rep 2
+Amazon S3 Files,small,crash.recovered,3,1,count,rep 3
+Amazon S3 Files,small,crash.failed_writes,3,0,count,rep 3
+Amazon S3 Files,small,crash.stall,3,3.1618,s,rep 3
+Amazon S3 Files,small,crash.acked,3,348,count,rep 3
+Amazon S3 Files,small,crash.correct,3,348,count,rep 3

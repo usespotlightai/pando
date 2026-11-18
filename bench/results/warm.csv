@@ -119,3 +119,57 @@ Pando (handoff),small,warm.status,4,1.06739,s,rep 4
 Pando (handoff),small,warm.git_status,5,1.79591,s,rep 5
 Pando (handoff),small,warm.open,5,0.77894,s,rep 5
 Pando (handoff),small,warm.status,5,1.01697,s,rep 5
+SOCI lazy pull,small,warm.git_status,1,2.12084,s,rep 1
+SOCI lazy pull,small,warm.open,1,0.404092,s,rep 1
+SOCI lazy pull,small,warm.status,1,1.71675,s,rep 1
+SOCI lazy pull,small,warm.git_status,2,2.19306,s,rep 2
+SOCI lazy pull,small,warm.open,2,0.476508,s,rep 2
+SOCI lazy pull,small,warm.status,2,1.71655,s,rep 2
+SOCI lazy pull,small,warm.git_status,3,2.29133,s,rep 3
+SOCI lazy pull,small,warm.open,3,0.474447,s,rep 3
+SOCI lazy pull,small,warm.status,3,1.81688,s,rep 3
+SOCI lazy pull,small,warm.git_status,4,2.19096,s,rep 4
+SOCI lazy pull,small,warm.open,4,0.474443,s,rep 4
+SOCI lazy pull,small,warm.status,4,1.71652,s,rep 4
+SOCI lazy pull,small,warm.git_status,5,2.17806,s,rep 5
+SOCI lazy pull,small,warm.open,5,0.461546,s,rep 5
+SOCI lazy pull,small,warm.status,5,1.71652,s,rep 5
+Nydus lazy pull,small,warm.git_status,1,1.42872,s,rep 1
+Nydus lazy pull,small,warm.open,1,0.713651,s,rep 1
+Nydus lazy pull,small,warm.status,1,0.715069,s,rep 1
+Nydus lazy pull,small,warm.git_status,2,1.32622,s,rep 2
+Nydus lazy pull,small,warm.open,2,0.661074,s,rep 2
+Nydus lazy pull,small,warm.status,2,0.665151,s,rep 2
+Nydus lazy pull,small,warm.git_status,3,1.13996,s,rep 3
+Nydus lazy pull,small,warm.open,3,0.675302,s,rep 3
+Nydus lazy pull,small,warm.status,3,0.464656,s,rep 3
+Nydus lazy pull,small,warm.git_status,4,1.3836,s,rep 4
+Nydus lazy pull,small,warm.open,4,0.668368,s,rep 4
+Nydus lazy pull,small,warm.status,4,0.715235,s,rep 4
+Nydus lazy pull,small,warm.git_status,5,1.30648,s,rep 5
+Nydus lazy pull,small,warm.open,5,0.691521,s,rep 5
+Nydus lazy pull,small,warm.status,5,0.614961,s,rep 5
+ZeroFS (NBD),small,warm.git_status,1,14.5193,s,rep 1
+ZeroFS (NBD),small,warm.open,1,13.3016,s,rep 1
+ZeroFS (NBD),small,warm.status,1,1.21769,s,rep 1
+ZeroFS (NBD),small,warm.git_status,2,14.7937,s,rep 2
+ZeroFS (NBD),small,warm.open,2,13.4265,s,rep 2
+ZeroFS (NBD),small,warm.status,2,1.36715,s,rep 2
+ZeroFS (NBD),small,warm.git_status,3,14.7968,s,rep 3
+ZeroFS (NBD),small,warm.open,3,13.379,s,rep 3
+ZeroFS (NBD),small,warm.status,3,1.41786,s,rep 3
+ZeroFS (NBD),small,warm.git_status,4,15.1381,s,rep 4
+ZeroFS (NBD),small,warm.open,4,13.7203,s,rep 4
+ZeroFS (NBD),small,warm.status,4,1.41774,s,rep 4
+ZeroFS (NBD),small,warm.git_status,5,14.2836,s,rep 5
+ZeroFS (NBD),small,warm.open,5,12.8659,s,rep 5
+ZeroFS (NBD),small,warm.status,5,1.41778,s,rep 5
+Amazon S3 Files,small,warm.git_status,1,227.181,s,rep 1
+Amazon S3 Files,small,warm.open,1,191.352,s,rep 1
+Amazon S3 Files,small,warm.status,1,35.8288,s,rep 1
+Amazon S3 Files,small,warm.git_status,2,236.841,s,rep 2
+Amazon S3 Files,small,warm.open,2,200.412,s,rep 2
+Amazon S3 Files,small,warm.status,2,36.4298,s,rep 2
+Amazon S3 Files,small,warm.git_status,3,221.649,s,rep 3
+Amazon S3 Files,small,warm.open,3,185.318,s,rep 3
+Amazon S3 Files,small,warm.status,3,36.3312,s,rep 3
