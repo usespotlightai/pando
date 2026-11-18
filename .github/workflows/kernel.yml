@@ -2,8 +2,8 @@ name: kernel
 
 # The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
 # container (tests/kernel). fio verify, the crash checks, discard, drain, the store outage and
-# the FUSE frontend run on every push to main; xfstests and the dm-log-writes tests run each
-# night, since the quick group takes hours. The FUSE frontend also runs on an aarch64 runner, the
+# the FUSE frontend run on every push to main; the dm-log-writes tests run each night. xfstests
+# has its own workflow, xfstests.yml. The FUSE frontend also runs on an aarch64 runner, the
 # architecture of AgentCore Runtime, whose kernels offer FUSE and loop devices but not ublk.
 # The systemd test also runs on every push: on the runner itself, it installs pando with
 # packaging/install.sh and runs a branch under the pando-attach@ unit (tests/systemd).
@@ -54,7 +54,7 @@ jobs:
           ASKED: ${{ inputs.tests }}
         run: |
           case $EVENT in
-            schedule) tests="xfstests log-writes" ;;
+            schedule) tests="log-writes" ;;
             workflow_dispatch) tests=$ASKED ;;
             *) tests="fio-verify crash discard drain outage fuse systemd" ;;
           esac
