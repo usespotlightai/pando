@@ -38,6 +38,8 @@ SYSTEMS: dict[str, tuple[str, type[start.Workspace]]] = {
     "pando-handoff": ("Pando (after handoff)", start.PandoHandoff),
     "ebs": ("EBS gp3", start.Ebs),
     "juicefs": ("JuiceFS", start.JuiceFS),
+    "zerofs": (start.ZeroFS.name, start.ZeroFS),
+    "s3files": (start.S3Files.name, start.S3Files),
 }
 
 
@@ -78,7 +80,7 @@ def measure_system(key: str, reps: int, out: Results) -> bool:
         path = s.root(1) / "fio.dat"
         fio(path, "--name=layout", "--rw=write", "--bs=1M", "--iodepth=8")
         run("sync")
-        for rep in range(1, reps + 1):
+        for rep in range(1, min(reps, s.max_reps) + 1):
             for row, unit, args in JOBS:
                 start.drop_caches()
                 j = fio(

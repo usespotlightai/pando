@@ -95,14 +95,71 @@ def du_bytes(path: Path | str) -> int:
     return int(run("du", "-s", "-x", "-B1", path, capture=True).split()[0])
 
 
+def bucket_summary(bucket: str, prefix: str) -> tuple[int, int]:
+    """Return the number and the bytes of the objects under s3://bucket/prefix/, listed with the host role.
+
+    Raises SystemExit when the listing has no summary.
+    """
+    out = run("aws", "s3", "ls", "--recursive", "--summarize", f"s3://{bucket}/{prefix}/", capture=True)
+    totals = {}
+    for line in out.splitlines():
+        k, sep, v = line.strip().partition(":")
+        if sep and k in {"Total Objects", "Total Size"}:
+            totals[k] = int(v)
+    if len(totals) != 2:  # noqa: PLR2004 -- the two totals aws s3 ls prints
+        msg = "no bucket summary from aws s3 ls"
+        raise SystemExit(msg)
+    return totals["Total Objects"], totals["Total Size"]
+
+
 def bucket_bytes(bucket: str, prefix: str) -> int:
     """Return the bytes of the objects under s3://bucket/prefix/, listed with the host role."""
-    out = run("aws", "s3", "ls", "--recursive", "--summarize", f"s3://{bucket}/{prefix}/", capture=True)
-    sizes = [line.split(":")[1] for line in out.splitlines() if line.strip().startswith("Total Size:")]
-    if not sizes:
-        msg = "no bucket size from aws s3 ls"
-        raise SystemExit(msg)
-    return int(sizes[0])
+    return bucket_summary(bucket, prefix)[1]
+
+
+def settled_bytes(bucket: str, prefix: str, quiet: float = 120, timeout: float = 3600) -> int:
+    """Return bucket_bytes of prefix once its objects have not changed for quiet seconds.
+
+    Raises SystemExit when they still change after timeout seconds.
+    """
+    deadline = time.monotonic() + timeout
+    last, since = None, time.monotonic()
+    while time.monotonic() < deadline:
+        now = bucket_summary(bucket, prefix)
+        if now != last:
+            last, since = now, time.monotonic()
+        elif time.monotonic() - since >= quiet:
+            return now[1]
+        time.sleep(15)
+    msg = f"s3://{bucket}/{prefix}/ still changing after {timeout:.0f} s"
+    raise SystemExit(msg)
+
+
+def s3_config() -> Path:
+    """Return an AWS CLI config file that runs 64 S3 requests at once, for copies of many small objects."""
+    path = WORK / "aws-s3-64.config"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[default]\ns3 =\n  max_concurrent_requests = 64\n")
+    return path
+
+
+def extract(tar: Path, dest: Path, member: str) -> Path:
+    """Unpack tar into dest unless done; return the path of the file named member inside it.
+
+    Raises SystemExit when the archive has no such file.
+    """
+    if not dest.exists():
+        tmp = dest.with_name(dest.name + ".part")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        run("tar", "-xf", tar, "-C", tmp)
+        tmp.rename(dest)
+    for p in sorted(dest.rglob(member)):
+        if p.is_file():
+            return p
+    msg = f"{tar} has no {member}"
+    raise SystemExit(msg)
 
 
 def env_file(path: Path | str) -> dict[str, str]:

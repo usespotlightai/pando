@@ -73,7 +73,7 @@ S3F = "Amazon S3 Files"
 REFLINK = "XFS reflink (local)"
 
 REMOTE = [HIGHLIGHT, HANDOFF, TAR, IMAGE, OCI, SOCI, NYDUS, EBS, JFS, ZFS0, S3F]
-FORKABLE = [HIGHLIGHT, OCI, EBS, JFS, ZFS0, REFLINK]
+FORKABLE = [HIGHLIGHT, OCI, EBS, JFS, ZFS0, S3F, REFLINK]
 LOCAL_ONLY = {REFLINK: "local only"}
 
 Data = dict[str, dict[str, tuple[float, float, float]]]
@@ -149,7 +149,7 @@ CHARTS: dict[str, dict[str, Any]] = {
                 "total time as a ratio to native (1.00x)",
                 "x",
                 scale="linear",
-                systems=[NATIVE, HIGHLIGHT, HANDOFF, IMAGE, OCI, NYDUS, EBS, JFS, ZFS0, S3F],
+                systems=[NATIVE, HIGHLIGHT, HANDOFF, IMAGE, OCI, SOCI, NYDUS, EBS, JFS, ZFS0, S3F],
                 ref=1.0,
             )
         ],
@@ -162,13 +162,13 @@ CHARTS: dict[str, dict[str, Any]] = {
                 "save.time",
                 "time to durable after npm ci",
                 "s",
-                systems=[HIGHLIGHT, TAR, OCI, EBS, JFS, ZFS0],
+                systems=[HIGHLIGHT, TAR, OCI, EBS, JFS, ZFS0, S3F],
             ),
             Panel(
                 "save.uploaded",
                 "uploaded after npm ci",
                 "MiB",
-                systems=[HIGHLIGHT, TAR, OCI, EBS, JFS, ZFS0],
+                systems=[HIGHLIGHT, TAR, OCI, EBS, JFS, ZFS0, S3F],
             ),
         ],
     },
@@ -182,7 +182,7 @@ CHARTS: dict[str, dict[str, Any]] = {
                 u,
                 scale="linear",
                 better="higher",
-                systems=["local NVMe", "Pando (ublk)", "Pando (after handoff)", "EBS gp3", JFS, ZFS0],
+                systems=["local NVMe", "Pando (ublk)", "Pando (after handoff)", "EBS gp3", JFS, ZFS0, S3F],
             )
             for m, label, u in [
                 ("randread_qd1", "4 KiB random read, QD1", "IOPS"),

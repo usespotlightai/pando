@@ -6,10 +6,13 @@ A writer outside the system writes 256 KiB files of known content into the branc
 each file and the directory, and logs each write as acknowledged or failed; after a failure it
 retries the next file 50 ms later. Five seconds in, the daemon is killed and at once restarted
 as the system restarts it: Pando with `pando attach --recover` on the same device, JuiceFS by a
-fresh mount on the same mount point. The writer runs 5 s more after its first write succeeds
-again. The branch is then closed as usual. A fresh host is a new cache and state directory on
-this host, sharing nothing with the first: there the file system is checked (e2fsck -fn for
-Pando, `juicefs fsck` for JuiceFS) and every acknowledged file is read back.
+fresh mount on the same mount point, ZeroFS by starting the server again (its NBD client runs
+with -persist and reconnects), S3 Files by the efs-utils watchdog, which restarts the efs-proxy
+process that carries the mount's NFS traffic. The writer runs 5 s more after its first write
+succeeds again. The branch is then closed as usual. A fresh host is a new cache and state
+directory on this host, sharing nothing with the first: there the file system is checked
+(e2fsck -fn for Pando and ZeroFS, `juicefs fsck` for JuiceFS; S3 Files has no checker) and every
+acknowledged file is read back.
 
 Rows: crash.failed_writes (count), crash.stall (s: the longest gap between acknowledged writes),
 crash.fsck (the checker's exit code), crash.acked and crash.correct (files).
@@ -100,8 +103,11 @@ class Crasher[W: start.Workspace]:
         """Close branch i as usual."""
         self.s.close(i)
 
-    def fresh_check(self, i: int) -> tuple[int, Path]:
-        """Open branch i with nothing from this host; return the checker's exit code and the mount point."""
+    def fresh_check(self, i: int) -> tuple[int | None, Path]:
+        """Open branch i with nothing from this host; return the checker's exit code and the mount point.
+
+        The exit code is None for a system with no checker.
+        """
         raise NotImplementedError
 
     def fresh_close(self, i: int) -> None:
@@ -175,9 +181,72 @@ class JuiceFSCrasher(Crasher[start.JuiceFS]):
         self.s.close(i)
 
 
+class ZeroFSCrasher(Crasher[start.ZeroFS]):
+    """The server started again on the same cache; a fresh host has a server on an empty cache.
+
+    The fresh host runs e2fsck -fn.
+    """
+
+    @override
+    def kill_and_restart(self, i: int) -> None:
+        self.s.server.stop(kill=True)
+        self.s.server.start()
+
+    @override
+    def close(self, i: int) -> None:
+        start.unmount(self.s.root(i))
+        self.s.server.disconnect(self.s.server.device(i))
+
+    @override
+    def fresh_check(self, i: int) -> tuple[int | None, Path]:
+        self.s.empty()
+        dev = self.s.server.connect(f"b{i}", i)
+        code = run("e2fsck", "-fn", dev, check=False)
+        self.s.root(i).mkdir(exist_ok=True)
+        run("mount", "-o", "ro", dev, self.s.root(i))
+        return code, self.s.root(i)
+
+    @override
+    def fresh_close(self, i: int) -> None:
+        self.s.close(i)
+
+
+class S3FilesCrasher(Crasher[start.S3Files]):
+    """SIGKILL of the mount's efs-proxy, which the efs-utils watchdog restarts.
+
+    A fresh host is a new mount.
+    """
+
+    @override
+    def kill_and_restart(self, i: int) -> None:
+        pids = run("pgrep", "-x", "efs-proxy", capture=True, check=False).split()
+        if not pids:
+            msg = "no efs-proxy process"
+            raise SystemExit(msg)
+        for pid in pids:
+            os.kill(int(pid), signal.SIGKILL)
+
+    @override
+    def close(self, i: int) -> None:
+        pass
+
+    @override
+    def fresh_check(self, i: int) -> tuple[int | None, Path]:
+        self.s.empty()
+        start.drop_caches()
+        self.s.fs.ensure_mounted()
+        return None, self.s.root(i)
+
+    @override
+    def fresh_close(self, i: int) -> None:
+        self.s.close(i)
+
+
 SYSTEMS: dict[str, tuple[type[start.Workspace], type[Crasher]]] = {
     "pando": (start.Pando, PandoCrasher),
     "juicefs": (start.JuiceFS, JuiceFSCrasher),
+    "zerofs": (start.ZeroFS, ZeroFSCrasher),
+    "s3files": (start.S3Files, S3FilesCrasher),
 }
 
 
@@ -227,7 +296,8 @@ def crash_once(s: start.Workspace, crasher: Crasher, i: int, rep: int, out: Resu
     note = f"rep {rep}"
     out.add(s.name, "crash.failed_writes", rep, len(err), "count", note)
     out.add(s.name, "crash.stall", rep, stall, "s", note)
-    out.add(s.name, "crash.fsck", rep, code, "code", note)
+    if code is not None:
+        out.add(s.name, "crash.fsck", rep, code, "code", note)
     out.add(s.name, "crash.acked", rep, len(ok), "count", note)
     out.add(s.name, "crash.correct", rep, correct, "count", note)
     log(
@@ -256,7 +326,7 @@ def measure(names: list[str], reps: int) -> None:
         try:
             s.setup()
             crasher = crasher_cls(s)
-            for rep in range(1, reps + 1):
+            for rep in range(1, min(reps, s.max_reps) + 1):
                 crash_once(s, crasher, rep, rep, out)
         except (
             subprocess.CalledProcessError,

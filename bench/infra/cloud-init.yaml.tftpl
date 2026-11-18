@@ -27,6 +27,8 @@ write_files:
       S3_BUCKET=${bucket}
       PANDO_BENCH_REGISTRY=${registry}
       PANDO_BENCH_EBS_VOLUME=${ebs_volume}
+      PANDO_BENCH_S3FILES=${s3files}
+      PANDO_BENCH_S3FILES_BUCKET=${s3files_b}
       PANDO_BENCH_DATA=/data
 
   # Docker keeps its images and containers on the instance-store NVMe, like every other system,
@@ -36,6 +38,29 @@ write_files:
       {"data-root": "/data/docker", "features": {"containerd-snapshotter": false}}
 
   - path: /etc/systemd/system/docker.service.d/pando-bench.conf
+    content: |
+      [Unit]
+      RequiresMountsFor=/data
+
+  # containerd keeps its images and snapshots on the NVMe too. The SOCI and Nydus lazy-pull rows
+  # run their snapshotters, started by the harness, behind these sockets.
+  - path: /etc/containerd/config.toml
+    content: |
+      version = 3
+      root = "/data/containerd"
+
+      [proxy_plugins]
+        [proxy_plugins.soci]
+          type = "snapshot"
+          address = "/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"
+          [proxy_plugins.soci.exports]
+            root = "/data/soci-snapshotter-grpc"
+            enable_remote_snapshot_annotations = "true"
+        [proxy_plugins.nydus]
+          type = "snapshot"
+          address = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+
+  - path: /etc/systemd/system/containerd.service.d/pando-bench.conf
     content: |
       [Unit]
       RequiresMountsFor=/data
@@ -133,8 +158,8 @@ runcmd:
   - snap install aws-cli --classic
   - systemctl daemon-reload
   - systemctl enable --now pando-bench-data.service
-  # Docker started while its package installed, before /data was mounted.
-  - systemctl restart docker
+  # containerd and Docker started while their packages installed, before /data was mounted.
+  - systemctl restart containerd docker
 %{ if max_hours > 0 ~}
   - systemctl enable --now pando-bench-poweroff.timer
 %{ endif ~}

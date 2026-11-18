@@ -5,7 +5,7 @@
 # - the GitHub OIDC identity provider (skip with create_oidc_provider = false if the account has one);
 # - the role the bench workflow assumes, only from the repository's `bench` environment;
 # - the bucket that holds the bench's Terraform state;
-# - the permissions boundary every bench host role must carry;
+# - the permissions boundary every bench host role, and the S3 Files role, must carry;
 # - an IAM user for Pando's S3_* keys, limited to the bench buckets. Create its access key in the
 #   console and store it as repository secrets; Terraform never sees it.
 
@@ -37,6 +37,8 @@ locals {
   # Every bench resource name starts with this; the state bucket deliberately does not.
   bench_buckets = "arn:aws:s3:::pando-bench-*"
   host_roles    = "arn:aws:iam::${local.account}:role/pando-bench-host-*"
+  s3files_roles = "arn:aws:iam::${local.account}:role/pando-bench-s3files-*"
+  file_systems  = "arn:aws:s3files:${var.region}:${local.account}:file-system/*"
   host_profiles = "arn:aws:iam::${local.account}:instance-profile/pando-bench-host-*"
   oidc_arn      = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : "arn:aws:iam::${local.account}:oidc-provider/token.actions.githubusercontent.com"
 }
@@ -89,9 +91,26 @@ resource "aws_iam_policy" "host_boundary" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"]
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketLocation", "s3:GetObject*", "s3:PutObject*",
+          "s3:DeleteObject*", "s3:List*", "s3:AbortMultipartUpload",
+        ]
         Resource = [local.bench_buckets, "${local.bench_buckets}/*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3files:ClientMount", "s3files:ClientWrite", "s3files:ClientRootAccess"]
+        Resource = local.file_systems
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "events:DeleteRule", "events:DisableRule", "events:EnableRule", "events:PutRule", "events:PutTargets",
+          "events:RemoveTargets", "events:DescribeRule", "events:ListRuleNamesByTarget", "events:ListRules",
+          "events:ListTargetsByRule",
+        ]
+        Resource = "arn:aws:events:*:*:rule/*"
       },
       {
         Effect   = "Allow"
@@ -174,9 +193,22 @@ resource "aws_iam_role_policy" "github" {
         Effect = "Allow"
         Action = [
           "ec2:Describe*", "ec2:RunInstances", "ec2:CreateSecurityGroup",
-          "ec2:ImportKeyPair", "ec2:CreateVolume", "ec2:AttachVolume",
+          "ec2:ImportKeyPair", "ec2:CreateVolume", "ec2:AttachVolume", "ec2:CreateNetworkInterface",
         ]
         Resource = "*"
+      },
+      {
+        Sid      = "S3Files"
+        Effect   = "Allow"
+        Action   = "s3files:*"
+        Resource = "*"
+      },
+      {
+        Sid       = "S3FilesServiceRole"
+        Effect    = "Allow"
+        Action    = "iam:CreateServiceLinkedRole"
+        Resource  = "*"
+        Condition = { StringLike = { "iam:AWSServiceName" = ["elasticfilesystem.amazonaws.com", "s3files.amazonaws.com"] } }
       },
       {
         # Tags only on what is being created. Tagging an existing resource would make it count
@@ -207,8 +239,15 @@ resource "aws_iam_role_policy" "github" {
         Sid       = "HostRoleCreate"
         Effect    = "Allow"
         Action    = ["iam:CreateRole", "iam:PutRolePolicy"]
-        Resource  = local.host_roles
+        Resource  = [local.host_roles, local.s3files_roles]
         Condition = { StringEquals = { "iam:PermissionsBoundary" = aws_iam_policy.host_boundary.arn } }
+      },
+      {
+        Sid       = "S3FilesRolePass"
+        Effect    = "Allow"
+        Action    = "iam:PassRole"
+        Resource  = local.s3files_roles
+        Condition = { StringLike = { "iam:PassedToService" = ["elasticfilesystem.amazonaws.com", "s3files.amazonaws.com"] } }
       },
       {
         Sid    = "HostRoleManage"
@@ -218,7 +257,7 @@ resource "aws_iam_role_policy" "github" {
           "iam:ListInstanceProfilesForRole", "iam:DeleteRolePolicy", "iam:DeleteRole", "iam:TagRole",
           "iam:UntagRole", "iam:UpdateAssumeRolePolicy",
         ]
-        Resource = local.host_roles
+        Resource = [local.host_roles, local.s3files_roles]
       },
       {
         Sid       = "HostRolePass"

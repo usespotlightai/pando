@@ -7,15 +7,14 @@
 #   bench/run.sh fio | save | crash [args]     raw I/O, saving after npm ci, and crash survival
 # Results go to $PANDO_BENCH_RESULTS (default /data/results). Pando's store keys, when the
 # workflow passed them, are in the file named by PANDO_ENV_FILE and are never printed.
-#
-# Of the measures in bench/README.md, `fio` and `crash` are not implemented yet.
 set -euo pipefail
 
 set -a
 # shellcheck source=/dev/null
 . /etc/pando-bench.env
 set +a
-export PANDO_BENCH_HOST PANDO_BENCH_REGISTRY PANDO_BENCH_EBS_VOLUME AWS_REGION S3_BUCKET S3_REGION
+export PANDO_BENCH_HOST PANDO_BENCH_REGISTRY PANDO_BENCH_EBS_VOLUME PANDO_BENCH_S3FILES PANDO_BENCH_S3FILES_BUCKET \
+	AWS_REGION S3_BUCKET S3_REGION
 export PANDO_ENV_FILE=${PANDO_ENV_FILE:-/etc/pando-bench.secrets}
 results=${PANDO_BENCH_RESULTS:-/data/results}
 mkdir -p "$results"
@@ -116,6 +115,9 @@ smoke() {
 	check "registry login" registry_login
 	check "docker" docker info
 	check "fio" fio --version
+	check "pando" pando --version
+	check "nbd-client" sh -c 'command -v nbd-client'
+	check "S3 Files bucket via the host role" aws s3api head-bucket --bucket "$PANDO_BENCH_S3FILES_BUCKET"
 	if [[ $PANDO_BENCH_HOST == a ]]; then
 		check "EBS volume attached" sh -c "lsblk -dn -o SERIAL | grep -q '${PANDO_BENCH_EBS_VOLUME/-/}'"
 	fi
