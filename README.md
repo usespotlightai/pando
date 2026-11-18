@@ -15,7 +15,8 @@ sharing one root system.
 
 - **Branches are block devices.** Pando serves each attached branch to the kernel over ublk, with
   a normal file system (ext4) on top. Agents see an ordinary disk, so `git`, `npm`
-  and compilers work without changes.
+  and compilers work without changes. The disk has 4 KiB sectors, a volatile write cache with
+  FUA, and discard: a discarded range reads as zeros, and its chunks no longer take space.
 - **Chunks and branch refs.** The device is split into 64 KiB chunks named by their hash. A
   persistent radix tree maps each chunk index to a chunk. Each branch is one root entry in a
   small ref object, and forking copies that ref. Branches share every chunk they have not changed.

@@ -25,7 +25,7 @@ use crate::dedup::learned::Learner;
 use crate::dedup::{Dedup, PreparedChunks};
 use crate::flight::bounded;
 use crate::gate::Gate;
-use crate::local::{Journal, read_file, write_durable};
+use crate::local::{Journal, Record, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
 use crate::ports::{Cpu, CpuClass, LocalFs, Version, on_cpu};
 use crate::remote::Remote;
@@ -48,6 +48,39 @@ const GENERATION_TRIES: usize = 10;
 const STORE_PARALLEL: usize = 16;
 /// Segments a change list walk fetches nodes from at once.
 const LIST_PARALLEL: usize = 16;
+static ZEROS: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
+
+/// A chunk written since the last flush.
+#[derive(Debug)]
+enum Dirty {
+    Bytes(Vec<u8>),
+    /// All zeros, held without a buffer, so clearing a large range costs no memory.
+    Zero,
+}
+
+impl Dirty {
+    fn of(b: &[u8]) -> Dirty {
+        if is_zero(b) {
+            Dirty::Zero
+        } else {
+            Dirty::Bytes(b.to_vec())
+        }
+    }
+
+    fn bytes(self) -> Bytes {
+        match self {
+            Dirty::Bytes(v) => Bytes::from(v),
+            Dirty::Zero => Bytes::from_static(&ZEROS),
+        }
+    }
+
+    fn copy_to(&self, at: usize, dst: &mut [u8]) {
+        match self {
+            Dirty::Bytes(d) => dst.copy_from_slice(&d[at..at + dst.len()]),
+            Dirty::Zero => dst.fill(0),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Mem {
@@ -57,7 +90,7 @@ struct Mem {
     size: u64,
     /// The root the branch opened at, as a root of `tree`.
     opened_now: Entry,
-    dirty: BTreeMap<u64, Vec<u8>>,
+    dirty: BTreeMap<u64, Dirty>,
     /// Every chunk written since the branch opened, so not the base image's any more.
     touched: HashSet<u64>,
     flushing: Option<Arc<BTreeMap<u64, Bytes>>>,
@@ -70,6 +103,17 @@ struct Mem {
     flush_seq: u64,
     /// Per file, the last flush that recorded a chunk as a reference into it.
     ref_seq: HashMap<PathBuf, u64>,
+}
+
+impl Mem {
+    /// Records that chunk `idx` is dirty now: not the base image's, and not a reference.
+    fn written(&mut self, idx: u64) {
+        self.touched.insert(idx);
+        self.dirty_ref.remove(&idx);
+        if let Some(t) = &mut self.track {
+            t.insert(idx);
+        }
+    }
 }
 
 /// A chunk whose bytes are `CHUNK_SIZE` bytes at `offset` of the file at `path`.
@@ -453,16 +497,15 @@ impl Volume {
         if beyond(off, len, self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
-        let zeros = vec![0; CHUNK_SIZE];
         let mut pos = off;
         while pos < off + len {
             let (idx, at) = (pos / CHUNK, usize_from(pos % CHUNK));
             let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
-            if n == CHUNK_SIZE && self.inner.is_sparse(idx).await? {
-                pos += u64_from(n);
-                continue;
+            if n < CHUNK_SIZE {
+                self.inner.write_chunk(idx, at, &ZEROS[..n], true).await?;
+            } else if !self.inner.is_sparse(idx).await? {
+                self.inner.zero_chunk(idx, true).await?;
             }
-            self.inner.write_chunk(idx, at, &zeros[..n], true).await?;
             pos += u64_from(n);
         }
         Ok(())
@@ -565,13 +608,16 @@ impl Inner {
         };
         let mut writes = Vec::new();
         self.journal
-            .replay(s.jfloor, |idx, at, data| {
-                writes.push((idx, at, data));
+            .replay(s.jfloor, |idx, r| {
+                writes.push((idx, r));
                 Ok(())
             })
             .await?;
-        for (idx, at, data) in writes {
-            self.write_chunk(idx, at, &data, false).await?;
+        for (idx, r) in writes {
+            match r {
+                Record::Data(at, data) => self.write_chunk(idx, at, &data, false).await?,
+                Record::ZeroChunk => self.zero_chunk(idx, false).await?,
+            }
         }
         let next = self.journal.last().await?.max(s.jfloor) + 1;
         self.journal.start(next).await
@@ -709,8 +755,10 @@ impl Inner {
         let _g = self.stripe(idx).read().await;
         let (tree, root) = {
             let m = self.mem.lock();
-            if let Some(d) = m.dirty.get(&idx) {
-                return Ok(Bytes::copy_from_slice(&d[at..at + n]));
+            match m.dirty.get(&idx) {
+                Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
+                Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
+                None => {}
             }
             if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
                 return Ok(f.slice(at..at + n));
@@ -742,7 +790,7 @@ impl Inner {
         let (tree, root) = {
             let m = self.mem.lock();
             if let Some(d) = m.dirty.get(&idx) {
-                dst.copy_from_slice(&d[at..at + dst.len()]);
+                d.copy_to(at, dst);
                 return Ok(true);
             }
             if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
@@ -781,7 +829,10 @@ impl Inner {
     async fn is_sparse(&self, idx: u64) -> Result<bool> {
         let (tree, root) = {
             let m = self.mem.lock();
-            if m.dirty.contains_key(&idx) || m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
+            if let Some(d) = m.dirty.get(&idx) {
+                return Ok(matches!(d, Dirty::Zero));
+            }
+            if m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
                 return Ok(false);
             }
             (Arc::clone(&m.tree), m.root)
@@ -797,10 +848,13 @@ impl Inner {
         let (dirty, flushing, tree, root, size) = {
             let m = self.mem.lock();
             let f = m.flushing.as_ref().and_then(|f| f.get(&idx)).cloned();
-            (m.dirty.contains_key(&idx), f, Arc::clone(&m.tree), m.root, m.size)
+            let zero = m.dirty.get(&idx).map(|d| matches!(d, Dirty::Zero));
+            (zero, f, Arc::clone(&m.tree), m.root, m.size)
         };
-        let fresh = if dirty {
+        let fresh = if dirty == Some(false) {
             None
+        } else if dirty == Some(true) {
+            Some(vec![0; CHUNK_SIZE])
         } else if let Some(f) = flushing {
             Some(f.to_vec())
         } else if data.len() < CHUNK_SIZE {
@@ -821,25 +875,33 @@ impl Inner {
             self.journal.append(idx, at, Bytes::copy_from_slice(data)).await?;
         }
         let mut m = self.mem.lock();
-        m.touched.insert(idx);
-        m.dirty_ref.remove(&idx);
-        if let Some(t) = &mut m.track {
-            t.insert(idx);
-        }
+        m.written(idx);
         match fresh {
             None => {
-                let Some(buf) = m.dirty.get_mut(&idx) else {
+                let Some(Dirty::Bytes(d)) = m.dirty.get_mut(&idx) else {
                     return Err(Error::Corrupt(format!(
                         "chunk {idx} left the dirty set under its stripe lock"
                     )));
                 };
-                buf[at..at + data.len()].copy_from_slice(data);
+                d[at..at + data.len()].copy_from_slice(data);
             }
             Some(mut buf) => {
                 buf[at..at + data.len()].copy_from_slice(data);
-                m.dirty.insert(idx, buf);
+                m.dirty.insert(idx, Dirty::Bytes(buf));
             }
         }
+        Ok(())
+    }
+
+    /// Makes chunk `idx` all zeros, as [`Self::write_chunk`] would with a chunk of zeros.
+    async fn zero_chunk(&self, idx: u64, journaled: bool) -> Result<()> {
+        let _g = self.stripe(idx).write().await;
+        if journaled {
+            self.journal.append_zero_chunk(idx).await?;
+        }
+        let mut m = self.mem.lock();
+        m.written(idx);
+        m.dirty.insert(idx, Dirty::Zero);
         Ok(())
     }
 
@@ -862,7 +924,7 @@ impl Inner {
             let mut m = self.mem.lock();
             let snap: BTreeMap<u64, Bytes> = std::mem::take(&mut m.dirty)
                 .into_iter()
-                .map(|(i, b)| (i, Bytes::from(b)))
+                .map(|(i, d)| (i, d.bytes()))
                 .collect();
             let snap = Arc::new(snap);
             m.flushing = Some(Arc::clone(&snap));
@@ -897,7 +959,7 @@ impl Inner {
                 m.flushing = None;
                 for (idx, b) in snapshot.iter() {
                     if !m.dirty.contains_key(idx) {
-                        m.dirty.insert(*idx, b.to_vec());
+                        m.dirty.insert(*idx, Dirty::of(b));
                         if let Some(r) = refs.get(idx) {
                             m.dirty_ref.insert(*idx, r.clone());
                         }
@@ -1233,6 +1295,51 @@ mod tests {
         );
         after.checkpoint().await.unwrap();
         after.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cleared_range_reads_as_zeros_without_a_buffer_per_chunk() {
+        let (ports, _, _) = sim::ports(5);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let w = data(4, 4 * CHUNK_SIZE);
+        v.write_at(&w, 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+
+        v.zero(1000, 3 * CHUNK - 1000).await.unwrap();
+        {
+            let m = v.inner.mem.lock();
+            assert!(matches!(m.dirty.get(&0), Some(Dirty::Bytes(_))));
+            assert!(matches!(m.dirty.get(&1), Some(Dirty::Zero)));
+            assert!(matches!(m.dirty.get(&2), Some(Dirty::Zero)));
+            assert!(!m.dirty.contains_key(&3));
+        }
+        v.write_at(&data(7, 10), CHUNK + 50).await.unwrap();
+        let mut want = w.clone();
+        want[1000..3 * CHUNK_SIZE].fill(0);
+        want[CHUNK_SIZE + 50..][..10].copy_from_slice(&data(7, 10));
+        assert_eq!(read(&v, 0, want.len()).await, want);
+        v.close().await;
+        drop(v);
+
+        let again = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&again, 0, want.len()).await,
+            want,
+            "the restart replays the cleared chunks"
+        );
+        again.checkpoint().await.unwrap();
+        again.close().await;
+
+        let other = Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "main")
+            .await
+            .unwrap();
+        assert_eq!(read(&other, 0, want.len()).await, want);
+        other.close().await;
     }
 
     #[tokio::test(start_paused = true)]
