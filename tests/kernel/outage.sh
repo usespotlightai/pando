@@ -117,6 +117,8 @@ fi
 if readback "$A" 0 1 "$W/data" 0; then check "read before the outage" ok; else check "read before the outage" "differs"; fi
 
 mark "pando outage: SIGSTOP"
+sleep 1
+flock --timeout 60 "$A" true || check "wait for udev to probe the device" "it still holds $A"
 snap "before SIGSTOP"
 pkill -STOP -x minio || check "stop the store" "no minio"
 t0=$(date +%s)
