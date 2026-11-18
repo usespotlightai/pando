@@ -17,13 +17,14 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::base::{Bases, BuildOptions, BuildReport, build};
 use crate::cache::{BaseKey, Cache};
 use crate::dedup::learned::{LearnedIndex, Learner};
 use crate::handoff::{self, Handoff, HandoffReport, HostEnv, SnapshotOptions, resize_table};
 use crate::ports::DeviceSwitch;
-use crate::{Ports, Result, Volume, ext4, recording};
+use crate::{CheckpointReport, Ports, Result, Volume, ext4, recording};
 
 const BUILD_PARALLEL: usize = 16;
 
@@ -84,6 +85,12 @@ pub struct FinishReport {
     pub absorbed: usize,
     /// Chunks the saved recording lists.
     pub recorded: usize,
+    /// Taking back what the kernel wrote to the image.
+    pub absorb: Duration,
+    /// What the checkpoint that published the branch did.
+    pub checkpoint: CheckpointReport,
+    /// Saving what the run learned and its recording, and closing the volume.
+    pub after: Duration,
 }
 
 /// What the background snapshots of a handoff did.
@@ -234,6 +241,11 @@ impl Attachment {
         &self.volume
     }
 
+    /// The cache the branch reads its chunks through.
+    pub fn cache(&self) -> &Arc<Cache> {
+        &self.cache
+    }
+
     /// Whether the kernel already serves the branch from an image a dead writer left, so no
     /// frontend is needed.
     pub fn rejoined(&self) -> bool {
@@ -369,15 +381,18 @@ impl Attachment {
         let mut report = FinishReport::default();
         let h = self.handoff.lock().clone();
         let mut done = Ok(());
+        let t0 = Instant::now();
         if let Some(h) = h.as_ref().filter(|h| h.switched()) {
             match h.absorb_final(v).await {
                 Ok(n) => report.absorbed = n,
                 Err(e) => done = Err(e),
             }
         }
+        report.absorb = t0.elapsed();
         if done.is_ok() {
-            done = v.checkpoint().await;
+            done = v.checkpoint_report().await.map(|c| report.checkpoint = c);
         }
+        let t1 = Instant::now();
         let learner = self.learner.lock().take();
         if let Some(l) = learner {
             if done.is_ok() {
@@ -402,6 +417,7 @@ impl Attachment {
                 .unwrap_or(0);
         }
         v.close().await;
+        report.after = t1.elapsed();
         done.map(|()| report)
     }
 }
