@@ -25,8 +25,8 @@
   <path d="M212,94.0 h76.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-76.9 z" fill="#818b98"><title>Docker (overlayfs, local): 11.1 ms (range 11.1 ms to 11.1 ms)</title></path>
   <text x="298.9" y="105.0" font-size="12" fill="#59636e">11.1 ms</text>
   <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,120.0 h159.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-159.5 z" fill="#0969da"><title>Pando: 130 ms (range 130 ms to 130 ms)</title></path>
-  <text x="381.5" y="131.0" font-size="12" fill="#59636e">130 ms</text>
+  <path d="M212,120.0 h159.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-159.1 z" fill="#0969da"><title>Pando: 129 ms (range 129 ms to 129 ms)</title></path>
+  <text x="381.1" y="131.0" font-size="12" fill="#59636e">129 ms</text>
   <text x="202" y="157.0" font-size="12" fill="#1f2328" text-anchor="end">EBS snapshot to volume</text>
   <path d="M212,146.0 h260.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-260.1 z" fill="#818b98"><title>EBS snapshot to volume: 2.6 s (range 2.6 s to 2.6 s)</title></path>
   <text x="482.1" y="157.0" font-size="12" fill="#59636e">2.6 s</text>
@@ -91,12 +91,12 @@
   <text x="202" y="603.0" font-size="12" fill="#1f2328" text-anchor="end">Amazon S3 Files</text>
   <path d="M212,592.0 h211.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-211.5 z" fill="#818b98"><title>Amazon S3 Files: 5 MiB (range 5 MiB to 5 MiB)</title></path>
   <text x="433.5" y="603.0" font-size="12" fill="#59636e">5 MiB</text>
-  <text x="202" y="629.0" font-size="12" fill="#1f2328" text-anchor="end">XFS reflink (local)</text>
-  <path d="M212,618.0 h230.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-230.2 z" fill="#818b98"><title>XFS reflink (local): 5.75 MiB (range 5.75 MiB to 5.75 MiB)</title></path>
-  <text x="452.2" y="629.0" font-size="12" fill="#59636e">5.75 MiB</text>
-  <text x="202" y="655.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,644.0 h267.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-267.2 z" fill="#0969da"><title>Pando: 7.58 MiB (range 7.58 MiB to 7.58 MiB)</title></path>
-  <text x="489.2" y="655.0" font-size="12" fill="#59636e">7.58 MiB</text>
+  <text x="202" y="629.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
+  <path d="M212,618.0 h213.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-213.5 z" fill="#0969da"><title>Pando: 5.08 MiB (range 5.08 MiB to 5.08 MiB)</title></path>
+  <text x="435.5" y="629.0" font-size="12" fill="#59636e">5.08 MiB</text>
+  <text x="202" y="655.0" font-size="12" fill="#1f2328" text-anchor="end">XFS reflink (local)</text>
+  <path d="M212,644.0 h230.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-230.2 z" fill="#818b98"><title>XFS reflink (local): 5.75 MiB (range 5.75 MiB to 5.75 MiB)</title></path>
+  <text x="452.2" y="655.0" font-size="12" fill="#59636e">5.75 MiB</text>
   <text x="202" y="681.0" font-size="12" fill="#1f2328" text-anchor="end">ZeroFS (NBD)</text>
   <path d="M212,670.0 h434.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-434.8 z" fill="#818b98"><title>ZeroFS (NBD): 26.5 MiB (range 26.5 MiB to 26.5 MiB)</title></path>
   <text x="656.8" y="681.0" font-size="12" fill="#59636e">26.5 MiB</text>

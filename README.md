@@ -128,9 +128,10 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **The results come from three runs** on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see
-> [bench/README.md](bench/README.md)): Pando's from main at `d57f1de`, SOCI, Nydus, ZeroFS and
-> Amazon S3 Files from the run before it, and the other systems from the first run.
+> **The results come from four runs** on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> [bench/README.md](bench/README.md)): Pando's fork, fio and kill -9 crash rows from main at
+> `a871f16`, Pando's other rows from main at `d57f1de`, SOCI, Nydus, ZeroFS and Amazon S3 Files
+> from the run before those, and the other systems from the first run.
 > Run `python3 bench/plot.py` to redraw the charts from `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
@@ -146,8 +147,9 @@ branches are durable and open on any host, so each fork waits on the network. Th
 one run so far, not five. JuiceFS made 100 branches, EBS and ZeroFS 10, and S3 Files 3; the others
 made 1,000. ZeroFS has only read-only checkpoints, so a writable branch is a copy of the device
 file. S3 Files has no branches, so a branch is a copy of every file through the mount. On Pando a
-5 MiB edit adds 7.58 MiB to the store in this run, against 5.08 MiB in the run before it; the
-cause is not known yet.
+5 MiB edit adds 5.08 MiB to the store: 5.05 MiB of segments and the rest change records and hints.
+At `d57f1de` it added 7.58 MiB, because a write-log record still in upload when the log closed was
+never deleted; that is fixed.
 
 <!-- bench:fork -->
 <picture>
@@ -160,7 +162,7 @@ cause is not known yet.
 
 | p50 over up to 1,000 branches | median | range |
 |---|---|---|
-| Pando | 130 ms | 130 ms to 130 ms |
+| Pando | 129 ms | 129 ms to 129 ms |
 | Docker (overlayfs, local) | 11.1 ms | 11.1 ms to 11.1 ms |
 | EBS snapshot to volume | 2.6 s | 2.6 s to 2.6 s |
 | JuiceFS | 12.8 s | 12.8 s to 12.8 s |
@@ -180,7 +182,7 @@ cause is not known yet.
 
 | storage added by a 5 MiB edit to a branch | median | range |
 |---|---|---|
-| Pando | 7.58 MiB | 7.58 MiB to 7.58 MiB |
+| Pando | 5.08 MiB | 5.08 MiB to 5.08 MiB |
 | Docker (overlayfs, local) | 5 MiB | 5 MiB to 5 MiB |
 | EBS snapshot to volume | none: billed by volume size | |
 | JuiceFS | 5 MiB | 5 MiB to 5 MiB |
@@ -352,12 +354,16 @@ Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs 
 Pando. Pando (ublk) reads come out ahead of the local NVMe because its daemon keeps the branch in
 cache files read through the host's page cache: direct I/O skips the page cache of the device, not
 of the daemon, so those rows mostly measure memory. Its writes do not: sequential writes match the
-NVMe, and 4 KiB random writes reach about 14k IOPS, a tenth of the NVMe's 134k. In the run before
-this one Pando's own random writes reached 467k IOPS; the drop is a regression whose cause is not
-known yet. After handoff, I/O goes through device-mapper and a loop device to the image on
-the NVMe and runs at the NVMe's speed. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On
-ZeroFS every request goes over NBD to its server and on S3 Files over NFS to the file system, so a
-single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
+NVMe, and 4 KiB random writes reach about 123k IOPS, near the NVMe's 134k. At `d57f1de` they reached
+only 14k: each dirty 4 KiB write held a whole 64 KiB chunk in memory, so the dirty-memory limit held
+random writes to the speed of full-chunk flushes. Dirty writes now stay in the journal. During these
+runs the daemon's memory grew with each run, to a peak of 1,060 MiB: the object log index and the
+uploader's map of uploaded objects keep every chunk version. This is a known issue, and a fix is in
+progress. The after-handoff rows are from `d57f1de`. After handoff, I/O goes through device-mapper
+and a loop device to the image on the NVMe and runs at the NVMe's speed. EBS gp3 runs at its
+baseline of 3,000 IOPS and 125 MiB/s. On ZeroFS every request goes over NBD to its server and on S3
+Files over NFS to the file system, so a single 4 KiB read waits on a round trip: about 240 IOPS on
+S3 Files.
 
 <!-- bench:fio -->
 <picture>
@@ -371,7 +377,7 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 4 KiB random read, QD1 | median | range |
 |---|---|---|
 | local NVMe | 11k | 10.4k to 11.1k |
-| Pando (ublk) | 103k | 98.4k to 104k |
+| Pando (ublk) | 107k | 104k to 110k |
 | Pando (after handoff) | 7.78k | 5.73k to 8.2k |
 | EBS gp3 | 1.54k | 1.54k to 1.6k |
 | JuiceFS | 6.37k | 5.98k to 6.58k |
@@ -381,7 +387,7 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 4 KiB random read, 4 x QD32 | median | range |
 |---|---|---|
 | local NVMe | 269k | 269k to 269k |
-| Pando (ublk) | 808k | 795k to 811k |
+| Pando (ublk) | 820k | 820k to 825k |
 | Pando (after handoff) | 254k | 252k to 255k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 76.7k | 76.4k to 77.3k |
@@ -391,7 +397,7 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 4 KiB random write, 4 x QD32 | median | range |
 |---|---|---|
 | local NVMe | 134k | 134k to 134k |
-| Pando (ublk) | 14.2k | 14.2k to 14.2k |
+| Pando (ublk) | 123k | 123k to 125k |
 | Pando (after handoff) | 132k | 131k to 132k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 484 | 456 to 493 |
@@ -401,7 +407,7 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 1 MiB sequential read | median | range |
 |---|---|---|
 | local NVMe | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
-| Pando (ublk) | 6,769 MB/s | 6,625 MB/s to 7,132 MB/s |
+| Pando (ublk) | 6,732 MB/s | 6,687 MB/s to 7,027 MB/s |
 | Pando (after handoff) | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,611 MB/s | 1,576 MB/s to 1,660 MB/s |
@@ -411,7 +417,7 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 1 MiB sequential write | median | range |
 |---|---|---|
 | local NVMe | 908 MB/s | 908 MB/s to 908 MB/s |
-| Pando (ublk) | 927 MB/s | 922 MB/s to 936 MB/s |
+| Pando (ublk) | 906 MB/s | 906 MB/s to 940 MB/s |
 | Pando (after handoff) | 902 MB/s | 901 MB/s to 902 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,328 MB/s | 1,317 MB/s to 1,330 MB/s |
@@ -433,18 +439,17 @@ the device after 120 s. What it acknowledged before the kill was intact.
 
 | System | Failed writes | Stall | fsck | Files correct |
 |---|---|---|---|---|
-| Pando | 0, 0, 0, 0 and 4 | 0.16 s | errors in 1 of 5 runs (known bug) | all acknowledged (1,379 to 1,445 per run) |
+| Pando | 0 | 0.15 s | clean | all acknowledged (1,390 to 1,440 per run) |
 | JuiceFS | 2 | 0.23 s | clean | all acknowledged (264 to 270 per run) |
 | ZeroFS | 1 | did not recover | clean | all acknowledged (20 per run) |
 | Amazon S3 Files | 0 | 3.16 s | no checker | all acknowledged (348 to 352 per run) |
 
-In one of Pando's five runs the restarted daemon logged `ublk io: File exists (os error 17)`, 4
-writes failed, and the fresh host's `e2fsck -fn` found the root directory, the inode count and the
-block bitmap of one group wrong (exit 4). Every acknowledged file still read back correctly. This
-is a known recovery bug in main at `d57f1de`, not a quirk of the measure, and is not fixed yet.
+At `d57f1de`, one of Pando's five runs failed 4 writes and left file system errors (`e2fsck` exit
+4): the restarted daemon reused a temporary file name that the killed one had left behind. That is
+fixed, and at `a871f16` all five runs were clean.
 
-Pando also ran a reboot case five times: the same writer, and five seconds in the host reboots
-through `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would. After the
-boot, `pando attach --recover=auto` served the branch in 3.2 s (2.8 s to 3.9 s), `e2fsck -fn` found
-the file system clean there and again on a fresh host, and every acknowledged file (804 to 836 per
-run) read back correctly on both.
+At `d57f1de` Pando also ran a reboot case five times: the same writer, and five seconds in the host
+reboots through `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would.
+After the boot, `pando attach --recover=auto` served the branch in 3.2 s (2.8 s to 3.9 s), `e2fsck
+-fn` found the file system clean there and again on a fresh host, and every acknowledged file (804
+to 836 per run) read back correctly on both.

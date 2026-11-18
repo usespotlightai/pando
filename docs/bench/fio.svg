@@ -17,8 +17,8 @@
   <text x="676.0" y="258" font-size="11" fill="#59636e" text-anchor="middle">125k</text>
   <line x1="212" y1="62" x2="212" y2="244" stroke="#d1d9e0" stroke-width="1"/>
   <text x="202" y="79.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (ublk)</text>
-  <path d="M212,68.0 h377.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-377.7 z" fill="#0969da"><title>Pando (ublk): 103k (range 98.4k to 104k)</title></path>
-  <text x="599.7" y="79.0" font-size="12" fill="#59636e">103k</text>
+  <path d="M212,68.0 h394.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-394.0 z" fill="#0969da"><title>Pando (ublk): 107k (range 104k to 110k)</title></path>
+  <text x="616.0" y="79.0" font-size="12" fill="#59636e">107k</text>
   <text x="202" y="105.0" font-size="12" fill="#1f2328" text-anchor="end">local NVMe</text>
   <path d="M212,94.0 h36.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-36.7 z" fill="#818b98"><title>local NVMe: 11k (range 10.4k to 11.1k)</title></path>
   <text x="258.7" y="105.0" font-size="12" fill="#59636e">11k</text>
@@ -52,8 +52,8 @@
   <text x="676.0" y="494" font-size="11" fill="#59636e" text-anchor="middle">1M</text>
   <line x1="212" y1="298" x2="212" y2="480" stroke="#d1d9e0" stroke-width="1"/>
   <text x="202" y="315.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (ublk)</text>
-  <path d="M212,304.0 h370.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-370.7 z" fill="#0969da"><title>Pando (ublk): 808k (range 795k to 811k)</title></path>
-  <text x="592.7" y="315.0" font-size="12" fill="#59636e">808k</text>
+  <path d="M212,304.0 h376.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-376.5 z" fill="#0969da"><title>Pando (ublk): 820k (range 820k to 825k)</title></path>
+  <text x="598.5" y="315.0" font-size="12" fill="#59636e">820k</text>
   <text x="202" y="341.0" font-size="12" fill="#1f2328" text-anchor="end">local NVMe</text>
   <path d="M212,330.0 h120.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-120.7 z" fill="#818b98"><title>local NVMe: 269k (range 269k to 269k)</title></path>
   <text x="342.7" y="341.0" font-size="12" fill="#59636e">269k</text>
@@ -89,8 +89,8 @@
   <path d="M212,566.0 h403.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-403.5 z" fill="#0969da"><title>Pando (after handoff): 132k (range 131k to 132k)</title></path>
   <text x="625.5" y="577.0" font-size="12" fill="#59636e">132k</text>
   <text x="202" y="603.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (ublk)</text>
-  <path d="M212,592.0 h39.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-39.9 z" fill="#0969da"><title>Pando (ublk): 14.2k (range 14.2k to 14.2k)</title></path>
-  <text x="261.9" y="603.0" font-size="12" fill="#59636e">14.2k</text>
+  <path d="M212,592.0 h377.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-377.8 z" fill="#0969da"><title>Pando (ublk): 123k (range 123k to 125k)</title></path>
+  <text x="599.8" y="603.0" font-size="12" fill="#59636e">123k</text>
   <text x="202" y="629.0" font-size="12" fill="#1f2328" text-anchor="end">Amazon S3 Files</text>
   <path d="M212,618.0 h10.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-10.9 z" fill="#818b98"><title>Amazon S3 Files: 4.83k (range 4.49k to 4.87k)</title></path>
   <text x="232.9" y="629.0" font-size="12" fill="#59636e">4.83k</text>
@@ -116,8 +116,8 @@
   <text x="676.0" y="966" font-size="11" fill="#59636e" text-anchor="middle">8,000 MB/s</text>
   <line x1="212" y1="770" x2="212" y2="952" stroke="#d1d9e0" stroke-width="1"/>
   <text x="202" y="787.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (ublk)</text>
-  <path d="M212,776.0 h388.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-388.6 z" fill="#0969da"><title>Pando (ublk): 6,769 MB/s (range 6,625 MB/s to 7,132 MB/s)</title></path>
-  <text x="610.6" y="787.0" font-size="12" fill="#59636e">6,769 MB/s</text>
+  <path d="M212,776.0 h386.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-386.4 z" fill="#0969da"><title>Pando (ublk): 6,732 MB/s (range 6,687 MB/s to 7,027 MB/s)</title></path>
+  <text x="608.4" y="787.0" font-size="12" fill="#59636e">6,732 MB/s</text>
   <text x="202" y="813.0" font-size="12" fill="#1f2328" text-anchor="end">local NVMe</text>
   <path d="M212,802.0 h106.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-106.8 z" fill="#818b98"><title>local NVMe: 1,910 MB/s (range 1,910 MB/s to 1,910 MB/s)</title></path>
   <text x="328.8" y="813.0" font-size="12" fill="#59636e">1,910 MB/s</text>
@@ -149,12 +149,12 @@
   <text x="202" y="1023.0" font-size="12" fill="#1f2328" text-anchor="end">JuiceFS</text>
   <path d="M212,1012.0 h406.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-406.8 z" fill="#818b98"><title>JuiceFS: 1,328 MB/s (range 1,317 MB/s to 1,330 MB/s)</title></path>
   <text x="628.8" y="1023.0" font-size="12" fill="#59636e">1,328 MB/s</text>
-  <text x="202" y="1049.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (ublk)</text>
-  <path d="M212,1038.0 h282.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-282.8 z" fill="#0969da"><title>Pando (ublk): 927 MB/s (range 922 MB/s to 936 MB/s)</title></path>
-  <text x="504.8" y="1049.0" font-size="12" fill="#59636e">927 MB/s</text>
-  <text x="202" y="1075.0" font-size="12" fill="#1f2328" text-anchor="end">local NVMe</text>
-  <path d="M212,1064.0 h276.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-276.8 z" fill="#818b98"><title>local NVMe: 908 MB/s (range 908 MB/s to 908 MB/s)</title></path>
-  <text x="498.8" y="1075.0" font-size="12" fill="#59636e">908 MB/s</text>
+  <text x="202" y="1049.0" font-size="12" fill="#1f2328" text-anchor="end">local NVMe</text>
+  <path d="M212,1038.0 h276.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-276.8 z" fill="#818b98"><title>local NVMe: 908 MB/s (range 908 MB/s to 908 MB/s)</title></path>
+  <text x="498.8" y="1049.0" font-size="12" fill="#59636e">908 MB/s</text>
+  <text x="202" y="1075.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (ublk)</text>
+  <path d="M212,1064.0 h276.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-276.4 z" fill="#0969da"><title>Pando (ublk): 906 MB/s (range 906 MB/s to 940 MB/s)</title></path>
+  <text x="498.4" y="1075.0" font-size="12" fill="#59636e">906 MB/s</text>
   <text x="202" y="1101.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (after handoff)</text>
   <path d="M212,1090.0 h275.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-275.0 z" fill="#0969da"><title>Pando (after handoff): 902 MB/s (range 901 MB/s to 902 MB/s)</title></path>
   <text x="497.0" y="1101.0" font-size="12" fill="#59636e">902 MB/s</text>
