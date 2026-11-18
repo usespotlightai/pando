@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Draws the benchmark charts and fills them into the README.
 
-    python3 bench/plot.py            reads bench/results/*.csv, writes docs/bench/*.svg, updates README.md
+    python3 bench/plot.py    reads bench/results/<chart>.csv, writes docs/bench/*.svg, updates README.md
 
 Results are CSV rows `system,workspace,measure,rep,value,unit,notes`. A chart panel takes the
 median of the `small` workspace's repetitions per system. Systems with no rows yet are drawn as
@@ -257,9 +257,13 @@ def fmt(v: float, kind: str) -> str:
 
 
 def load() -> Data:
-    """Return {metric: {system: (median, min, max)}} in base units, for WORKSPACE."""
+    """Return {metric: {system: (median, min, max)}} in base units, for WORKSPACE.
+
+    Only each chart's own results file is read, so the other files' rows, from runs that tried
+    something out, never mix into a chart.
+    """
     rows = {}
-    for f in sorted(RESULTS.glob("*.csv")):
+    for f in (RESULTS / f"{name}.csv" for name in CHARTS):
         with f.open(newline="") as h:
             for r in csv.DictReader(h):
                 if r["workspace"] != WORKSPACE:
