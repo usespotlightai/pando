@@ -63,6 +63,7 @@ pub struct SimStore {
     state: Mutex<State>,
     clock: Arc<dyn Clock>,
     answering: tokio::sync::watch::Sender<bool>,
+    held: tokio::sync::watch::Sender<Vec<(StoreOp, String)>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +77,7 @@ impl SimStore {
             state: Mutex::default(),
             clock,
             answering: tokio::sync::watch::Sender::new(true),
+            held: tokio::sync::watch::Sender::new(Vec::new()),
         }
     }
 
@@ -122,9 +124,26 @@ impl SimStore {
         self.answering.send_replace(on);
     }
 
-    async fn round_trip(&self) {
+    /// Holds every call of kind `op` on a key that starts with `prefix` and that starts after
+    /// this: it waits without failing until [`SimStore::release`], as a call a slow link holds
+    /// up does. A call that started before goes on.
+    pub fn hold(&self, op: StoreOp, prefix: &str) {
+        self.held.send_modify(|h| h.push((op, prefix.to_string())));
+    }
+
+    /// Ends the hold of [`SimStore::hold`] on `op` and `prefix`; the calls it held go on.
+    pub fn release(&self, op: StoreOp, prefix: &str) {
+        self.held
+            .send_modify(|h| h.retain(|(o, p)| (*o, p.as_str()) != (op, prefix)));
+    }
+
+    async fn round_trip(&self, op: StoreOp, key: &str) {
         let mut answering = self.answering.subscribe();
         let _ = answering.wait_for(|on| *on).await;
+        let mut held = self.held.subscribe();
+        let _ = held
+            .wait_for(|h| !h.iter().any(|(o, p)| *o == op && key.starts_with(p.as_str())))
+            .await;
         let latency = self.state.lock().latency;
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
@@ -211,7 +230,7 @@ impl SimStore {
 #[async_trait]
 impl Store for SimStore {
     async fn get(&self, key: &str) -> Result<Object, StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::Get, key).await;
         let (body, v) = self.read(key)?;
         Ok(Object {
             body,
@@ -220,7 +239,7 @@ impl Store for SimStore {
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::Get, key).await;
         let (body, _) = self.read(key)?;
         let end = usize_from(range.end).min(body.len());
         let start = usize_from(range.start).min(end);
@@ -228,29 +247,29 @@ impl Store for SimStore {
     }
 
     async fn get_tail(&self, key: &str, n: u64) -> Result<(Bytes, u64), StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::Get, key).await;
         let (body, _) = self.read(key)?;
         let len = body.len();
         Ok((body.slice(len - usize_from(n).min(len)..), u64_from(len)))
     }
 
     async fn put(&self, key: &str, body: Bytes) -> Result<Version, StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::Put, key).await;
         self.write(StoreOp::Put, key, body, None)
     }
 
     async fn create(&self, key: &str, body: Bytes) -> Result<Version, StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::Create, key).await;
         self.write(StoreOp::Create, key, body, None)
     }
 
     async fn update(&self, key: &str, body: Bytes, expected: &Version) -> Result<Version, StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::Update, key).await;
         self.write(StoreOp::Update, key, body, Some(expected))
     }
 
     async fn list(&self, dir: &str) -> Result<Vec<ObjectInfo>, StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::List, dir).await;
         let mut s = self.state.lock();
         if let Some(f) = Self::fault(&mut s, StoreOp::List) {
             return Err(Self::failure(dir, f));
@@ -268,7 +287,7 @@ impl Store for SimStore {
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.round_trip().await;
+        self.round_trip(StoreOp::Delete, key).await;
         let mut s = self.state.lock();
         let fault = Self::fault(&mut s, StoreOp::Delete);
         if let Some(f) = fault.filter(|f| !f.applied) {

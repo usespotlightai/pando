@@ -63,7 +63,8 @@ struct Queue {
     bytes: usize,
     /// Flushes through this one left the queue unlogged; only an upload covers them.
     dropped: u64,
-    /// The last flush of each record this writer created, by record number.
+    /// The last flush of each record this writer created or is creating, by record number. A
+    /// number is taken before its create starts, so a log position counts a record in flight.
     records: Vec<u64>,
     /// Records below this number are deleted.
     trimmed: u64,
@@ -71,7 +72,6 @@ struct Queue {
     covered: u64,
     published: bool,
     older_trimmed: bool,
-    stopped: bool,
 }
 
 /// The log of one writer.
@@ -82,6 +82,11 @@ pub(super) struct Log {
     wake: Notify,
     /// The last flush the log holds, with every flush before it.
     logged: watch::Sender<u64>,
+    /// The log takes no more flushes. It changes only under the queue's lock.
+    stopped: watch::Sender<bool>,
+    /// The shipper is creating a record. It turns on only under the queue's lock while the log
+    /// is not stopped, so once the log stops and it is off, no record is created any more.
+    shipping: watch::Sender<bool>,
     /// Where this open's read of the log started; the generation take writes it to the ref.
     pub(super) start: LogPos,
 }
@@ -93,12 +98,31 @@ impl Log {
             queue: Mutex::default(),
             wake: Notify::new(),
             logged: watch::Sender::new(0),
+            stopped: watch::Sender::new(false),
+            shipping: watch::Sender::new(false),
             start,
         }
     }
 
     pub(super) fn mode(&self) -> LogMode {
         self.mode
+    }
+}
+
+/// Marks a record in flight in [`Log::shipping`] until it drops, so a shipper that ends in any
+/// way does not leave a close waiting.
+struct Shipping<'a>(&'a watch::Sender<bool>);
+
+impl<'a> Shipping<'a> {
+    fn start(flag: &'a watch::Sender<bool>) -> Shipping<'a> {
+        flag.send_replace(true);
+        Shipping(flag)
+    }
+}
+
+impl Drop for Shipping<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
     }
 }
 
@@ -302,7 +326,7 @@ impl Inner {
             generation: self.generation,
             flush: seq,
             next: q.records.partition_point(|to| *to <= seq) as u64,
-            closed: self.log.mode == LogMode::Off || q.stopped,
+            closed: self.log.mode == LogMode::Off || *self.log.stopped.borrow(),
         }
     }
 
@@ -315,15 +339,19 @@ impl Inner {
         self.log.wake.notify_one();
     }
 
-    /// Stops the log and records in the ref that this writer appends no more records. Only
-    /// once every flush is published; otherwise it does nothing.
+    /// Stops the log, waits for a record in flight, and records in the ref that this writer
+    /// appends no more records. Only once every flush is published; otherwise it does nothing.
     pub(super) async fn close_log(&self) -> Result<()> {
         let seq = self.mem.lock().flush_seq;
         if *self.uploaded_seq.borrow() < seq {
             return Ok(());
         }
-        self.log.queue.lock().stopped = true;
+        {
+            let _q = self.log.queue.lock();
+            self.log.stopped.send_replace(true);
+        }
         self.log.wake.notify_one();
+        let _ = self.log.shipping.subscribe().wait_for(|s| !*s).await;
         let pos = self.log_pos(seq);
         let (r, version) = {
             let up = self.up.lock();
@@ -385,8 +413,9 @@ impl Inner {
     }
 
     /// Creates record `n` of this writer with `body`, retrying until the store answers; false
-    /// when the writer is fenced or stopping.
+    /// when the writer is fenced or stopping, or the log stopped after a failed try.
     async fn put_record(&self, n: u64, body: Bytes, stop: &mut watch::Receiver<bool>) -> bool {
+        let mut stopped = self.log.stopped.subscribe();
         let mut failed = 0;
         loop {
             match self
@@ -412,6 +441,7 @@ impl Inner {
                     failed += 1;
                     tokio::select! {
                         _ = stop.wait_for(|s| *s) => return false,
+                        _ = stopped.wait_for(|s| *s) => return false,
                         () = tokio::time::sleep(backoff(failed, self.rng.as_ref())) => {}
                     }
                 }
@@ -431,7 +461,7 @@ impl Inner {
                 let q = self.log.queue.lock();
                 (
                     !q.pending.is_empty() || q.dropped > *self.log.logged.borrow(),
-                    q.stopped,
+                    *self.log.stopped.borrow(),
                 )
             };
             if !waiting || stopped {
@@ -486,10 +516,19 @@ impl Inner {
                     return;
                 }
             };
-            if !self.put_record(n, body, &mut stop).await {
+            let shipping = {
+                let mut q = self.log.queue.lock();
+                if *self.log.stopped.borrow() {
+                    continue;
+                }
+                q.records.push(to);
+                Shipping::start(&self.log.shipping)
+            };
+            let created = self.put_record(n, body, &mut stop).await;
+            drop(shipping);
+            if !created {
                 return;
             }
-            self.log.queue.lock().records.push(to);
             self.log.logged.send_modify(|l| *l = (*l).max(to));
         }
     }
@@ -833,6 +872,68 @@ mod tests {
         assert!(log_keys(&store).is_empty(), "no seal");
         assert_eq!(read(&b, data(7).len()).await, data(7));
         b.close().await;
+    }
+
+    async fn record_waits_while_published(ports: &Ports, store: &SimStore, seed: u8) -> Volume {
+        Volume::create(ports, "main", SIZE).await.unwrap();
+        let a = open(ports, "/a", LogMode::Behind).await;
+        let reference = keys::reference("main");
+        store.hold(StoreOp::Update, &reference);
+        store.hold(StoreOp::Create, &keys::log_branch("main"));
+        a.write_at(&data(seed), 1000).await.unwrap();
+        a.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        store.release(StoreOp::Update, &reference);
+        a.checkpoint().await.unwrap();
+        a
+    }
+
+    async fn assert_closed_clean(ports: &Ports, store: &SimStore, seed: u8) {
+        assert!(log_keys(store).is_empty(), "{:?}", log_keys(store));
+        let r = reference(ports).await;
+        assert!(
+            r.log
+                .is_some_and(|l| l.closed && l.generation == r.generation && l.next == 1),
+            "{r:?}"
+        );
+        let b = open(ports, "/b", LogMode::Behind).await;
+        assert_eq!(read(&b, data(seed).len()).await, data(seed));
+        b.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_created_while_the_log_closes_is_trimmed() {
+        let (ports, store, _) = sim::ports(12);
+        let a = record_waits_while_published(&ports, &store, 12).await;
+        let (closed, ()) = tokio::join!(a.close_log(), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            store.release(StoreOp::Create, &keys::log_branch("main"));
+        });
+        closed.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        a.close().await;
+        assert_closed_clean(&ports, &store, 12).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_close_ends_the_retries_of_a_record() {
+        let (ports, store, _) = sim::ports(13);
+        let a = record_waits_while_published(&ports, &store, 13).await;
+        store.inject(Fault {
+            op: StoreOp::Create,
+            applied: false,
+            permanent: false,
+        });
+        let t0 = tokio::time::Instant::now();
+        let (closed, ()) = tokio::join!(a.close_log(), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            store.release(StoreOp::Create, &keys::log_branch("main"));
+        });
+        closed.unwrap();
+        assert!(t0.elapsed() < RETRY_AFTER / 2, "{:?}", t0.elapsed());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        a.close().await;
+        assert_closed_clean(&ports, &store, 13).await;
     }
 
     #[tokio::test(start_paused = true)]
