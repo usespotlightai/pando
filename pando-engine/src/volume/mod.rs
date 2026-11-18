@@ -58,6 +58,10 @@ const GENERATION_TRIES: usize = 10;
 const STORE_PARALLEL: usize = 16;
 /// Segments a change list walk fetches nodes from at once.
 const LIST_PARALLEL: usize = 16;
+/// Dirty chunk bytes past which a commit starts in the background.
+const DIRTY_COMMIT: usize = 16 << 20;
+/// Dirty chunk bytes past which a write that needs a new chunk buffer commits first.
+const DIRTY_MAX: usize = 32 << 20;
 static ZEROS: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
 
 /// A chunk written since the last flush.
@@ -84,11 +88,70 @@ impl Dirty {
         }
     }
 
+    fn len(&self) -> usize {
+        match self {
+            Dirty::Bytes(v) => v.len(),
+            Dirty::Zero => 0,
+        }
+    }
+
     fn copy_to(&self, at: usize, dst: &mut [u8]) {
         match self {
             Dirty::Bytes(d) => dst.copy_from_slice(&d[at..at + dst.len()]),
             Dirty::Zero => dst.fill(0),
         }
+    }
+}
+
+/// The chunks written since the last flush, with the bytes their buffers hold.
+#[derive(Debug, Default)]
+struct DirtySet {
+    chunks: BTreeMap<u64, Dirty>,
+    bytes: usize,
+}
+
+impl DirtySet {
+    fn get(&self, idx: u64) -> Option<&Dirty> {
+        self.chunks.get(&idx)
+    }
+
+    fn get_mut(&mut self, idx: u64) -> Option<&mut Dirty> {
+        self.chunks.get_mut(&idx)
+    }
+
+    fn contains_key(&self, idx: u64) -> bool {
+        self.chunks.contains_key(&idx)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.chunks.keys()
+    }
+
+    fn insert(&mut self, idx: u64, d: Dirty) {
+        self.bytes += d.len();
+        if let Some(old) = self.chunks.insert(idx, d) {
+            self.bytes -= old.len();
+        }
+    }
+
+    fn remove(&mut self, idx: u64) -> Option<Dirty> {
+        let old = self.chunks.remove(&idx)?;
+        self.bytes -= old.len();
+        Some(old)
+    }
+
+    /// Whether chunk `idx` has a buffer already, so a write to it needs no new one.
+    fn buffered(&self, idx: u64) -> bool {
+        matches!(self.chunks.get(&idx), Some(Dirty::Bytes(_)))
+    }
+
+    fn take(&mut self) -> BTreeMap<u64, Dirty> {
+        self.bytes = 0;
+        std::mem::take(&mut self.chunks)
     }
 }
 
@@ -100,7 +163,7 @@ struct Mem {
     size: u64,
     /// The root the branch opened at, as a root of `tree`.
     opened_now: Entry,
-    dirty: BTreeMap<u64, Dirty>,
+    dirty: DirtySet,
     /// Every chunk written since the branch opened, so not the base image's any more.
     touched: HashSet<u64>,
     flushing: Option<Arc<BTreeMap<u64, Bytes>>>,
@@ -207,6 +270,8 @@ struct Inner {
     up: Mutex<Up>,
     changed: watch::Sender<u64>,
     kick: Notify,
+    /// Wakes the committer: the dirty set passed [`DIRTY_COMMIT`].
+    full: Notify,
     stop: watch::Sender<bool>,
     dedup: Mutex<Option<Arc<Dedup>>>,
     learner: Mutex<Option<Arc<Learner>>>,
@@ -348,7 +413,7 @@ impl Volume {
             tree: Arc::clone(&tree),
             size,
             opened_now: root,
-            dirty: BTreeMap::new(),
+            dirty: DirtySet::default(),
             touched: HashSet::new(),
             flushing: None,
             jfloor: resume.map_or(0, |s| s.jfloor),
@@ -394,6 +459,7 @@ impl Volume {
             }),
             changed: watch::Sender::new(0),
             kick: Notify::new(),
+            full: Notify::new(),
             stop: watch::Sender::new(false),
             dedup: Mutex::default(),
             learner: Mutex::default(),
@@ -407,12 +473,9 @@ impl Volume {
         });
         inner.start_journal(resume).await?;
         let grown = size != r.size;
-        let taker = tokio::spawn(Arc::clone(&inner).take_generation(r, version));
-        let uploader = tokio::spawn(Arc::clone(&inner).uploader());
-        let shipper = tokio::spawn(Arc::clone(&inner).shipper());
         let v = Volume {
+            tasks: Mutex::new(inner.start(r, version)),
             inner,
-            tasks: Mutex::new(vec![taker, uploader, shipper]),
         };
         if let Err(e) = v.inner.replay_log(scan.writes).await {
             v.close().await;
@@ -763,6 +826,17 @@ fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
 }
 
 impl Inner {
+    /// Starts the tasks that run until the volume closes: the generation take on ref `r`, the
+    /// uploader, the shipper and the committer.
+    fn start(self: &Arc<Self>, r: Ref, version: Version) -> Vec<JoinHandle<()>> {
+        vec![
+            tokio::spawn(Arc::clone(self).take_generation(r, version)),
+            tokio::spawn(Arc::clone(self).uploader()),
+            tokio::spawn(Arc::clone(self).shipper()),
+            tokio::spawn(Arc::clone(self).committer()),
+        ]
+    }
+
     /// Replays the journal above the floor of `resume`, or starts an empty one without it.
     async fn start_journal(&self, resume: Option<VolState>) -> Result<()> {
         let Some(s) = resume else {
@@ -926,7 +1000,7 @@ impl Inner {
         let _g = self.stripe(idx).read().await;
         let (tree, root) = {
             let m = self.mem.lock();
-            match m.dirty.get(&idx) {
+            match m.dirty.get(idx) {
                 Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
                 Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
                 None => {}
@@ -960,7 +1034,7 @@ impl Inner {
         };
         let (tree, root) = {
             let m = self.mem.lock();
-            if let Some(d) = m.dirty.get(&idx) {
+            if let Some(d) = m.dirty.get(idx) {
                 d.copy_to(at, dst);
                 return Ok(true);
             }
@@ -1000,7 +1074,7 @@ impl Inner {
     async fn is_sparse(&self, idx: u64) -> Result<bool> {
         let (tree, root) = {
             let m = self.mem.lock();
-            if let Some(d) = m.dirty.get(&idx) {
+            if let Some(d) = m.dirty.get(idx) {
                 return Ok(matches!(d, Dirty::Zero));
             }
             if m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
@@ -1015,11 +1089,14 @@ impl Inner {
     /// in the buffer and in the journal; writes to other chunks run in parallel. A flush takes
     /// every stripe, so no write is half applied when it takes the dirty set.
     async fn write_chunk(&self, idx: u64, at: usize, data: &[u8], journaled: bool) -> Result<()> {
+        if journaled {
+            self.make_room(idx).await?;
+        }
         let _g = self.stripe(idx).write().await;
         let (dirty, flushing, tree, root, size) = {
             let m = self.mem.lock();
             let f = m.flushing.as_ref().and_then(|f| f.get(&idx)).cloned();
-            let zero = m.dirty.get(&idx).map(|d| matches!(d, Dirty::Zero));
+            let zero = m.dirty.get(idx).map(|d| matches!(d, Dirty::Zero));
             (zero, f, Arc::clone(&m.tree), m.root, m.size)
         };
         let fresh = if dirty == Some(false) {
@@ -1049,7 +1126,7 @@ impl Inner {
         m.written(idx);
         match fresh {
             None => {
-                let Some(Dirty::Bytes(d)) = m.dirty.get_mut(&idx) else {
+                let Some(Dirty::Bytes(d)) = m.dirty.get_mut(idx) else {
                     return Err(Error::Corrupt(format!(
                         "chunk {idx} left the dirty set under its stripe lock"
                     )));
@@ -1062,6 +1139,42 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// Keeps the dirty set's buffers near [`DIRTY_MAX`] before a write to chunk `idx`: past
+    /// [`DIRTY_COMMIT`] it wakes the committer, and past [`DIRTY_MAX`] a write that needs a new
+    /// buffer commits first. Call it holding no stripe lock.
+    async fn make_room(&self, idx: u64) -> Result<()> {
+        loop {
+            let bytes = {
+                let m = self.mem.lock();
+                if m.dirty.buffered(idx) {
+                    return Ok(());
+                }
+                m.dirty.bytes
+            };
+            if bytes < DIRTY_COMMIT {
+                return Ok(());
+            }
+            self.full.notify_one();
+            if bytes < DIRTY_MAX {
+                return Ok(());
+            }
+            self.commit_at(DIRTY_MAX).await?;
+        }
+    }
+
+    /// Commits the dirty set whenever it passes [`DIRTY_COMMIT`], until the volume stops. A
+    /// failed commit leaves the writes dirty, for the next flush to report.
+    async fn committer(self: Arc<Self>) {
+        let mut stop = self.stop.subscribe();
+        loop {
+            tokio::select! {
+                _ = stop.wait_for(|s| *s) => return,
+                () = self.full.notified() => {}
+            }
+            let _ = self.commit_at(DIRTY_COMMIT).await;
+        }
     }
 
     /// Makes chunk `idx` all zeros, as [`Self::write_chunk`] would with a chunk of zeros.
@@ -1086,6 +1199,13 @@ impl Inner {
 
     /// Commits completed writes locally and durably; returns the number of the last flush.
     async fn commit_flush(&self) -> Result<u64> {
+        self.commit_at(0).await
+    }
+
+    /// Commits the dirty set when it is not empty and its buffers hold at least `min` bytes.
+    /// A commit with `min` above 0 only bounds memory: no caller waits for it, so it leaves
+    /// the log to the uploader's next pass and does not start one.
+    async fn commit_at(&self, min: usize) -> Result<u64> {
         let _c = self.commit.lock().await;
         if self.up.lock().fenced {
             return Err(Error::Fenced {
@@ -1098,17 +1218,15 @@ impl Inner {
         }
         {
             let m = self.mem.lock();
-            if m.dirty.is_empty() {
+            if m.dirty.is_empty() || m.dirty.bytes < min {
                 return Ok(m.flush_seq);
             }
         }
         let generation = self.journal.rotate().await?;
         let (snapshot, refs, tree, root) = {
             let mut m = self.mem.lock();
-            let snap: BTreeMap<u64, Bytes> = std::mem::take(&mut m.dirty)
-                .into_iter()
-                .map(|(i, d)| (i, d.bytes()))
-                .collect();
+            let snap: BTreeMap<u64, Bytes> =
+                m.dirty.take().into_iter().map(|(i, d)| (i, d.bytes())).collect();
             let snap = Arc::new(snap);
             m.flushing = Some(Arc::clone(&snap));
             (
@@ -1139,15 +1257,17 @@ impl Inner {
                     .into_iter()
                     .map(|(idx, e)| (idx, (!e.is_empty()).then(|| (e.hash, snapshot[&idx].clone()))))
                     .collect();
-                self.queue_flush(log::Flushed { seq, size, chunks });
-                self.kick.notify_one();
+                self.queue_flush(log::Flushed { seq, size, chunks }, min == 0);
+                if min == 0 {
+                    self.kick.notify_one();
+                }
                 Ok(seq)
             }
             Err(e) => {
                 let mut m = self.mem.lock();
                 m.flushing = None;
                 for (idx, b) in snapshot.iter() {
-                    if !m.dirty.contains_key(idx) {
+                    if !m.dirty.contains_key(*idx) {
                         m.dirty.insert(*idx, Dirty::of(b));
                         if let Some(r) = refs.get(idx) {
                             m.dirty_ref.insert(*idx, r.clone());
@@ -1561,10 +1681,10 @@ mod tests {
         v.zero(1000, 3 * CHUNK - 1000).await.unwrap();
         {
             let m = v.inner.mem.lock();
-            assert!(matches!(m.dirty.get(&0), Some(Dirty::Bytes(_))));
-            assert!(matches!(m.dirty.get(&1), Some(Dirty::Zero)));
-            assert!(matches!(m.dirty.get(&2), Some(Dirty::Zero)));
-            assert!(!m.dirty.contains_key(&3));
+            assert!(matches!(m.dirty.get(0), Some(Dirty::Bytes(_))));
+            assert!(matches!(m.dirty.get(1), Some(Dirty::Zero)));
+            assert!(matches!(m.dirty.get(2), Some(Dirty::Zero)));
+            assert!(!m.dirty.contains_key(3));
         }
         v.write_at(&data(7, 10), CHUNK + 50).await.unwrap();
         let mut want = w.clone();
@@ -1589,6 +1709,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read(&other, 0, want.len()).await, want);
+        other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writes_without_a_flush_keep_the_dirty_set_bounded_and_read_back() {
+        let (ports, _, fs) = sim::ports(8);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let step = 1 << 20;
+        let w = data(5, 3 * DIRTY_MAX / 2);
+        for (i, part) in w.chunks(step).enumerate() {
+            v.write_at(part, u64_from(i * step)).await.unwrap();
+            let bytes = v.inner.mem.lock().dirty.bytes;
+            assert!(bytes <= DIRTY_MAX + step, "{bytes} dirty bytes after write {i}");
+        }
+        assert!(v.inner.mem.lock().flush_seq > 0, "a commit bounded the dirty set");
+        assert_eq!(read(&v, 0, w.len()).await, w);
+        v.flush().await.unwrap();
+        v.close().await;
+        drop(v);
+
+        crash(&fs);
+        let again = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        assert_eq!(read(&again, 0, w.len()).await, w, "the flush kept every write");
+        again.checkpoint().await.unwrap();
+        again.close().await;
+
+        let other = Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "main")
+            .await
+            .unwrap();
+        assert_eq!(read(&other, 0, w.len()).await, w, "the upload has every write");
         other.close().await;
     }
 

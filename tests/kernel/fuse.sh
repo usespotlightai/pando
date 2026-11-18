@@ -2,10 +2,10 @@
 # The FUSE frontend (`attach --fuse`): a branch served as disk.img in a FUSE mount, with a loop
 # device over it, the path for kernels without ublk. fio checks every block it wrote through
 # the loop device, ext4 on it survives a detach and an attach on an empty cache, discard
-# reaches the branch, a mounted loop device refuses a detach, the branch grows while it serves,
-# and ext4 writes complete while the daemon and the writer share a small memory cgroup. Then
-# fio measures the loop device against a ublk device of the same branch on this kernel; the
-# numbers are reported, not checked. ublk id 68.
+# reaches the branch, a mounted loop device refuses a detach, and the branch grows while it
+# serves; memory.sh checks the daemon's memory. Then fio measures the loop device against a
+# ublk device of the same branch on this kernel; the numbers are reported, not checked. ublk
+# id 68.
 TEST=fuse
 # shellcheck source=SCRIPTDIR/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -25,7 +25,6 @@ stopall() {
 		wait "$pid" 2>/dev/null
 	}
 	pid=
-	[[ -d /sys/fs/cgroup/pando-$TEST ]] && rmdir "/sys/fs/cgroup/pando-$TEST" 2>/dev/null
 }
 trap 'stopall; rm -rf "$W"' EXIT
 rm -rf "$W"
@@ -144,46 +143,6 @@ check "ext4 grows on it" "$grown"
 umount "$W/mnt"
 if down b; then detached=ok; else detached=$(tail -1 "$W/detach.log" || true); fi
 check "detach publishes the grown branch" "$detached"
-
-# memory_cgroup <dir>: makes a cgroup with a memory limit under the container's own, whose
-# processes first move to a leaf of their own, as cgroup v2 asks before it hands out a controller.
-memory_cgroup() {
-	local root=/sys/fs/cgroup p procs
-	mkdir -p "$root/rest" "$1" 2>/dev/null || return 1
-	for _ in 1 2 3; do
-		mapfile -t procs <"$root/cgroup.procs"
-		for p in "${procs[@]}"; do
-			echo "$p" >"$root/rest/cgroup.procs" 2>/dev/null
-		done
-	done
-	echo +memory >"$root/cgroup.subtree_control" 2>/dev/null || return 1
-	echo $((1 << 30)) >"$1/memory.max" 2>/dev/null
-}
-cg=/sys/fs/cgroup/pando-$TEST
-if memory_cgroup "$cg"; then
-	pando "$W/cache-m" init m "$SIZE"
-	echo $$ >"$cg/cgroup.procs"
-	up m cache-m m --dirty-limit $((64 << 20)) || say "attach in the cgroup FAILED: $(tail -3 "$W/m.log" || true)"
-	mkfs.ext4 -q -F "$dev"
-	mount -o noatime "$dev" "$W/mnt"
-	if timeout 300 dd if=/dev/urandom of="$W/mnt/big" bs=1M count=1536 conv=fsync status=none; then
-		pressure=ok
-	elif grep -q "^oom_kill [1-9]" "$cg/memory.events"; then
-		pressure="the daemon was OOM-killed: its anonymous memory grows with the data written"
-	else
-		pressure="the writes did not complete in 300 s"
-	fi
-	check "1.5 GiB of ext4 writes complete with the daemon in a 1 GiB cgroup" "$pressure"
-	events=$(cat "$cg/memory.events" || true)
-	say "cgroup memory events: ${events//$'\n'/ }"
-	umount "$W/mnt"
-	if ! down m; then
-		say "detach in the cgroup FAILED: $(tail -1 "$W/detach.log" || true)"
-	fi
-	echo $$ >/sys/fs/cgroup/rest/cgroup.procs
-else
-	say "memory pressure: skipped, no writable cgroup v2"
-fi
 
 # perf <dev> <label>: fio's raw device rows, as bench/run.sh fio runs them, 10 s each, reads
 # first so both devices read the same data.

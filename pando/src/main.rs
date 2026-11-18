@@ -398,6 +398,7 @@ enum Exit {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let flushers = matches!(cli.command, Command::Attach(_) | Command::Serve);
+    pando_host::tune_malloc();
     if flushers && let Err(e) = pando_host::io_flusher() {
         eprintln!(
             "warning: the threads that serve the device are not I/O flushers ({e}); with much \

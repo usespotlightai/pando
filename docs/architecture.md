@@ -50,6 +50,12 @@ recorded. Two background tasks then take it to the store:
 - The **uploader** packs pending chunks and tree nodes into segments and moves the ref. The ref's
   `log` line says which records its root covers; the shipper then deletes them.
 
+Writes wait in memory until a commit, so a commit also starts without a flush once 16 MiB of
+written chunks wait, and past 32 MiB a write that needs a new chunk buffer commits first. Such a
+commit is local only: it leaves the log to the uploader, as a flush does when 32 MiB of flushes
+already wait for the shipper. A daemon's memory for writes therefore stays bounded however much
+is written between flushes.
+
 An open that does not resume this host's own state reads the records the ref does not cover, from
 the ref's log position through the last writer's log, and applies them as writes. It seals each
 log it read by creating a seal record at its first free number, so a writer that is still running

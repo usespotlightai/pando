@@ -43,7 +43,7 @@ const GATHER: Duration = Duration::from_millis(50);
 /// The chunk bytes one record holds at most; a larger flush is left to the uploader.
 const RECORD_MAX: usize = LOG_DATA_CHUNKS_MAX * CHUNK_SIZE;
 /// The chunk bytes that may wait for the log; past it, waiting flushes are left to the uploader.
-const PENDING_MAX: usize = 256 << 20;
+const PENDING_MAX: usize = 32 << 20;
 /// Records an open reads at most.
 const REPLAY_MAX: u64 = 100_000;
 /// How often an open tries each read and seal of the log when the store fails transiently.
@@ -250,14 +250,15 @@ async fn retried<T, F: Future<Output = Result<T>>>(mut f: impl FnMut() -> F) -> 
 }
 
 impl Inner {
-    /// Hands a committed flush to the shipper.
-    pub(super) fn queue_flush(&self, f: Flushed) {
+    /// Hands a committed flush to the shipper; without `logged`, it and the flushes waiting
+    /// before it are left to the uploader.
+    pub(super) fn queue_flush(&self, f: Flushed, logged: bool) {
         if self.log.mode == LogMode::Off {
             return;
         }
         let n = chunk_bytes(&f);
         let mut q = self.log.queue.lock();
-        if n > RECORD_MAX || f.chunks.len() > LOG_CHUNKS_MAX || q.bytes + n > PENDING_MAX {
+        if !logged || n > RECORD_MAX || f.chunks.len() > LOG_CHUNKS_MAX || q.bytes + n > PENDING_MAX {
             q.pending.clear();
             q.bytes = 0;
             q.dropped = f.seq;
@@ -624,6 +625,31 @@ mod tests {
 
         let b = open(&ports, "/b", LogMode::Strict).await;
         assert_eq!(read(&b, data(2).len()).await, data(2));
+        b.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_strict_flush_after_commits_that_bound_memory_returns_once_uploaded() {
+        let (ports, store, _) = sim::ports(9);
+        Volume::create(&ports, "main", 4 * SIZE).await.unwrap();
+        let a = open(&ports, "/a", LogMode::Strict).await;
+        let w: Vec<u8> = (0..3 * super::super::DIRTY_MAX / 2)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        for (i, part) in w.chunks(1 << 20).enumerate() {
+            a.write_at(part, u64_from(i << 20)).await.unwrap();
+        }
+        a.write_at(&data(4), 1000).await.unwrap();
+        a.flush().await.unwrap();
+        assert_eq!(a.published(), a.root(), "an upload, not the log, has the flush");
+        assert_eq!(log_keys(&store), Vec::<String>::new());
+        a.close().await;
+
+        let b = open(&ports, "/b", LogMode::Strict).await;
+        assert_eq!(read(&b, data(4).len()).await, data(4));
+        let mut got = vec![0; w.len() - 2 * CHUNK_SIZE];
+        b.read_at(&mut got, u64_from(2 * CHUNK_SIZE)).await.unwrap();
+        assert!(got == w[2 * CHUNK_SIZE..], "the writes before the flush");
         b.close().await;
     }
 
