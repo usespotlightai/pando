@@ -20,7 +20,7 @@
   <path d="M212,68.0 h37.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-37.0 z" fill="#818b98"><title>JuiceFS: 2.76 ms (range 2.5 ms to 3.52 ms)</title></path>
   <text x="259.0" y="79.0" font-size="12" fill="#59636e">2.76 ms</text>
   <text x="202" y="105.0" font-size="12" fill="#1f2328" text-anchor="end">Amazon S3 Files</text>
-  <path d="M212,94.0 h72.3 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-72.3 z" fill="#818b98"><title>Amazon S3 Files: 6.65 ms (range 6.65 ms to 6.65 ms)</title></path>
+  <path d="M212,94.0 h72.3 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-72.3 z" fill="#818b98"><title>Amazon S3 Files: 6.65 ms (range 5.66 ms to 7.31 ms)</title></path>
   <text x="294.3" y="105.0" font-size="12" fill="#59636e">6.65 ms</text>
   <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end">tar from S3</text>
   <path d="M212,120.0 h321.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-321.2 z" fill="#818b98"><title>tar from S3: 3.2 s (range 3.17 s to 3.2 s)</title></path>
@@ -64,6 +64,6 @@
   <path d="M212,434.0 h231.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-231.1 z" fill="#818b98"><title>EBS snapshot to volume: 1.05 GiB (range 1.05 GiB to 1.05 GiB)</title></path>
   <text x="453.1" y="445.0" font-size="12" fill="#59636e">1.05 GiB</text>
   <text x="202" y="471.0" font-size="12" fill="#1f2328" text-anchor="end">Amazon S3 Files</text>
-  <path d="M212,460.0 h257.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-257.9 z" fill="#818b98"><title>Amazon S3 Files: 1.56 GiB (range 1.56 GiB to 1.56 GiB)</title></path>
+  <path d="M212,460.0 h257.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-257.9 z" fill="#818b98"><title>Amazon S3 Files: 1.56 GiB (range 1.42 GiB to 1.65 GiB)</title></path>
   <text x="479.9" y="471.0" font-size="12" fill="#59636e">1.56 GiB</text>
 </svg>

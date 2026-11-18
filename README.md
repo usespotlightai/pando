@@ -100,9 +100,8 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** SOCI, Nydus, ZeroFS and Amazon S3 Files have fork, cold, warm and crash
-> results. Their save (one S3 Files run of three so far), raw I/O and agent workload rows fill in
-> as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> **Partly measured.** SOCI, Nydus, ZeroFS and Amazon S3 Files have every result except the
+> agent workload, which fills in as its runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
 > [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw the charts from
 > `bench/results/`.
 
@@ -299,7 +298,7 @@ last write. Three runs each.
 | EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
 | JuiceFS | 2.76 ms | 2.5 ms to 3.52 ms |
 | ZeroFS (NBD) | 12.4 s | 10.6 s to 14.1 s |
-| Amazon S3 Files | 6.65 ms | 6.65 ms to 6.65 ms |
+| Amazon S3 Files | 6.65 ms | 5.66 ms to 7.31 ms |
 
 | uploaded after npm ci | median | range |
 |---|---|---|
@@ -309,7 +308,7 @@ last write. Three runs each.
 | EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |
 | JuiceFS | 732 MiB | 665 MiB to 785 MiB |
 | ZeroFS (NBD) | 318 MiB | 301 MiB to 320 MiB |
-| Amazon S3 Files | 1.56 GiB | 1.56 GiB to 1.56 GiB |
+| Amazon S3 Files | 1.56 GiB | 1.42 GiB to 1.65 GiB |
 
 </details>
 <!-- /bench:save -->
@@ -321,7 +320,9 @@ Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs 
 and written through the host's page cache: direct I/O skips the page cache of the device, not of
 the daemon, so these rows mostly measure memory. After handoff, reads go through device-mapper
 and a loop device to the image on the NVMe; writes are slow there, about 21 MB/s sequential,
-for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s.
+for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On ZeroFS
+every request goes over NBD to its server and on S3 Files over NFS to the file system, so a
+single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 
 <!-- bench:fio -->
 <picture>
@@ -339,8 +340,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 6.72k | 5.99k to 7.24k |
 | EBS gp3 | 1.54k | 1.54k to 1.6k |
 | JuiceFS | 6.37k | 5.98k to 6.58k |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 5.99k | 4.55k to 6.77k |
+| Amazon S3 Files | 243 | 228 to 245 |
 
 | 4 KiB random read, 4 x QD32 | median | range |
 |---|---|---|
@@ -349,8 +350,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 237k | 233k to 265k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 76.7k | 76.4k to 77.3k |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 31.7k | 28.4k to 32.7k |
+| Amazon S3 Files | 24.7k | 16.7k to 25.1k |
 
 | 4 KiB random write, 4 x QD32 | median | range |
 |---|---|---|
@@ -359,8 +360,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 2.47k | 2.14k to 5.09k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 484 | 456 to 493 |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 1.32k | 1.23k to 1.54k |
+| Amazon S3 Files | 4.83k | 4.49k to 4.87k |
 
 | 1 MiB sequential read | median | range |
 |---|---|---|
@@ -369,8 +370,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 1,849 MB/s | 1,826 MB/s to 1,856 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,611 MB/s | 1,576 MB/s to 1,660 MB/s |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 545 MB/s | 529 MB/s to 594 MB/s |
+| Amazon S3 Files | 484 MB/s | 482 MB/s to 488 MB/s |
 
 | 1 MiB sequential write | median | range |
 |---|---|---|
@@ -379,8 +380,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 21 MB/s | 16 MB/s to 24 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,328 MB/s | 1,317 MB/s to 1,330 MB/s |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 190 MB/s | 180 MB/s to 226 MB/s |
+| Amazon S3 Files | 186 MB/s | 184 MB/s to 188 MB/s |
 
 </details>
 <!-- /bench:fio -->
