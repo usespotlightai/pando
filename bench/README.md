@@ -50,7 +50,7 @@ in the following order on a fresh branch:
 | `replay` | slowdown while the agent works | the 14 commands, total and per command, as a ratio to native ext4 on local NVMe |
 | `save` | time to durable | from the last write to the branch being readable on another host; also bytes uploaded after `npm ci` |
 | `fio` | raw I/O | 4 KiB random read QD1 and 4 x QD32, 4 KiB random write 4 x QD32, 1 MiB sequential read and write |
-| `crash` | crash survival | `kill -9` of the storage daemon mid-write: failed writes, fsck, file correctness on a fresh host |
+| `crash` | crash survival | `kill -9` of the storage daemon, and for Pando a host reboot without a sync, mid-write: failed writes, fsck, file correctness on a fresh host |
 
 Run a measure with `bench/run.sh <measure>` on the host, or pick it in the workflow's `measure`
 input (`all` runs every implemented one). For `fork`, each system loads the workspace once, then
@@ -150,8 +150,15 @@ which drops the labels a remote snapshotter needs, so the image would be pulled 
   first: the file system is checked (`e2fsck -fn` for Pando and ZeroFS, `juicefs fsck` for
   JuiceFS; S3 Files has no checker, so it is a new mount after the page cache is dropped) and
   every acknowledged file is read back. The stall is the longest gap between acknowledged writes.
+  Pando also has a reboot case, `crash-reboot`: the same writer, with its log fsynced
+  after each acknowledged write, and five seconds in the host reboots through
+  `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would. Once the host
+  is back, `pando attach --recover=auto` serves the branch from the state the host kept, the
+  file system is mounted (ext4 replays its journal), unmounted and checked with `e2fsck -fn`,
+  every acknowledged file is read back, and the branch is closed and checked again on a fresh
+  host. The bench workflow runs it after `crash`.
 
-Repeat every run 5 times (3 for `replay`, `save`, `fio` and `crash`), dropping caches between
+Repeat every run 5 times (3 for `replay`), dropping caches between
 repetitions, and report the median and range.
 Write raw results to `bench/results/<measure>.csv` with the columns
 `system,workspace,measure,rep,value,unit,notes`. A plot script converts those results to
@@ -249,9 +256,10 @@ Things to know:
   host stops billing compute but keeps its EBS volumes, and its `/data` is empty after the next
   start, so copy results to the bucket as they are produced. `terraform destroy` removes
   everything, including the bucket's contents.
-- **Pando's credentials.** Pando reads `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` and cannot
-  use the instance role yet. Until it can, pass keys through `PANDO_ENV_FILE`; Terraform does not
-  create long-lived keys, so none end up in its state or in the instance user data.
+- **Pando's credentials.** Pando reads `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`, or, with
+  `S3_CREDENTIALS=instance`, the instance role from the metadata service. The bench passes keys
+  through `PANDO_ENV_FILE`; Terraform does not create long-lived keys, so none end up in its
+  state or in the instance user data.
 - **Fast Snapshot Restore** is billed per snapshot and availability zone for every hour it is
   on. The harness should turn it on only for its own rows and off again afterwards.
 

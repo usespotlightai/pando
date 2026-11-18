@@ -379,5 +379,5 @@ def main_args(add_parser: Callable[..., argparse.ArgumentParser]) -> dict[str, o
     """Add the save subcommand with add_parser; return its systems by key."""
     p = add_parser("save", help="time and bytes to make a branch durable after npm ci")
     p.add_argument("--systems", default=",".join(SYSTEMS), help=f"comma-separated, from {', '.join(SYSTEMS)}")
-    p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--reps", type=int, default=5)
     return SYSTEMS

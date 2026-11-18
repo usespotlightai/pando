@@ -17,8 +17,8 @@ async fn s3_adapter_conforms_over_an_in_memory_backend() {
     store_conformance::check(&S3Store::over(Arc::new(InMemory::new()), "prefix/a")).await;
 }
 
-/// Runs against a real store named by `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID` and
-/// `S3_SECRET_ACCESS_KEY`, under a fresh prefix it removes afterwards.
+/// Runs against a real store named by `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`,
+/// `S3_SECRET_ACCESS_KEY` and, for a temporary key, `S3_SESSION_TOKEN`, under a fresh prefix it removes afterwards.
 #[tokio::test]
 #[ignore = "needs S3_* variables for a real store"]
 async fn s3_store_conforms() {
@@ -32,8 +32,11 @@ async fn s3_store_conforms() {
         prefix: format!("pando-rs-conformance/{nanos}"),
         endpoint: std::env::var("S3_ENDPOINT").ok().filter(|e| !e.is_empty()),
         region: std::env::var("S3_REGION").unwrap_or_else(|_| "auto".into()),
-        access_key_id: var("S3_ACCESS_KEY_ID"),
-        secret_access_key: var("S3_SECRET_ACCESS_KEY"),
+        credentials: pando_s3::Credentials::Keys {
+            access_key_id: var("S3_ACCESS_KEY_ID"),
+            secret_access_key: var("S3_SECRET_ACCESS_KEY"),
+            session_token: std::env::var("S3_SESSION_TOKEN").ok().filter(|t| !t.is_empty()),
+        },
         allow_http: false,
     };
     let store = S3Store::new(&config).unwrap();

@@ -18,12 +18,26 @@ Rows: crash.recovered (1 when a write was acknowledged within 120 s of the kill)
 (count), crash.stall (s: the longest gap between acknowledged writes, when recovered), crash.fsck
 (the checker's exit code), crash.acked and crash.correct (files). A system that does not recover
 within 120 s has its branch's pending I/O failed, where it can, and is checked all the same.
+
+The reboot case (`crash-reboot`, Pando only) runs in two processes with a reboot between them.
+`start` opens a fresh branch, starts the writer with its log fsynced after each acknowledged
+write, and five seconds in reboots the host through /proc/sysrq-trigger, which neither syncs
+nor unmounts, as a power loss would. After the boot, `check` attaches the branch with
+`--recover=auto` from the state the host kept, mounts it so ext4 replays its journal, unmounts
+it, runs e2fsck -fn, reads every acknowledged file back, closes the branch and checks it again as
+a fresh host. `clean` unmounts and detaches what a failed check left, then removes what the runs
+left on the host and in the bucket.
+
+Rows: crash.reboot.attach (s: from the start of the attach to the device serving),
+crash.reboot.fsck and crash.reboot.fresh_fsck (exit codes), crash.reboot.acked,
+crash.reboot.correct and crash.reboot.fresh_correct (files).
 """
 
 import argparse
 import contextlib
 import hashlib
 import itertools
+import json
 import os
 import shutil
 import signal
@@ -37,18 +51,21 @@ from typing import override
 
 import start
 import workspace
-from common import Results, log, run
+from common import Results, log, read_json, run
 
 FILE_BYTES = 256 << 10
 BEFORE_KILL = 5
 AFTER_RECOVERY = 5
 RECOVERY_TIMEOUT = 120
 LOG_FIELDS = 3
+REBOOT_STATE = start.DIR / "crash-reboot.json"
+BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 
 WRITER = string.Template(
     r"""
 import errno, hashlib, os, sys, time
 d, log, stop = sys.argv[1], sys.argv[2], sys.argv[3]
+durable = len(sys.argv) > 4
 os.makedirs(d, exist_ok=True)
 with open(log, "w", buffering=1) as out:
     n = 0
@@ -67,6 +84,8 @@ with open(log, "w", buffering=1) as out:
             finally:
                 os.close(dfd)
             out.write(f"{n} ok {time.monotonic():.6f}\n")
+            if durable:
+                os.fsync(out.fileno())
         except OSError as e:
             out.write(f"{n} err {time.monotonic():.6f} {errno.errorcode.get(e.errno, e.errno)}\n")
             time.sleep(0.05)
@@ -325,11 +344,7 @@ def crash_once(s: start.Workspace, crasher: Crasher, i: int, rep: int, out: Resu
     stall = max(b - a for a, b in itertools.pairwise(times)) if recovered else None
     crasher.close(i)
     code, root = crasher.fresh_check(i)
-    correct = 0
-    for n, _ in ok:
-        with contextlib.suppress(OSError):
-            if (root / "crash" / f"f{n:06d}").read_bytes() == content(n):
-                correct += 1
+    correct = correct_files(root, ok)
     crasher.fresh_close(i)
     note = f"rep {rep}"
     out.add(s.name, "crash.recovered", rep, int(recovered), "count", note)
@@ -387,9 +402,136 @@ def measure(names: list[str], reps: int) -> None:
         raise SystemExit(msg)
 
 
+def correct_files(root: Path, ok: list[tuple[int, float]]) -> int:
+    """Return how many of the acknowledged files under root/crash hold what the writer wrote."""
+    correct = 0
+    for n, _ in ok:
+        with contextlib.suppress(OSError):
+            if (root / "crash" / f"f{n:06d}").read_bytes() == content(n):
+                correct += 1
+    return correct
+
+
+def reboot_log(rep: int) -> Path:
+    """Return the path of the writer's log for reboot rep."""
+    return start.DIR / f"crash-reboot-writer-{rep}.log"
+
+
+def reboot_start(rep: int) -> None:
+    """Open branch b<rep> under writes and reboot the host without a sync; return only on failure.
+
+    The first rep sets Pando up; later reps keep what the first imported.
+
+    Raises SystemExit when the writer has no acknowledged write by the reboot.
+    """
+    s = start.Pando()
+    if rep == 1:
+        workspace.prepare()
+        s.setup()
+    else:
+        s.connect()
+    s.open(rep)
+    wlog = reboot_log(rep)
+    stop = start.DIR / f"crash-reboot-stop-{rep}"
+    stop.unlink(missing_ok=True)
+    REBOOT_STATE.write_text(json.dumps({"rep": rep, "boot": BOOT_ID.read_text().strip()}))
+    os.sync()
+    args = [sys.executable, "-c", WRITER, str(s.root(rep) / "crash"), str(wlog), str(stop), "durable"]
+    w = subprocess.Popen(args)
+    time.sleep(BEFORE_KILL)
+    ok, err = read_log(wlog)
+    if not ok:
+        stop.touch()
+        w.wait(timeout=60)
+        msg = f"no acknowledged write in {BEFORE_KILL} s ({len(err)} failed)"
+        raise SystemExit(msg)
+    log(f"{s.name}: crash reboot rep {rep}: {len(ok)} acknowledged writes, rebooting")
+    time.sleep(1)
+    Path("/proc/sysrq-trigger").write_text("b")
+    time.sleep(60)
+    msg = "the host did not reboot"
+    raise SystemExit(msg)
+
+
+def reboot_check(rep: int) -> None:
+    """Recover branch b<rep> after the reboot, check it here and as a fresh host; write the rows.
+
+    Raises SystemExit when the state names another rep or the host has not rebooted since.
+    """
+    state = read_json(REBOOT_STATE, {})
+    if not isinstance(state, dict) or state.get("rep") != rep:
+        msg = f"no crash-reboot start of rep {rep} on this host"
+        raise SystemExit(msg)
+    if state.get("boot") == BOOT_ID.read_text().strip():
+        msg = "the host has not rebooted since the start"
+        raise SystemExit(msg)
+    s = start.Pando()
+    s.connect()
+    crasher = PandoCrasher(s)
+    dev, root = s.device_path(rep), s.root(rep)
+    t0 = time.perf_counter()
+    s.attach(rep, f"b{rep}", "--recover=auto")
+    attach = time.perf_counter() - t0
+    root.mkdir(exist_ok=True)
+    run("mount", dev, root)
+    start.unmount(root)
+    code = run("e2fsck", "-fn", dev, check=False)
+    run("mount", dev, root)
+    ok, _ = read_log(reboot_log(rep))
+    correct = correct_files(root, ok)
+    crasher.close(rep)
+    fresh_code, fresh_root = crasher.fresh_check(rep)
+    fresh_correct = correct_files(fresh_root, ok)
+    crasher.fresh_close(rep)
+    out = Results("crash")
+    note = f"rep {rep}"
+    out.add(s.name, "crash.reboot.attach", rep, attach, "s", note)
+    out.add(s.name, "crash.reboot.fsck", rep, code, "code", note)
+    out.add(s.name, "crash.reboot.fresh_fsck", rep, fresh_code, "code", note)
+    out.add(s.name, "crash.reboot.acked", rep, len(ok), "count", note)
+    out.add(s.name, "crash.reboot.correct", rep, correct, "count", note)
+    out.add(s.name, "crash.reboot.fresh_correct", rep, fresh_correct, "count", note)
+    log(
+        f"{s.name}: crash reboot rep {rep}: attach {attach:.2f} s, "
+        f"fsck exit {code}, fresh fsck exit {fresh_code}, {correct} and {fresh_correct} of {len(ok)} "
+        "acknowledged files correct"
+    )
+    reboot_log(rep).unlink(missing_ok=True)
+
+
+def reboot_clean() -> None:
+    """Close the branches a failed check left; remove what the runs left on this host and in the bucket."""
+    s = start.Pando()
+    s.connect()
+    for d in (s.dir / "fresh", s.dir):
+        held = start.Pando()
+        held.dir = d
+        held.connect()
+        for root in d.glob("m[0-9]*"):
+            if root.name[1:].isdigit():
+                held.close(int(root.name[1:]))
+    s.teardown()
+    REBOOT_STATE.unlink(missing_ok=True)
+    for f in start.DIR.glob("crash-reboot-*"):
+        f.unlink(missing_ok=True)
+
+
+def reboot(phase: str, rep: int) -> None:
+    """Run one phase of the reboot case: start, check or clean."""
+    if phase == "start":
+        reboot_start(rep)
+    elif phase == "check":
+        reboot_check(rep)
+    else:
+        reboot_clean()
+
+
 def main_args(add_parser: Callable[..., argparse.ArgumentParser]) -> dict[str, object]:
-    """Add the crash subcommand with add_parser; return its systems by key."""
+    """Add the crash and crash-reboot subcommands with add_parser; return crash's systems by key."""
     p = add_parser("crash", help="kill -9 of the storage daemon during writes")
     p.add_argument("--systems", default=",".join(SYSTEMS), help=f"comma-separated, from {', '.join(SYSTEMS)}")
-    p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--reps", type=int, default=5)
+    r = add_parser("crash-reboot", help="a host reboot without a sync during writes (Pando)")
+    r.add_argument("phase", choices=["start", "check", "clean"])
+    r.add_argument("--rep", type=int, default=1, help="repetition number, also the branch's number")
     return SYSTEMS

@@ -1,5 +1,5 @@
-//! Pando on Linux: the ublk frontend and the `DeviceSwitch` port over device-mapper and loop
-//! devices. Empty on other systems.
+//! Pando on Linux: the ublk frontend, the FUSE frontend with a loop device over it, and the
+//! `DeviceSwitch` port over device-mapper and loop devices. Empty on other systems.
 //!
 //! Each ublk queue thread waits in `io_uring_enter`. A lone read the queue can serve from
 //! memory or the page cache without waiting is served there; every other request goes to the
@@ -9,16 +9,18 @@
 #![cfg(target_os = "linux")]
 #![expect(
     unsafe_code,
-    reason = "the ublk frontend and the device switch talk to the kernel through ioctls, io_uring and shared mappings"
+    reason = "the frontends and the device switch talk to the kernel through ioctls, io_uring, /dev/fuse and shared mappings"
 )]
 
 mod bdi;
 mod dm;
+mod fuse;
 mod sys;
 mod ublk;
 mod users;
 
 pub use dm::DmSwitch;
+pub use fuse::{FILE_NAME as FUSE_FILE, FuseFrontend, FuseOptions};
 pub use ublk::{Daemon, Frontend, FrontendOptions, daemon, daemon_dead, delete, device_id, resize, stop};
 
 /// What a stop of block device `dev` would cut off: each mount of it, each device stacked on
