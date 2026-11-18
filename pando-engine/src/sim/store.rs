@@ -62,6 +62,7 @@ struct State {
 pub struct SimStore {
     state: Mutex<State>,
     clock: Arc<dyn Clock>,
+    answering: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +75,7 @@ impl SimStore {
         SimStore {
             state: Mutex::default(),
             clock,
+            answering: tokio::sync::watch::Sender::new(true),
         }
     }
 
@@ -114,7 +116,15 @@ impl SimStore {
         self.state.lock().latency = latency;
     }
 
+    /// Stops or resumes answering. While stopped, every call waits without failing, as a store
+    /// that is down or cut off does; calls in flight finish once it answers again.
+    pub fn set_answering(&self, on: bool) {
+        self.answering.send_replace(on);
+    }
+
     async fn round_trip(&self) {
+        let mut answering = self.answering.subscribe();
+        let _ = answering.wait_for(|on| *on).await;
         let latency = self.state.lock().latency;
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;

@@ -86,6 +86,19 @@ A power loss or kernel panic skips the drain. Writes the host made durable survi
 covers every write acknowledged before a flush (FLUSH or FUA), as on a disk with a volatile
 write cache. Writes after the last flush may be lost.
 
+**Store outage.** While the store does not answer, the device serves what the host holds: reads
+of chunks it has fetched, most writes, and flushes, which are durable on the host. A read or
+write that needs the store fails with EIO after `--store-wait` (30 s) instead of hanging, so no
+process waits in D state. A write needs it when it covers part of a chunk the host has not
+fetched, or lands in a region of the branch's index the host has not read. The fetch goes on,
+and a retry once the store answers finds it done. With `--log strict`, a flush the log does not
+take within the wait fails the same way. Uploads retry with a backoff that grows to 30 s between
+tries. Once they fall 60 s behind the flushes, the daemon logs it and sets its systemd status to
+`degraded`; it logs again when they catch up. Until then the writes are on this host only, as
+in [a host that never comes back](#a-host-that-never-comes-back). A `detach` during an outage
+fails after `--publish-wait`, with the device stopped and the daemon still publishing; run
+`detach` again to wait for it.
+
 ## A host that never comes back
 
 The store holds the branch as of its last upload. Before a handoff the daemon uploads within

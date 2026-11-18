@@ -1,1 +1,2 @@
 ext4/054 the device has 4 KiB logical blocks, so ext4 with 1 KiB blocks cannot be made on it
+generic/223 the device is not rotational, so ext4 sets mb_max_linear_groups to 0 and its optimized group scan places the first small fallocated file off the stripe unit; loop fails the same way when its backing disk is not rotational, and both pass when marked rotational
