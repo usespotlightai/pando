@@ -100,10 +100,10 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** SOCI, Nydus, ZeroFS and Amazon S3 Files have every result except the
-> agent workload, which fills in as its runs finish on the bench VM (AWS `m8id.4xlarge`,
-> eu-north-1; see [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw the
-> charts from `bench/results/`.
+> **Partly measured.** Every system has every result, except that Amazon S3 Files has two of its
+> three agent workload runs so far. Pando's rows are from an earlier run than the others, on the
+> same bench VM (AWS `m8id.4xlarge`, eu-north-1; see [bench/README.md](bench/README.md)). Run
+> `python3 bench/plot.py` to redraw the charts from `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
 1.4 GB and 129k files. All systems use the same VM and bucket. Results show medians of 5 runs,
@@ -239,7 +239,10 @@ Time to run the 14 command types agents use most often in Spotlight sandboxes (`
 `tsc`, `oxlint`, `vitest`, `npm ci`, ...), expressed as a ratio to native ext4 on local NVMe.
 Each system ran the replay 3 times on a fresh branch of a warm host, page cache dropped. Native
 took 70.5 s. Most of JuiceFS's time is `npm ci`, about 9.5 min against 7.6 s; in its first
-repetition one `vitest` run failed, and it passed in the other two.
+repetition one `vitest` run failed, and it passed in the other two. SOCI, Nydus, ZeroFS and S3
+Files ran in a later run, against a native run of their own (70.3 s). On S3 Files, where every
+file operation is an NFS round trip, `npm ci` takes about 9.6 min, the first `git status` 43 s
+and the control-plane `tsc` and `vitest` about 75 s each.
 
 <!-- bench:replay -->
 <picture>
@@ -257,12 +260,12 @@ repetition one `vitest` run failed, and it passed in the other two.
 | Pando (handoff) | 1.05x | 1.04x to 1.06x |
 | image download from S3 | 1.03x | 1.03x to 1.04x |
 | Docker (overlayfs) | 1.02x | 1.02x to 1.03x |
-| SOCI lazy pull | — | |
-| Nydus lazy pull | — | |
+| SOCI lazy pull | 1.21x | 1.20x to 1.34x |
+| Nydus lazy pull | 1.10x | 1.08x to 1.12x |
 | EBS snapshot to volume | 1.17x | 1.16x to 1.23x |
 | JuiceFS | 9.96x | 9.90x to 12.07x |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 1.16x | 1.12x to 1.17x |
+| Amazon S3 Files | 11.79x | 11.75x to 11.82x |
 
 </details>
 <!-- /bench:replay -->
