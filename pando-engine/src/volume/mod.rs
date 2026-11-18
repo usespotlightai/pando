@@ -48,6 +48,10 @@ const _: () = assert!(CHUNK_LEN as usize == CHUNK_SIZE);
 const UPLOAD_EVERY: Duration = Duration::from_secs(2);
 /// After a failed upload the uploader waits this long before the next try.
 const RETRY_AFTER: Duration = Duration::from_secs(1);
+/// Uploads in a row the store may refuse before the uploader stops. The wait before each next
+/// try doubles from [`RETRY_AFTER`], so a refusal that passes within about two minutes, such
+/// as a policy that is still propagating, does not stop it.
+const REFUSED_TRIES: u32 = 8;
 /// How often an open tries to take the writer generation when the store fails transiently.
 const GENERATION_TRIES: usize = 10;
 /// Chunks a flush hashes and stores at once.
@@ -648,6 +652,20 @@ impl Volume {
         }
     }
 
+    /// Waits until the uploader stops for good, and returns why: no later upload can publish
+    /// the branch.
+    pub async fn upload_stopped(&self) -> Arc<Error> {
+        let mut rx = self.inner.changed.subscribe();
+        loop {
+            if let Some(e) = &self.inner.up.lock().error {
+                return Arc::clone(e);
+            }
+            if rx.changed().await.is_err() {
+                return Arc::new(Error::Cancelled);
+            }
+        }
+    }
+
     /// What the last upload packed.
     pub fn last_upload(&self) -> Option<PackStats> {
         self.inner.up.lock().last
@@ -717,6 +735,10 @@ fn beyond(off: u64, len: u64, size: u64) -> bool {
 
 fn is_transient(e: &Error) -> bool {
     matches!(e.kind(), Error::Store(crate::ports::StoreError::Transient { .. }))
+}
+
+fn is_permanent(e: &Error) -> bool {
+    matches!(e.kind(), Error::Store(crate::ports::StoreError::Permanent { .. }))
 }
 
 fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
@@ -1214,20 +1236,37 @@ impl Inner {
                 _ = changed.changed() => {}
             }
         }
+        let mut refused = 0;
         loop {
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => return,
                 () = self.kick.notified() => {}
                 () = tokio::time::sleep(UPLOAD_EVERY) => {}
             }
-            if let Err(e) = self.upload().await {
-                if matches!(e.kind(), Error::Fenced { .. } | Error::ChunkLost { .. }) {
+            let e = match self.upload().await {
+                Ok(()) => {
+                    refused = 0;
+                    continue;
+                }
+                Err(e) => e,
+            };
+            if matches!(e.kind(), Error::Fenced { .. } | Error::ChunkLost { .. }) {
+                return;
+            }
+            let wait = if is_permanent(&e) {
+                refused += 1;
+                if refused >= REFUSED_TRIES {
+                    fail_with(&mut self.up.lock(), e);
+                    self.notify();
                     return;
                 }
-                tokio::select! {
-                    _ = stop.wait_for(|s| *s) => return,
-                    () = tokio::time::sleep(RETRY_AFTER) => {}
-                }
+                RETRY_AFTER * (1 << (refused - 1))
+            } else {
+                RETRY_AFTER
+            };
+            tokio::select! {
+                _ = stop.wait_for(|s| *s) => return,
+                () = tokio::time::sleep(wait) => {}
             }
         }
     }
@@ -1376,8 +1415,8 @@ async fn record_learned(dedup: Option<&Arc<Dedup>>, learner: Option<&Arc<Learner
 #[cfg(feature = "sim")]
 mod tests {
     use super::*;
-    use crate::ports::Open;
-    use crate::sim::{self, SimFs, SimStore};
+    use crate::ports::{Open, StoreError};
+    use crate::sim::{self, Fault, SimFs, SimStore, StoreOp};
 
     const SIZE: u64 = 64 << 20;
 
@@ -1715,9 +1754,10 @@ mod tests {
             .unwrap();
         v.write_at(&data(1, 100), 0).await.unwrap();
         v.checkpoint().await.unwrap();
-        store.inject(sim::Fault {
-            op: sim::StoreOp::Update,
+        store.inject(Fault {
+            op: StoreOp::Update,
             applied: false,
+            permanent: false,
         });
         v.grow(64 << 20).await.unwrap();
         v.write_at(&data(2, 100), 40 << 20).await.unwrap();
@@ -1766,6 +1806,57 @@ mod tests {
         assert!(v.grow(SIZE + 100).await.is_err());
         v.grow(SIZE).await.unwrap();
         assert_eq!(v.size(), SIZE);
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lasting_refusal_stops_the_uploader_and_fails_the_checkpoint() {
+        let (ports, store, _) = sim::ports(5);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        let published = v.published();
+        store.refuse(StoreOp::Create);
+        v.write_at(&data(2, 100), 0).await.unwrap();
+        let refused = |e: &Error| matches!(e.kind(), Error::Store(StoreError::Permanent { .. }));
+        let e = v.checkpoint().await.unwrap_err();
+        assert!(refused(&e), "{e}");
+        let stopped = v.upload_stopped().await;
+        assert!(refused(&stopped), "{stopped}");
+        store.accept();
+        tokio::time::sleep(UPLOAD_EVERY * 30).await;
+        assert_eq!(
+            v.published(),
+            published,
+            "no upload ran after the uploader stopped"
+        );
+        let again = v.checkpoint().await.unwrap_err();
+        assert!(refused(&again), "{again}");
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_passes_does_not_stop_the_uploader() {
+        let (ports, store, _) = sim::ports(6);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        for _ in 1..REFUSED_TRIES {
+            store.inject(Fault {
+                op: StoreOp::Update,
+                applied: false,
+                permanent: true,
+            });
+        }
+        v.write_at(&data(2, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        assert_eq!(v.published(), v.root());
         v.close().await;
     }
 

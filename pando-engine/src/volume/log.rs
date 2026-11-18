@@ -568,6 +568,7 @@ mod tests {
             store.inject(Fault {
                 op: StoreOp::Update,
                 applied: false,
+                permanent: false,
             });
         }
     }
@@ -720,10 +721,12 @@ mod tests {
         store.inject(Fault {
             op: StoreOp::Create,
             applied: true,
+            permanent: false,
         });
         store.inject(Fault {
             op: StoreOp::Get,
             applied: false,
+            permanent: false,
         });
         a.write_at(&data(8), 1000).await.unwrap();
         a.flush().await.unwrap();

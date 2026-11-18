@@ -168,6 +168,7 @@ async fn a_failed_fetch_leaves_nothing_behind() {
     store.inject(sim::Fault {
         op: sim::StoreOp::Get,
         applied: false,
+        permanent: false,
     });
     assert!(c.get(&seg.entries[1]).await.is_err());
     assert_eq!(c.get(&seg.entries[1]).await.unwrap(), chunk(10));
@@ -215,6 +216,7 @@ async fn a_failed_index_still_tells_every_entry() {
     store.inject(sim::Fault {
         op: sim::StoreOp::Get,
         applied: false,
+        permanent: false,
     });
     let seen = Mutex::new(0);
     let ready = |_: usize| *seen.lock() += 1;

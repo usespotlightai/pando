@@ -59,9 +59,9 @@ pub enum StoreError {
         /// What failed.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// Any other failure; a retry is not expected to help.
+    /// Fails again if retried: the store refused the request, or this client cannot make it.
     #[error("{key}: {source}")]
-    Other {
+    Permanent {
         /// The key.
         key: String,
         /// What failed.

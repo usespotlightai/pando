@@ -310,6 +310,7 @@ mod tests {
             store.inject(sim::Fault {
                 op: sim::StoreOp::Update,
                 applied: false,
+                permanent: false,
             });
         }
         dead.write_at(&vec![9; CHUNK_SIZE], 0).await.unwrap();

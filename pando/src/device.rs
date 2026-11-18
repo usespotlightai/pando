@@ -207,6 +207,7 @@ pub(crate) fn notify(_: &str) {}
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs::Permissions;
+    use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -247,6 +248,7 @@ mod linux {
             bail!("--images needs --dm");
         }
         let recover = takes_over(&a, id).await?;
+        clear_publish_error(id)?;
         let t0 = Instant::now();
         let switch: Arc<dyn DeviceSwitch> = Arc::new(DmSwitch::new());
         let opts = options(&a, &store, recover);
@@ -303,6 +305,7 @@ mod linux {
                 out.clone(),
             ))
         });
+        let uploads = watch_uploads(&att, &a.name, out);
         let drained = tokio::select! {
             r = fe.stopped() => {
                 if let Err(e) = r {
@@ -312,6 +315,7 @@ mod linux {
             }
             () = signals.next() => true,
         };
+        uploads.abort();
         stop.send_replace(true);
         if let Some(b) = background {
             b.abort();
@@ -332,9 +336,71 @@ mod linux {
                 Err(e) => Ended::DrainFailed(e, held),
             });
         }
-        finish(att, &a.name, out).await?;
+        finish_for_detach(att, &a.name, id, out).await?;
         drop(fe);
         Ok(Ended::Detached)
+    }
+
+    /// Reports why the uploads of branch `name` stopped, once they stop for good.
+    fn watch_uploads(att: &Attachment, name: &str, out: &Out) -> JoinHandle<()> {
+        let (v, name, out) = (Arc::clone(att.volume()), name.to_owned(), out.clone());
+        tokio::spawn(async move {
+            let e = v.upload_stopped().await;
+            out.err(format!("uploads of {name} stopped: {e}"));
+        })
+    }
+
+    /// Publishes the branch as [`finish`] does, and leaves an error for the `detach` that
+    /// waits for the daemon of device `id`.
+    async fn finish_for_detach(att: Arc<Attachment>, name: &str, id: u32, out: &Out) -> Result<()> {
+        let r = finish(att, name, out).await;
+        if let Err(e) = &r {
+            leave_publish_error(id, e, out);
+        }
+        r
+    }
+
+    /// Where, in `dir`, the daemon of ublk device `id` leaves why it could not publish its
+    /// branch, for the `detach` that waits for it.
+    fn publish_error(dir: &Path, id: u32) -> PathBuf {
+        dir.join(format!("ublk{id}.publish-error"))
+    }
+
+    /// Removes the publish error an earlier daemon of device `id` left.
+    fn clear_publish_error(id: u32) -> Result<()> {
+        let p = publish_error(Path::new(CONTROL_DIR), id);
+        match std::fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("remove {}", p.display())),
+        }
+    }
+
+    /// Leaves `e` for the `detach` that waits for the daemon of device `id`.
+    fn leave_publish_error(id: u32, e: &anyhow::Error, out: &Out) {
+        let p = publish_error(Path::new(CONTROL_DIR), id);
+        if let Err(we) =
+            std::fs::create_dir_all(CONTROL_DIR).and_then(|()| std::fs::write(&p, format!("{e:#}")))
+        {
+            out.err(format!("{}: {we}", p.display()));
+        }
+    }
+
+    /// Fails with the error the daemon of ublk device `id` left in `dir`, once it let go of
+    /// the device.
+    fn published(dir: &Path, id: u32, device: &Path) -> Result<()> {
+        let p = publish_error(dir, id);
+        match std::fs::read_to_string(&p) {
+            Ok(e) => {
+                let _ = std::fs::remove_file(&p);
+                bail!(
+                    "the daemon of {} did not publish its branch: {e}",
+                    device.display()
+                )
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("read {}", p.display())),
+        }
     }
 
     /// Serves the control socket of device `id` until `stopping`; `None` when it cannot listen.
@@ -530,7 +596,7 @@ mod linux {
         std::fs::set_permissions(CONTROL_DIR, Permissions::from_mode(0o700))?;
         let p = control_path(id);
         match std::fs::remove_file(&p) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
             _ => {}
         }
         let l = UnixListener::bind(&p)?;
@@ -693,7 +759,8 @@ mod linux {
     }
 
     /// Stops the device of `d`. A live daemon publishes the branch before the device is
-    /// deleted, so this returns once the branch is in the store.
+    /// deleted, so this returns once the branch is in the store, or fails with why the daemon
+    /// could not publish it.
     pub(crate) async fn detach(d: DetachArgs) -> Result<()> {
         let id = pando_linux::device_id(&d.device)?;
         let switch = DmSwitch::new();
@@ -718,7 +785,8 @@ mod linux {
                     switch.resume(dm).await?;
                 }
                 switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
-                return Ok(pando_linux::delete(id, d.publish_wait).await?);
+                pando_linux::delete(id, d.publish_wait).await?;
+                return published(Path::new(CONTROL_DIR), id, &d.device);
             }
             switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
         }
@@ -731,7 +799,8 @@ mod linux {
         };
         pando_linux::stop(id).await?;
         drop(lock);
-        Ok(pando_linux::delete(id, d.publish_wait).await?)
+        pando_linux::delete(id, d.publish_wait).await?;
+        published(Path::new(CONTROL_DIR), id, &d.device)
     }
 
     /// Fails while `users` hold device `dev`, so a stop cannot cut a mounted file system off.
@@ -792,6 +861,20 @@ mod linux {
             let e = in_use("/dev/ublkb1", &users).unwrap_err().to_string();
             assert!(e.starts_with("/dev/ublkb1 is in use: mounted at /mnt/b1, under /dev/mapper/pando-b1."));
             assert!(e.contains("still serves the branch"));
+        }
+
+        #[test]
+        fn detach_fails_with_the_error_the_daemon_left_once() {
+            let dir = tempfile::tempdir().unwrap();
+            let dev = Path::new("/dev/ublkb7");
+            published(dir.path(), 7, dev).unwrap();
+            std::fs::write(publish_error(dir.path(), 7), "publish main: refused").unwrap();
+            let e = published(dir.path(), 7, dev).unwrap_err().to_string();
+            assert_eq!(
+                e,
+                "the daemon of /dev/ublkb7 did not publish its branch: publish main: refused"
+            );
+            published(dir.path(), 7, dev).unwrap();
         }
     }
 }
