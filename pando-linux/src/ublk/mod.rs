@@ -284,7 +284,7 @@ pub async fn delete(id: u32, publish_wait: Duration) -> io::Result<()> {
                     e.kind(),
                     format!(
                         "the daemon of ublk device {id} still holds it after {publish_wait:?}; it \
-                         may still be publishing its branch"
+                         may still be publishing its branch, and a detach again waits for it"
                     ),
                 )
             } else {

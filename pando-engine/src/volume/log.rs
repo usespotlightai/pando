@@ -20,7 +20,7 @@ use pando_format::{
 };
 use tokio::sync::{Notify, watch};
 
-use super::{Inner, RETRY_AFTER, UPLOAD_EVERY, fail_with, is_transient};
+use super::{Inner, RETRY_AFTER, UPLOAD_EVERY, backoff, fail_with, is_transient};
 use crate::ports::{Cpu, CpuClass, on_cpu};
 use crate::remote::Remote;
 use crate::{Error, Result};
@@ -356,7 +356,7 @@ impl Inner {
             }
             for (idx, c) in w.chunks {
                 let data: &[u8] = c.as_ref().map_or(&zeros, |v| v.bytes());
-                self.write_chunk(idx, 0, data, true).await?;
+                self.write_chunk(idx, 0, data, true, false).await?;
             }
         }
         self.commit_flush().await.map(drop)
@@ -386,6 +386,7 @@ impl Inner {
     /// Creates record `n` of this writer with `body`, retrying until the store answers; false
     /// when the writer is fenced or stopping.
     async fn put_record(&self, n: u64, body: Bytes, stop: &mut watch::Receiver<bool>) -> bool {
+        let mut failed = 0;
         loop {
             match self
                 .remote
@@ -406,10 +407,13 @@ impl Inner {
                     self.notify();
                     return false;
                 }
-                Err(_) => tokio::select! {
-                    _ = stop.wait_for(|s| *s) => return false,
-                    () = tokio::time::sleep(RETRY_AFTER) => {}
-                },
+                Err(_) => {
+                    failed += 1;
+                    tokio::select! {
+                        _ = stop.wait_for(|s| *s) => return false,
+                        () = tokio::time::sleep(backoff(failed, self.rng.as_ref())) => {}
+                    }
+                }
             }
         }
     }
@@ -625,6 +629,42 @@ mod tests {
         let b = open(&ports, "/b", LogMode::Strict).await;
         assert_eq!(read(&b, data(2).len()).await, data(2));
         b.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_strict_flush_fails_in_time_while_the_store_does_not_answer() {
+        let (ports, store, _) = sim::ports(9);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let a = open(&ports, "/a", LogMode::Strict).await;
+        a.set_store_wait(Duration::from_secs(5));
+        a.write_at(&data(9), 1000).await.unwrap();
+        store.set_answering(false);
+        let t0 = tokio::time::Instant::now();
+        let e = a.flush().await.unwrap_err();
+        assert!(is_transient(&e), "{e}");
+        assert_eq!(t0.elapsed(), Duration::from_secs(5));
+        assert_eq!(read(&a, data(9).len()).await, data(9));
+        store.set_answering(true);
+        a.flush().await.unwrap();
+        a.close().await;
+
+        let b = open(&ports, "/b", LogMode::Strict).await;
+        assert_eq!(read(&b, data(9).len()).await, data(9));
+        b.close().await;
+    }
+
+    #[test]
+    fn retries_back_off_with_jitter_up_to_a_cap() {
+        let rng = sim::SimRng::new(5);
+        for failed in 1..40 {
+            let full = RETRY_AFTER
+                .saturating_mul(1 << (failed - 1).min(16))
+                .min(super::super::RETRY_MAX);
+            for _ in 0..50 {
+                let d = backoff(failed, &rng);
+                assert!(d >= full / 2 && d <= full, "{failed}: {d:?} for {full:?}");
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

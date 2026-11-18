@@ -69,6 +69,9 @@ pub struct AttachOptions {
     /// How the branch logs its flushes to the store. [`LogMode::Strict`] cannot hand off: the
     /// kernel flushes an image without the branch.
     pub log: LogMode,
+    /// How long a read, write or flush of the device waits on the store before it fails;
+    /// `None` keeps [`crate::STORE_WAIT`], and zero waits for good.
+    pub store_wait: Option<Duration>,
 }
 
 /// What [`Attachment::warm`] did.
@@ -170,6 +173,9 @@ impl Attachment {
             ));
         }
         let v = Arc::new(Volume::open_logged(ports, Arc::clone(&cache), dir, name, opts.log).await?);
+        if let Some(wait) = opts.store_wait {
+            v.set_store_wait(wait);
+        }
         let bases = opts
             .images
             .as_ref()
