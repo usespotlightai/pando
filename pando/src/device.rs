@@ -39,6 +39,13 @@ pub(crate) struct AttachArgs {
     /// Also snapshot once this many bytes were written since the last snapshot (0: never).
     #[arg(long, default_value_t = 64 << 20)]
     pub(crate) snapshot_bytes: u64,
+    /// Also snapshot once writes came and none came for this long (0s: never).
+    #[arg(long, value_parser = crate::parse_duration, default_value = "0s")]
+    pub(crate) snapshot_idle: Duration,
+    /// Snapshots read the written chunks from the image instead of cloning them when they hold
+    /// at most this many bytes; they need an era device (0: always clone).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) snapshot_copy_max: u64,
     /// Parallel fetches for the recording of earlier first reads (0: none).
     #[arg(long, default_value_t = 32)]
     pub(crate) prefetch: usize,
@@ -160,6 +167,8 @@ mod linux {
             learned,
             snapshot_every: a.snapshot,
             snapshot_bytes: a.snapshot_bytes,
+            snapshot_idle: a.snapshot_idle,
+            snapshot_copy_max: a.snapshot_copy_max,
             prefetch: a.prefetch,
             record: a.record,
             metadata: a.metadata,

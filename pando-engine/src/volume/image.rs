@@ -123,6 +123,17 @@ impl Volume {
         path: &Path,
         idxs: &[u64],
     ) -> Result<usize> {
+        self.take_chunks(f, Some(path), idxs).await
+    }
+
+    /// Reads chunks `idxs` from `f` and takes each one that differs from the root as a write
+    /// that holds its own bytes, so `f` may change afterwards. A chunk that no longer differs
+    /// drops a write taken for it earlier. Returns how many it took.
+    pub(crate) async fn read_chunks(&self, f: &Arc<dyn LocalFile>, idxs: &[u64]) -> Result<usize> {
+        self.take_chunks(f, None, idxs).await
+    }
+
+    async fn take_chunks(&self, f: &Arc<dyn LocalFile>, path: Option<&Path>, idxs: &[u64]) -> Result<usize> {
         let (size, tree, root) = {
             let m = self.inner.mem.lock().expect("mem lock");
             (m.size, m.tree.clone(), m.root)
@@ -144,15 +155,15 @@ impl Volume {
                 })
                 .await;
                 let r = match h {
-                    None if e.is_empty() => return Ok(false),
+                    None if e.is_empty() => return Ok(self.drop_write(idx).await),
                     None => None,
-                    Some(h) if h == e.hash => return Ok(false),
+                    Some(h) if h == e.hash => return Ok(self.drop_write(idx).await),
                     Some(h) => {
                         if full {
                             self.prepare(h, &buf).await;
                         }
-                        full.then(|| ChunkRef {
-                            path: path.to_owned(),
+                        path.filter(|_| full).map(|p| ChunkRef {
+                            path: p.to_owned(),
                             offset: off,
                             hash: h,
                         })
@@ -198,6 +209,13 @@ impl Volume {
         let dedup = self.dedup();
         let next = self.inner.mem.lock().expect("mem lock").flush_seq + 1;
         p.add(h, b, dedup, next).await;
+    }
+
+    async fn drop_write(&self, idx: u64) -> bool {
+        let _g = self.inner.stripe(idx).write().await;
+        let mut m = self.inner.mem.lock().expect("mem lock");
+        m.dirty_ref.remove(&idx);
+        m.dirty.remove(&idx).is_some()
     }
 
     async fn take_write(&self, idx: u64, buf: Vec<u8>, r: Option<ChunkRef>) {

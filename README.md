@@ -48,7 +48,10 @@ sharing one root system.
 ## Building
 
 Build with Rust 1.100, pinned in `rust-toolchain.toml`. The block device requires Linux with
-`ublk_drv`. The engine's tests run anywhere; on macOS, `pando-host` falls back to plain file
+`ublk_drv`. After a handoff, snapshots clone only the chunks the kernel wrote when the host has
+the `dm-era` target and `era_invalidate` from thin-provisioning-tools; without them each
+snapshot clones the whole image, and every block written after it pays a copy-on-write. The
+engine's tests run anywhere; on macOS, `pando-host` falls back to plain file
 operations. To build and test the Linux crates from macOS, `tools/cargo.sh` runs cargo in a
 Linux container and takes the same arguments.
 

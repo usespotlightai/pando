@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 pub use clock::Clock;
 pub use cpu::{Cpu, CpuClass, CpuJob, on_cpu};
-pub use device::DeviceSwitch;
+pub use device::{DeviceSwitch, EraDevice, EraWritten};
 pub use local::{Advice, DirEntry, Extent, FileLock, LocalFile, LocalFs, LocalImage, Open};
 pub use rng::Rng;
 pub use store::{Object, ObjectInfo, Store, StoreError, Version};

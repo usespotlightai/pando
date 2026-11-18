@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -250,6 +251,58 @@ impl LocalImage for SimFs {
         Self::parent_exists(&s, to)?;
         let (bytes, blocks) = (s.data[&src].current.clone(), s.data[&src].blocks.clone());
         Self::new_file(&mut s, to, bytes, blocks);
+        Ok(())
+    }
+
+    async fn clone_ranges(&self, from: &Path, to: &Path, ranges: &[Range<u64>]) -> io::Result<()> {
+        let mut s = self.lock_state();
+        let src = Self::inode(&s, from)?;
+        Self::parent_exists(&s, to)?;
+        let d = &s.data[&src];
+        let len = d.current.len() as u64;
+        let (mut parts, mut spans) = (Vec::new(), Vec::new());
+        let mut blocks = BTreeMap::new();
+        for r in ranges {
+            let end = r.end.min(len);
+            if end <= r.start {
+                continue;
+            }
+            if r.start % BLOCK != 0 || (end % BLOCK != 0 && end != len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("range {r:?} of {} is not block aligned", from.display()),
+                ));
+            }
+            parts.push((
+                r.start as usize,
+                d.current[r.start as usize..end as usize].to_vec(),
+            ));
+            spans.push(r.start / BLOCK..end.div_ceil(BLOCK));
+            blocks.extend(
+                d.blocks
+                    .range(r.start / BLOCK..end.div_ceil(BLOCK))
+                    .map(|(b, p)| (*b, *p)),
+            );
+        }
+        let dst = match s.names.get(to) {
+            Some(Node::File(i)) => *i,
+            Some(Node::Dir) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::IsADirectory,
+                    to.display().to_string(),
+                ));
+            }
+            None => Self::new_file(&mut s, to, Vec::new(), BTreeMap::new()),
+        };
+        let d = s.data.get_mut(&dst).expect("inode data");
+        if (d.current.len() as u64) < len {
+            d.current.resize(len as usize, 0);
+        }
+        for (at, b) in parts {
+            d.current[at..at + b.len()].copy_from_slice(&b);
+        }
+        d.blocks.retain(|b, _| !spans.iter().any(|r| r.contains(b)));
+        d.blocks.extend(blocks);
         Ok(())
     }
 
