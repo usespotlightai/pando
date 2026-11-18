@@ -476,7 +476,15 @@ mod linux {
             }
             switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
         }
+        let lock = if d.force || pando_linux::daemon_dead(id).await? {
+            None
+        } else {
+            pando_linux::lock(&d.device, Duration::from_secs(10))
+                .await
+                .with_context(|| format!("lock {}", d.device.display()))?
+        };
         pando_linux::stop(id).await?;
+        drop(lock);
         Ok(pando_linux::delete(id, d.publish_wait).await?)
     }
 
