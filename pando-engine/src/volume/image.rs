@@ -8,7 +8,7 @@ use std::sync::Arc;
 use pando_format::{CHUNK_SIZE, Entry, Hash, is_zero, usize_from};
 use tokio::sync::watch;
 
-use super::{CHUNK, ChunkRef, Dirty, Volume};
+use super::{CHUNK, ChunkRef, Dirty, Under, Volume};
 use crate::Result;
 use crate::dedup::PreparedChunks;
 use crate::flight::bounded;
@@ -221,7 +221,7 @@ impl Volume {
         let _g = self.inner.stripe(idx).write().await;
         let mut m = self.inner.mem.lock();
         m.written(idx);
-        m.dirty.insert(idx, Dirty::Bytes(buf));
+        m.dirty.insert(idx, Dirty::new(Under::Bytes(buf.into())));
         if let Some(r) = r {
             m.dirty_ref.insert(idx, r);
         }

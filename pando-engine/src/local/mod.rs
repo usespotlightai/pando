@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-pub(crate) use journal::{Journal, Record};
+pub(crate) use journal::{Extent, Journal, Record};
 pub(crate) use object_log::{ObjectLog, WritebackHold};
 use pando_format::usize_from;
 pub(crate) use space::{Space, no_room};
