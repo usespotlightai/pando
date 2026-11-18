@@ -265,7 +265,14 @@ async fn main() -> Result<()> {
             };
             collect(&ports, &cache()?, &opts).await
         }
-        Command::Attach(a) => device::attach(&ports, cache()?, a, cli.store.identity()).await,
+        Command::Attach(a) => match device::attach(&ports, cache()?, a, cli.store.identity()).await? {
+            device::Ended::Detached => Ok(()),
+            device::Ended::Drained(_held) => std::process::exit(device::DRAINED),
+            device::Ended::DrainFailed(e, _held) => {
+                eprintln!("{e:#}");
+                std::process::exit(1)
+            }
+        },
         Command::Detach(d) => device::detach(d).await,
         Command::Resize(r) => device::resize(r).await,
         Command::Stat => {
@@ -338,6 +345,37 @@ mod tests {
         assert_eq!(access(&["init", "main", "4096"]), Some(Access::Write));
         assert_eq!(access(&["branch", "main", "run-1"]), Some(Access::Write));
         assert_eq!(access(&["detach", "--device", "/dev/ublkb0"]), None);
+    }
+
+    #[test]
+    fn recover_alone_is_always_and_never_takes_the_branch_name() {
+        use device::Recover;
+        let attach = |args: &[&str]| {
+            let all = ["pando", "attach"].into_iter().chain(args.iter().copied());
+            let parsed = Cli::try_parse_from(all).unwrap().command;
+            let a = if let Command::Attach(a) = parsed {
+                Some(a)
+            } else {
+                None
+            };
+            let a = a.unwrap();
+            (a.name, a.recover, a.drain_wait)
+        };
+        let dev = ["--device", "/dev/ublkb1"];
+        assert_eq!(
+            attach(&["main", dev[0], dev[1]]),
+            ("main".into(), Recover::Never, Duration::from_secs(60))
+        );
+        assert_eq!(attach(&["main", dev[0], dev[1], "--recover"]).1, Recover::Always);
+        assert_eq!(attach(&["--recover", "main", dev[0], dev[1]]).0, "main");
+        assert_eq!(
+            attach(&["main", dev[0], dev[1], "--recover=auto"]).1,
+            Recover::Auto
+        );
+        assert_eq!(
+            attach(&["main", dev[0], dev[1], "--drain-wait", "5m"]).2,
+            Duration::from_secs(300)
+        );
     }
 
     #[test]

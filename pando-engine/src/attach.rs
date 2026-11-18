@@ -17,13 +17,14 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::base::{Bases, BuildOptions, BuildReport, build};
 use crate::cache::{BaseKey, Cache};
 use crate::dedup::learned::{LearnedIndex, Learner};
 use crate::handoff::{self, Handoff, HandoffReport, HostEnv, SnapshotOptions, resize_table};
 use crate::ports::DeviceSwitch;
-use crate::{Ports, Result, Volume, ext4, recording};
+use crate::{CheckpointReport, Ports, Result, Volume, ext4, recording};
 
 const BUILD_PARALLEL: usize = 16;
 
@@ -84,6 +85,12 @@ pub struct FinishReport {
     pub absorbed: usize,
     /// Chunks the saved recording lists.
     pub recorded: usize,
+    /// Taking back what the kernel wrote to the image.
+    pub absorb: Duration,
+    /// What the checkpoint that published the branch did.
+    pub checkpoint: CheckpointReport,
+    /// Saving what the run learned and its recording, and closing the volume.
+    pub after: Duration,
 }
 
 /// What the background snapshots of a handoff did.
@@ -234,6 +241,11 @@ impl Attachment {
         &self.volume
     }
 
+    /// The cache the branch reads its chunks through.
+    pub fn cache(&self) -> &Arc<Cache> {
+        &self.cache
+    }
+
     /// Whether the kernel already serves the branch from an image a dead writer left, so no
     /// frontend is needed.
     pub fn rejoined(&self) -> bool {
@@ -362,6 +374,18 @@ impl Attachment {
         })
     }
 
+    /// Publishes what the branch held when the drain began, while the device keeps serving,
+    /// for a daemon that exits and leaves the device to the next one. A handed-off branch is
+    /// snapshotted first. Writes acknowledged later stay on this host: in the journal, or in the
+    /// image after a handoff.
+    pub async fn drain(&self) -> Result<()> {
+        let h = self.handoff.lock().clone();
+        if let Some(h) = h.filter(|h| h.switched()) {
+            h.snapshot_once(&self.volume).await?;
+        }
+        self.volume.checkpoint().await
+    }
+
     /// Publishes what the branch holds and frees it. The device must no longer write to the
     /// image: the caller removed it first.
     pub async fn finish(self) -> Result<FinishReport> {
@@ -369,15 +393,18 @@ impl Attachment {
         let mut report = FinishReport::default();
         let h = self.handoff.lock().clone();
         let mut done = Ok(());
+        let t0 = Instant::now();
         if let Some(h) = h.as_ref().filter(|h| h.switched()) {
             match h.absorb_final(v).await {
                 Ok(n) => report.absorbed = n,
                 Err(e) => done = Err(e),
             }
         }
+        report.absorb = t0.elapsed();
         if done.is_ok() {
-            done = v.checkpoint().await;
+            done = v.checkpoint_report().await.map(|c| report.checkpoint = c);
         }
+        let t1 = Instant::now();
         let learner = self.learner.lock().take();
         if let Some(l) = learner {
             if done.is_ok() {
@@ -402,6 +429,7 @@ impl Attachment {
                 .unwrap_or(0);
         }
         v.close().await;
+        report.after = t1.elapsed();
         done.map(|()| report)
     }
 }
@@ -648,6 +676,45 @@ mod tests {
         let mut want = vec![5; usize_from(SIZE)];
         want[3 * CHUNK_SIZE..3 * CHUNK_SIZE + 4096].fill(0x33);
         assert_eq!(got, want);
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_publishes_what_the_branch_holds_and_leaves_the_device_serving() {
+        let (ports, _, fs) = sim::ports(14);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let devices = SimDevices::new((*fs).clone());
+        let cache = Arc::new(Cache::open(&ports, Path::new("/c")).await.unwrap());
+        let a = Attachment::open(
+            &ports,
+            Some(Arc::new(devices.clone())),
+            cache,
+            Path::new("/v"),
+            "main",
+            opts(),
+        )
+        .await
+        .unwrap();
+        devices.add_block(Path::new(FRONT), Arc::new(Front(Arc::clone(a.volume()))));
+        devices.create("dm0", Path::new(FRONT), SIZE).await.unwrap();
+        let at = |chunk: usize| (chunk * CHUNK_SIZE) as u64;
+        devices.write("dm0", &[0x11; 4096], at(1)).await.unwrap();
+        a.drain().await.unwrap();
+        a.warm().await.unwrap();
+        a.hand_off().await.unwrap();
+        devices.write("dm0", &[0x22; 4096], at(3)).await.unwrap();
+        a.drain().await.unwrap();
+        devices.write("dm0", &[0x33; 4096], at(5)).await.unwrap();
+
+        let elsewhere = Arc::new(Cache::open(&ports, Path::new("/e")).await.unwrap());
+        let v = Volume::open(&ports, elsewhere, Path::new("/ev"), "main")
+            .await
+            .unwrap();
+        let mut got = vec![0; 4096];
+        for (chunk, want) in [(1, 0x11), (3, 0x22), (5, 0)] {
+            v.read_at(&mut got, at(chunk)).await.unwrap();
+            assert!(got.iter().all(|&b| b == want), "chunk {chunk}");
+        }
         v.close().await;
     }
 }

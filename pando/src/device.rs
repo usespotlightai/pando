@@ -1,11 +1,50 @@
 //! The `attach`, `resize` and `detach` commands: a branch served as a block device. An attach
 //! listens on a control socket, `/run/pando/ublkbN.sock`, that `resize` asks to grow it. A
 //! request is one line, `grow <bytes>`; the answer is `ok <bytes>` or `error <why>`.
+//!
+//! On SIGTERM or SIGINT an attach drains: it publishes what the branch holds, for at most
+//! `--drain-wait`, and exits with [`DRAINED`] without stopping the device. The kernel holds the
+//! device's I/O until `attach --recover` takes it over.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{ArgAction, Args};
+use clap::{ArgAction, Args, ValueEnum};
+
+/// The exit status of an attach that drained and left its device to the next daemon.
+pub(crate) const DRAINED: i32 = 75;
+
+/// How an attach ended.
+#[derive(Debug)]
+pub(crate) enum Ended {
+    /// `detach` stopped the device and the branch is published.
+    Detached,
+    /// A signal drained the daemon; the device waits for the next one.
+    Drained(Held),
+    /// A signal drained the daemon but it could not commit the writes locally; they are in the
+    /// journal, and the device waits for the next daemon to replay it.
+    DrainFailed(anyhow::Error, Held),
+}
+
+/// The device of a drained daemon, held open until the process exits: closing it while its
+/// queues still run would hand their file descriptor to whatever opens next.
+#[derive(Debug)]
+pub(crate) struct Held {
+    #[cfg(target_os = "linux")]
+    _frontend: pando_linux::Frontend,
+}
+
+/// When `attach` takes over a device whose daemon died.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Recover {
+    /// Add a new device.
+    Never,
+    /// Take over the device; fail if it has none or its daemon lives.
+    Always,
+    /// Take over the device if it is there, as after a crash or a drain; add a new one if it is
+    /// not, as after a reboot. Fail if its daemon lives.
+    Auto,
+}
 
 /// How `attach` serves a branch.
 #[derive(Args, Debug)]
@@ -59,12 +98,22 @@ pub(crate) struct AttachArgs {
     /// After the first reads, fetch every chunk with this many parallel fetches (0: none).
     #[arg(long, default_value_t = 0)]
     pub(crate) hydrate: usize,
-    /// Take over a device whose daemon died, with the requests it had in flight.
-    #[arg(long)]
-    pub(crate) recover: bool,
+    /// Take over a device whose daemon died, with the requests it had in flight. `--recover`
+    /// alone is `always`.
+    #[arg(long, value_enum, default_value_t = Recover::Never, num_args = 0..=1, default_missing_value = "always", require_equals = true)]
+    pub(crate) recover: Recover,
+    /// On SIGTERM or SIGINT, how long to wait for the store to hold every write acknowledged
+    /// so far before the daemon exits; the writes stay on this host either way.
+    #[arg(long, value_parser = crate::parse_duration, default_value = "60s")]
+    pub(crate) drain_wait: Duration,
     /// Hardware queues of a new device, one thread each.
     #[arg(long, default_value_t = 2)]
     pub(crate) queues: u16,
+    /// Cap the page cache's dirty data on the device the file system sits on at this many
+    /// bytes, so writes reach the branch while it runs and a detach has little left to take;
+    /// writers wait at the cap (0: the kernel's limits).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) dirty_limit: u64,
 }
 
 /// Which device `detach` stops.
@@ -105,7 +154,7 @@ pub(crate) async fn attach(
     _: std::sync::Arc<pando_engine::Cache>,
     _: AttachArgs,
     _: String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Ended> {
     anyhow::bail!("attach needs Linux")
 }
 
@@ -131,55 +180,42 @@ mod linux {
     use pando_engine::ports::DeviceSwitch;
     use pando_engine::{AttachOptions, Attachment, Cache, Ports};
     use pando_format::Hash;
-    use pando_linux::{DmSwitch, Frontend, FrontendOptions};
+    use pando_linux::{Daemon, DmSwitch, Frontend, FrontendOptions};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::runtime::Handle;
+    use tokio::signal::unix::{Signal, SignalKind, signal};
     use tokio::sync::watch;
 
-    use super::{AttachArgs, DetachArgs, ResizeArgs};
+    use super::{AttachArgs, DetachArgs, Ended, Recover, ResizeArgs};
 
     const CONTROL_DIR: &str = "/run/pando";
     /// How long a daemon waits for the request of a client that connected.
     const REQUEST_WAIT: Duration = Duration::from_secs(5);
 
-    /// Serves branch `a.name` until `detach` stops its device, then publishes it. `store` names
-    /// the store, so chunks learned from one store never serve another.
-    pub(crate) async fn attach(ports: &Ports, cache: Arc<Cache>, a: AttachArgs, store: String) -> Result<()> {
+    /// Serves branch `a.name` until `detach` stops its device, then publishes it, or until a
+    /// signal drains it. `store` names the store, so chunks learned from one store never serve
+    /// another.
+    pub(crate) async fn attach(
+        ports: &Ports,
+        cache: Arc<Cache>,
+        a: AttachArgs,
+        store: String,
+    ) -> Result<Ended> {
         let id = pando_linux::device_id(&a.device)?;
         if a.images.is_some() && a.dm.is_none() {
             bail!("--images needs --dm");
         }
-        if a.recover {
-            dead_daemon(id, &a.device).await?;
-        }
+        let recover = takes_over(&a, id).await?;
         let t0 = Instant::now();
         let switch: Arc<dyn DeviceSwitch> = Arc::new(DmSwitch::new());
-        let learned = a
-            .images
-            .as_ref()
-            .filter(|_| a.learn)
-            .map(|d| d.join("learned").join(Hash::of(store.as_bytes()).short()));
-        let opts = AttachOptions {
-            images: a.images.clone(),
-            device: a.dm.clone(),
-            share_bases: a.share_bases,
-            dedup: a.dedup,
-            learned,
-            snapshot_every: a.snapshot,
-            snapshot_bytes: a.snapshot_bytes,
-            prefetch: a.prefetch,
-            record: a.record,
-            metadata: a.metadata,
-            hydrate: a.hydrate,
-            rejoin: a.recover,
-        };
+        let opts = options(&a, &store, recover);
         let att = Arc::new(
             Attachment::open(ports, Some(Arc::clone(&switch)), cache, &a.state, &a.name, opts).await?,
         );
         let fopts = FrontendOptions {
             queues: a.queues,
-            recover: a.recover,
+            recover,
         };
         let mut fe = match Frontend::start(Handle::current(), Arc::clone(att.volume()), id, fopts).await {
             Ok(fe) => fe,
@@ -190,7 +226,7 @@ mod linux {
                 return Err(e).with_context(|| format!("start {}", a.device.display()));
             }
         };
-        if let Some(dm) = a.dm.as_deref().filter(|_| !a.recover)
+        if let Some(dm) = a.dm.as_deref().filter(|_| !recover)
             && let Err(e) = switch.create(dm, &a.device, att.volume().size()).await
         {
             if let Err(ae) = fe.abort().await {
@@ -201,6 +237,7 @@ mod linux {
             }
             return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
         }
+        limit_dirty(&a).await;
         println!(
             "attached {} as {} in {:.1?}{}",
             a.name,
@@ -212,6 +249,8 @@ mod linux {
                 ""
             }
         );
+        let mut signals = Signals::new()?;
+        notify("READY=1");
         let (stop, stopping) = watch::channel(false);
         let control = match listen(id) {
             Ok(l) => Some(tokio::spawn(serve(
@@ -228,9 +267,15 @@ mod linux {
         };
         let background = (!att.rejoined())
             .then(|| tokio::spawn(warm(Arc::clone(&att), a.name.clone(), a.images.is_some())));
-        if let Err(e) = fe.stopped().await {
-            eprintln!("{}: {e}", a.device.display());
-        }
+        let drained = tokio::select! {
+            r = fe.stopped() => {
+                if let Err(e) = r {
+                    eprintln!("{}: {e}", a.device.display());
+                }
+                false
+            }
+            () = signals.next() => true,
+        };
         stop.send_replace(true);
         if let Some(b) = background {
             b.abort();
@@ -240,9 +285,153 @@ mod linux {
             let _ = c.await;
             let _ = std::fs::remove_file(control_path(id));
         }
-        let published = finish(att, &a.name).await;
+        if drained {
+            notify("STOPPING=1");
+            let drained = drain(&att, &a.name, a.drain_wait, &mut signals).await;
+            let held = super::Held { _frontend: fe };
+            return Ok(match drained {
+                Ok(()) => Ended::Drained(held),
+                Err(e) => Ended::DrainFailed(e, held),
+            });
+        }
+        finish(att, &a.name).await?;
         drop(fe);
-        published
+        Ok(Ended::Detached)
+    }
+
+    /// Whether this attach takes over the device of a daemon that died; it fails while a
+    /// daemon still serves the device.
+    async fn takes_over(a: &AttachArgs, id: u32) -> Result<bool> {
+        let recover = match a.recover {
+            Recover::Never => false,
+            Recover::Always => true,
+            Recover::Auto => {
+                pando_linux::daemon(id)
+                    .await
+                    .with_context(|| format!("state of {}", a.device.display()))?
+                    != Daemon::NoDevice
+            }
+        };
+        if recover {
+            dead_daemon(id, &a.device).await?;
+        }
+        Ok(recover)
+    }
+
+    /// How `a` asks for the branch to be served. `store` names the store, so chunks learned
+    /// from one store never serve another.
+    fn options(a: &AttachArgs, store: &str, rejoin: bool) -> AttachOptions {
+        let learned = a
+            .images
+            .as_ref()
+            .filter(|_| a.learn)
+            .map(|d| d.join("learned").join(Hash::of(store.as_bytes()).short()));
+        AttachOptions {
+            images: a.images.clone(),
+            device: a.dm.clone(),
+            share_bases: a.share_bases,
+            dedup: a.dedup,
+            learned,
+            snapshot_every: a.snapshot,
+            snapshot_bytes: a.snapshot_bytes,
+            prefetch: a.prefetch,
+            record: a.record,
+            metadata: a.metadata,
+            hydrate: a.hydrate,
+            rejoin,
+        }
+    }
+
+    /// SIGTERM and SIGINT.
+    struct Signals {
+        term: Signal,
+        int: Signal,
+    }
+
+    impl Signals {
+        fn new() -> Result<Signals> {
+            Ok(Signals {
+                term: signal(SignalKind::terminate()).context("listen for SIGTERM")?,
+                int: signal(SignalKind::interrupt()).context("listen for SIGINT")?,
+            })
+        }
+
+        async fn next(&mut self) {
+            tokio::select! {
+                _ = self.term.recv() => {}
+                _ = self.int.recv() => {}
+            }
+        }
+    }
+
+    /// Publishes what the branch holds while the device serves, for at most `wait` or until a
+    /// second signal, then makes every write acknowledged so far durable on this host.
+    async fn drain(att: &Attachment, name: &str, wait: Duration, signals: &mut Signals) -> Result<()> {
+        let t0 = Instant::now();
+        println!("draining {name}: publishing for at most {wait:.0?}");
+        let published = tokio::select! {
+            r = tokio::time::timeout(wait, att.drain()) => match r {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    eprintln!("drain {name}: {e:#}");
+                    false
+                }
+                Err(_) => false,
+            },
+            () = signals.next() => false,
+        };
+        att.volume()
+            .flush()
+            .await
+            .with_context(|| format!("drain {name}: commit the writes locally"))?;
+        if published {
+            println!(
+                "drained {name} in {:.1?}: the store holds every write acknowledged before the signal",
+                t0.elapsed()
+            );
+        } else {
+            println!(
+                "drained {name} in {:.1?}: the writes are on this host; `attach --recover` publishes them",
+                t0.elapsed()
+            );
+        }
+        Ok(())
+    }
+
+    /// Tells systemd, when it started this daemon with `Type=notify`, how the daemon stands.
+    fn notify(state: &str) {
+        if let Some(to) = std::env::var_os("NOTIFY_SOCKET")
+            && let Err(e) = notify_to(&to, state)
+        {
+            eprintln!("tell systemd {state}: {e}");
+        }
+    }
+
+    /// Sends `state` to the systemd notify socket `to`: a path, or an abstract name after `@`.
+    fn notify_to(to: &std::ffi::OsStr, state: &str) -> std::io::Result<()> {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+        let addr = match to.as_bytes().strip_prefix(b"@") {
+            Some(name) => SocketAddr::from_abstract_name(name)?,
+            None => SocketAddr::from_pathname(to)?,
+        };
+        UnixDatagram::unbound()?.send_to_addr(state.as_bytes(), &addr)?;
+        Ok(())
+    }
+
+    /// Caps the dirty page cache of the device `a` mounts at `a.dirty_limit` bytes, unless it
+    /// is 0. A failure leaves the kernel's limits in force.
+    async fn limit_dirty(a: &AttachArgs) {
+        if a.dirty_limit == 0 {
+            return;
+        }
+        let mounted =
+            a.dm.as_deref()
+                .map_or_else(|| a.device.clone(), pando_linux::mapper_path);
+        if let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await {
+            eprintln!("{}: the dirty limit is off: {e}", mounted.display());
+        }
     }
 
     /// Warms `att`, then, with `hand_off`, moves its device to a local image.
@@ -396,8 +585,33 @@ mod linux {
         if let Some(s) = att.snapshots() {
             println!("snapshots of {name}: {s:?}");
         }
+        let cache = Arc::clone(att.cache());
         let r = att.finish().await.with_context(|| format!("publish {name}"))?;
-        println!("published {name} in {:.1?}: {r:?}", t0.elapsed());
+        let total = t0.elapsed();
+        println!("published {name} in {total:.1?}: {r:?}");
+        let c = &r.checkpoint;
+        let last = c.last.unwrap_or_default();
+        let s = cache.stats();
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "publish times {name}: total={:.4} absorb={:.4} flush={:.4} wait={:.4} pack={:.4} ref={:.4} \
+             after={:.4} passes_before={} bytes_before={} passes={} bytes={} stalls={} stall={:.4} \
+             fetched_bytes={}",
+            total.as_secs_f64(),
+            r.absorb.as_secs_f64(),
+            c.flush.as_secs_f64(),
+            c.wait.as_secs_f64(),
+            last.pack.as_secs_f64(),
+            last.publish.as_secs_f64(),
+            r.after.as_secs_f64(),
+            c.passes_before,
+            c.bytes_before,
+            c.passes,
+            c.bytes,
+            load(&s.stalls),
+            Duration::from_nanos(load(&s.stall_nanos)).as_secs_f64(),
+            load(&s.bytes_fetched),
+        );
         Ok(())
     }
 
@@ -431,7 +645,15 @@ mod linux {
             }
             switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
         }
+        let lock = if d.force || pando_linux::daemon_dead(id).await? {
+            None
+        } else {
+            pando_linux::lock(&d.device, Duration::from_secs(10))
+                .await
+                .with_context(|| format!("lock {}", d.device.display()))?
+        };
         pando_linux::stop(id).await?;
+        drop(lock);
         Ok(pando_linux::delete(id, d.publish_wait).await?)
     }
 
@@ -457,6 +679,26 @@ mod linux {
             assert!(parse_request("grow\n").is_err());
             assert!(parse_request("shrink 4096\n").is_err());
             assert!(parse_request("grow -1\n").is_err());
+        }
+
+        #[test]
+        fn systemd_hears_on_a_path_socket_and_an_abstract_one() {
+            use std::os::linux::net::SocketAddrExt;
+            use std::os::unix::net::{SocketAddr, UnixDatagram};
+            let tag = format!("pando-notify-{}", std::process::id());
+            let path = std::env::temp_dir().join(&tag);
+            let _ = std::fs::remove_file(&path);
+            let at_path = UnixDatagram::bind(&path).unwrap();
+            let abstract_addr = SocketAddr::from_abstract_name(tag.as_bytes()).unwrap();
+            let at_name = UnixDatagram::bind_addr(&abstract_addr).unwrap();
+            let mut buf = [0; 64];
+            notify_to(path.as_os_str(), "READY=1").unwrap();
+            let n = at_path.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"READY=1");
+            notify_to(format!("@{tag}").as_ref(), "STOPPING=1").unwrap();
+            let n = at_name.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"STOPPING=1");
+            std::fs::remove_file(&path).unwrap();
         }
 
         #[test]

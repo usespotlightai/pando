@@ -32,7 +32,9 @@ sharing one root system.
   touched, and the next run on another host prefetches them. Once the branch is local, Pando
   hands the device to the kernel through device-mapper over a loop device and leaves the I/O path.
 - **Crash safety.** ublk user recovery and a local journal preserve acknowledged writes through
-  a daemon crash. After restarting, the daemon resumes serving the device where it left off.
+  a daemon crash. After restarting, the daemon resumes serving the device where it left off. On
+  SIGTERM it publishes what it holds and leaves the device to the next daemon, so an upgrade
+  does not unmount anything. [docs/hosts.md](docs/hosts.md) covers running it under systemd.
 
 ## Crates
 
@@ -61,6 +63,13 @@ cargo test --workspace
 (`tools/Dockerfile`, `tools/install.sh`): with no arguments it runs the lints, the supply-chain
 checks and the tests. It also takes `asan`, `fuzz [seconds]`, `coverage`, `mutants`, or any
 single check by name, such as `clippy` or `shellcheck`. The fuzz targets are in `fuzz/`.
+
+Dependabot proposes weekly updates for the crates, actions, base images and Terraform providers
+(`.github/dependabot.yml`). A crate update passes `vet` only once each new version has an audit
+or exemption in `supply-chain/`. Dependabot moves the `rust` image only within its minor version,
+so a new Rust release is a manual change to `rust-toolchain.toml`, `rust-version` in
+`Cargo.toml`, and the `FROM` and `rustup` lines in `tools/Dockerfile`, all in one commit. The
+nightly in `tools/nightly` and `fuzz/README.md` also moves by hand.
 
 Fixtures in `pando-format/tests/fixtures` pin the byte encoding of every stored object.
 
