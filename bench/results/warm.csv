@@ -1,19 +1,4 @@
 system,workspace,measure,rep,value,unit,notes
-Pando,small,warm.git_status,1,1.22285,s,rep 1
-Pando,small,warm.open,1,0.757823,s,rep 1
-Pando,small,warm.status,1,0.465032,s,rep 1
-Pando,small,warm.git_status,2,1.3532,s,rep 2
-Pando,small,warm.open,2,0.887358,s,rep 2
-Pando,small,warm.status,2,0.46584,s,rep 2
-Pando,small,warm.git_status,3,1.03993,s,rep 3
-Pando,small,warm.open,3,0.774728,s,rep 3
-Pando,small,warm.status,3,0.265198,s,rep 3
-Pando,small,warm.git_status,4,1.30409,s,rep 4
-Pando,small,warm.open,4,0.8384,s,rep 4
-Pando,small,warm.status,4,0.465689,s,rep 4
-Pando,small,warm.git_status,5,1.29367,s,rep 5
-Pando,small,warm.open,5,0.827785,s,rep 5
-Pando,small,warm.status,5,0.465886,s,rep 5
 image download from S3,small,warm.git_status,1,3.11918,s,rep 1
 image download from S3,small,warm.open,1,2.70403,s,rep 1
 image download from S3,small,warm.status,1,0.415154,s,rep 1
@@ -104,21 +89,6 @@ tar from S3,small,warm.status,4,0.164676,s,rep 4
 tar from S3,small,warm.git_status,5,2.52259,s,rep 5
 tar from S3,small,warm.open,5,2.35801,s,rep 5
 tar from S3,small,warm.status,5,0.164573,s,rep 5
-Pando (handoff),small,warm.git_status,1,1.86858,s,rep 1
-Pando (handoff),small,warm.open,1,0.801174,s,rep 1
-Pando (handoff),small,warm.status,1,1.06741,s,rep 1
-Pando (handoff),small,warm.git_status,2,1.76672,s,rep 2
-Pando (handoff),small,warm.open,2,0.799858,s,rep 2
-Pando (handoff),small,warm.status,2,0.966866,s,rep 2
-Pando (handoff),small,warm.git_status,3,1.77613,s,rep 3
-Pando (handoff),small,warm.open,3,0.759425,s,rep 3
-Pando (handoff),small,warm.status,3,1.0167,s,rep 3
-Pando (handoff),small,warm.git_status,4,1.85036,s,rep 4
-Pando (handoff),small,warm.open,4,0.782979,s,rep 4
-Pando (handoff),small,warm.status,4,1.06739,s,rep 4
-Pando (handoff),small,warm.git_status,5,1.79591,s,rep 5
-Pando (handoff),small,warm.open,5,0.77894,s,rep 5
-Pando (handoff),small,warm.status,5,1.01697,s,rep 5
 SOCI lazy pull,small,warm.git_status,1,2.12084,s,rep 1
 SOCI lazy pull,small,warm.open,1,0.404092,s,rep 1
 SOCI lazy pull,small,warm.status,1,1.71675,s,rep 1
@@ -173,3 +143,33 @@ Amazon S3 Files,small,warm.status,2,36.4298,s,rep 2
 Amazon S3 Files,small,warm.git_status,3,221.649,s,rep 3
 Amazon S3 Files,small,warm.open,3,185.318,s,rep 3
 Amazon S3 Files,small,warm.status,3,36.3312,s,rep 3
+Pando,small,warm.git_status,1,1.30008,s,rep 1
+Pando,small,warm.open,1,0.834328,s,rep 1
+Pando,small,warm.status,1,0.465751,s,rep 1
+Pando,small,warm.git_status,2,1.28859,s,rep 2
+Pando,small,warm.open,2,0.822597,s,rep 2
+Pando,small,warm.status,2,0.465989,s,rep 2
+Pando,small,warm.git_status,3,1.30597,s,rep 3
+Pando,small,warm.open,3,0.840299,s,rep 3
+Pando,small,warm.status,3,0.46567,s,rep 3
+Pando,small,warm.git_status,4,1.31584,s,rep 4
+Pando,small,warm.open,4,0.849924,s,rep 4
+Pando,small,warm.status,4,0.465914,s,rep 4
+Pando,small,warm.git_status,5,1.31473,s,rep 5
+Pando,small,warm.open,5,0.848621,s,rep 5
+Pando,small,warm.status,5,0.466112,s,rep 5
+Pando (handoff),small,warm.git_status,1,1.80623,s,rep 1
+Pando (handoff),small,warm.open,1,0.839445,s,rep 1
+Pando (handoff),small,warm.status,1,0.966781,s,rep 1
+Pando (handoff),small,warm.git_status,2,1.77612,s,rep 2
+Pando (handoff),small,warm.open,2,0.859535,s,rep 2
+Pando (handoff),small,warm.status,2,0.916582,s,rep 2
+Pando (handoff),small,warm.git_status,3,1.70199,s,rep 3
+Pando (handoff),small,warm.open,3,0.835958,s,rep 3
+Pando (handoff),small,warm.status,3,0.866028,s,rep 3
+Pando (handoff),small,warm.git_status,4,1.7522,s,rep 4
+Pando (handoff),small,warm.open,4,0.835709,s,rep 4
+Pando (handoff),small,warm.status,4,0.916487,s,rep 4
+Pando (handoff),small,warm.git_status,5,1.68474,s,rep 5
+Pando (handoff),small,warm.open,5,0.817998,s,rep 5
+Pando (handoff),small,warm.status,5,0.866742,s,rep 5

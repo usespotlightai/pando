@@ -1,10 +1,4 @@
 system,workspace,measure,rep,value,unit,notes
-Pando,small,fork.p50,1,0.105602,s,1000 branches
-Pando,small,fork.p99,1,0.142173,s,1000 branches
-Pando,small,fork.first,1,0.092478,s,1000 branches
-Pando,small,fork.last,1,0.0883712,s,1000 branches
-Pando,small,fork-bytes.per_branch,1,135,B,1000 branches
-Pando,small,fork-bytes.per_edit,1,5.32352e+06,B,"20 branches, 5 MiB each"
 Docker (overlayfs),small,fork.p50,1,0.011132,s,1000 branches
 Docker (overlayfs),small,fork.p99,1,0.0123486,s,1000 branches
 Docker (overlayfs),small,fork.first,1,0.0165164,s,1000 branches
@@ -40,3 +34,9 @@ Amazon S3 Files,small,fork.first,1,179.465,s,3 branches
 Amazon S3 Files,small,fork.last,1,123.068,s,3 branches
 Amazon S3 Files,small,fork-bytes.per_branch,1,1.39775e+09,B,3 branches
 Amazon S3 Files,small,fork-bytes.per_edit,1,5.24288e+06,B,"3 branches, 5 MiB each"
+Pando,small,fork.p50,1,0.130042,s,1000 branches
+Pando,small,fork.p99,1,0.17265,s,1000 branches
+Pando,small,fork.first,1,0.192611,s,1000 branches
+Pando,small,fork.last,1,0.16009,s,1000 branches
+Pando,small,fork-bytes.per_branch,1,136,B,1000 branches
+Pando,small,fork-bytes.per_edit,1,7.94781e+06,B,"20 branches, 5 MiB each"

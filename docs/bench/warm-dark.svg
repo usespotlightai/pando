@@ -21,14 +21,14 @@
   <path d="M212,94.0 h124.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-124.1 z" fill="#656c76"><title>Docker (overlayfs): 1.27 s (range 1.23 s to 1.31 s)</title></path>
   <text x="346.1" y="105.0" font-size="12" fill="#9198a1">1.27 s</text>
   <text x="202" y="131.0" font-size="12" fill="#f0f6fc" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,120.0 h125.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-125.0 z" fill="#4493f8"><title>Pando: 1.29 s (range 1.04 s to 1.35 s)</title></path>
-  <text x="347.0" y="131.0" font-size="12" fill="#9198a1">1.29 s</text>
+  <path d="M212,120.0 h125.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-125.4 z" fill="#4493f8"><title>Pando: 1.31 s (range 1.29 s to 1.32 s)</title></path>
+  <text x="347.4" y="131.0" font-size="12" fill="#9198a1">1.31 s</text>
   <text x="202" y="157.0" font-size="12" fill="#f0f6fc" text-anchor="end">Nydus lazy pull</text>
   <path d="M212,146.0 h126.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-126.2 z" fill="#656c76"><title>Nydus lazy pull: 1.33 s (range 1.14 s to 1.43 s)</title></path>
   <text x="348.2" y="157.0" font-size="12" fill="#9198a1">1.33 s</text>
   <text x="202" y="183.0" font-size="12" fill="#f0f6fc" text-anchor="end" font-weight="600">Pando (handoff)</text>
-  <path d="M212,172.0 h141.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-141.5 z" fill="#4493f8"><title>Pando (handoff): 1.8 s (range 1.77 s to 1.87 s)</title></path>
-  <text x="363.5" y="183.0" font-size="12" fill="#9198a1">1.8 s</text>
+  <path d="M212,172.0 h140.3 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-140.3 z" fill="#4493f8"><title>Pando (handoff): 1.75 s (range 1.68 s to 1.81 s)</title></path>
+  <text x="362.3" y="183.0" font-size="12" fill="#9198a1">1.75 s</text>
   <text x="202" y="209.0" font-size="12" fill="#f0f6fc" text-anchor="end">SOCI lazy pull</text>
   <path d="M212,198.0 h151.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-151.5 z" fill="#656c76"><title>SOCI lazy pull: 2.19 s (range 2.12 s to 2.29 s)</title></path>
   <text x="373.5" y="209.0" font-size="12" fill="#9198a1">2.19 s</text>

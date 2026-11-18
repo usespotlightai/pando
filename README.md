@@ -116,7 +116,7 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 | | Writable fork | Fork cost | Starts on an empty host | Saves only the change |
 |---|---|---|---|---|
-| Pando | yes | ~100 ms, a 135 B ref | yes, fetches what it reads | yes, 4 KiB dedup |
+| Pando | yes | ~130 ms, a 136 B ref | yes, fetches what it reads | yes, 4 KiB dedup |
 | image or tar from S3 | copy | full copy | downloads everything | no |
 | OCI layers on overlayfs | yes | ms on a host with the image | pulls the image (lazily with SOCI / Nydus) | a new layer per save |
 | EBS snapshot to volume | yes | seconds to create | lazy-loaded, slow first reads | incremental snapshots, minutes |
@@ -128,8 +128,9 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Pando's rows are from an earlier run** than those of SOCI, Nydus, ZeroFS and Amazon S3 Files,
-> on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see [bench/README.md](bench/README.md)).
+> **The results come from three runs** on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> [bench/README.md](bench/README.md)): Pando's from main at `d57f1de`, SOCI, Nydus, ZeroFS and
+> Amazon S3 Files from the run before it, and the other systems from the first run.
 > Run `python3 bench/plot.py` to redraw the charts from `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
@@ -157,7 +158,7 @@ file. S3 Files has no branches, so a branch is a copy of every file through the 
 
 | p50 over up to 1,000 branches | median | range |
 |---|---|---|
-| Pando | 106 ms | 106 ms to 106 ms |
+| Pando | 130 ms | 130 ms to 130 ms |
 | Docker (overlayfs, local) | 11.1 ms | 11.1 ms to 11.1 ms |
 | EBS snapshot to volume | 2.6 s | 2.6 s to 2.6 s |
 | JuiceFS | 12.8 s | 12.8 s to 12.8 s |
@@ -167,7 +168,7 @@ file. S3 Files has no branches, so a branch is a copy of every file through the 
 
 | storage added per branch | median | range |
 |---|---|---|
-| Pando | 135 B | 135 B to 135 B |
+| Pando | 136 B | 136 B to 136 B |
 | Docker (overlayfs, local) | 36.5 KiB | 36.5 KiB to 36.5 KiB |
 | EBS snapshot to volume | 16 GiB | 16 GiB to 16 GiB |
 | JuiceFS | 25.4 MiB | 25.4 MiB to 25.4 MiB |
@@ -177,7 +178,7 @@ file. S3 Files has no branches, so a branch is a copy of every file through the 
 
 | storage added by a 5 MiB edit to a branch | median | range |
 |---|---|---|
-| Pando | 5.08 MiB | 5.08 MiB to 5.08 MiB |
+| Pando | 7.58 MiB | 7.58 MiB to 7.58 MiB |
 | Docker (overlayfs, local) | 5 MiB | 5 MiB to 5 MiB |
 | EBS snapshot to volume | none: billed by volume size | |
 | JuiceFS | 5 MiB | 5 MiB to 5 MiB |
@@ -207,8 +208,8 @@ S3 Files copies every file for each branch; S3 Files ran 3 times, not 5.
 
 | fork, mount and git status done | median | range |
 |---|---|---|
-| Pando | 1.19 s | 1.15 s to 2.6 s |
-| Pando (handoff) | 1.19 s | 934 ms to 2.25 s |
+| Pando | 1.22 s | 1.16 s to 2.83 s |
+| Pando (handoff) | 1.21 s | 1.19 s to 2.32 s |
 | tar from S3 | 4.44 s | 4.41 s to 4.48 s |
 | image download from S3 | 4.72 s | 4.69 s to 4.79 s |
 | Docker (overlayfs) | 26.9 s | 26.8 s to 27.3 s |
@@ -244,8 +245,8 @@ copies every file again for each branch, so its warm start is as slow as its col
 
 | fork, mount and git status done | median | range |
 |---|---|---|
-| Pando | 1.29 s | 1.04 s to 1.35 s |
-| Pando (handoff) | 1.8 s | 1.77 s to 1.87 s |
+| Pando | 1.31 s | 1.29 s to 1.32 s |
+| Pando (handoff) | 1.75 s | 1.68 s to 1.81 s |
 | tar from S3 | 2.51 s | 2.5 s to 2.52 s |
 | image download from S3 | 2.8 s | 2.8 s to 3.12 s |
 | Docker (overlayfs) | 1.27 s | 1.23 s to 1.31 s |
@@ -262,14 +263,14 @@ copies every file again for each branch, so its warm start is as slow as its col
 
 ### Agent workload
 
-Time to run the 14 command types agents use most often in Spotlight sandboxes (`git status`,
-`tsc`, `oxlint`, `vitest`, `npm ci`, ...), expressed as a ratio to native ext4 on local NVMe.
-Each system ran the replay 3 times on a fresh branch of a warm host, page cache dropped. Native
-took 70.5 s. Most of JuiceFS's time is `npm ci`, about 9.5 min against 7.6 s; in its first
-repetition one `vitest` run failed, and it passed in the other two. SOCI, Nydus, ZeroFS and S3
-Files ran in a later run, against a native run of their own (70.3 s). On S3 Files, where every
-file operation is an NFS round trip, `npm ci` takes about 9.7 min, the first `git status` 44 s
-and the control-plane `tsc` and `vitest` 74 s and 83 s.
+Time to run the 14 command types agents use most often in Spotlight sandboxes (`git status`, `tsc`,
+`oxlint`, `vitest`, `npm ci`, ...), expressed as a ratio to native ext4 on local NVMe. Each system
+ran the replay 3 times on a fresh branch of a warm host, page cache dropped, against native in the
+same run: 71.5 s in Pando's run, 70.3 s in the run of SOCI, Nydus, ZeroFS and S3 Files, and 70.5 s
+in the first run. Most of JuiceFS's time is `npm ci`, about 9.5 min against 7.6 s; in its first
+repetition one `vitest` run failed, and it passed in the other two. On S3 Files, where every file
+operation is an NFS round trip, `npm ci` takes about 9.7 min, the first `git status` 44 s and the
+control-plane `tsc` and `vitest` 74 s and 83 s.
 
 <!-- bench:replay -->
 <picture>
@@ -282,9 +283,9 @@ and the control-plane `tsc` and `vitest` 74 s and 83 s.
 
 | total time as a ratio to native (1.00x) | median | range |
 |---|---|---|
-| native ext4 (NVMe) | 1.00x | 1.00x to 1.01x |
-| Pando | 1.07x | 1.06x to 1.17x |
-| Pando (handoff) | 1.05x | 1.04x to 1.06x |
+| native ext4 (NVMe) | 1.00x | 1.00x to 1.00x |
+| Pando | 1.03x | 1.03x to 1.16x |
+| Pando (handoff) | 1.02x | 1.02x to 1.06x |
 | image download from S3 | 1.03x | 1.03x to 1.04x |
 | Docker (overlayfs) | 1.02x | 1.02x to 1.03x |
 | SOCI lazy pull | 1.21x | 1.20x to 1.34x |
@@ -309,7 +310,7 @@ snapshot. ZeroFS's save is unmount and `nbd-client -d`, which flush the device t
 bucket. On S3 Files, `npm ci` takes about 10 min over NFS; another host's mount reads each file as
 soon as it is closed, so its save is a `sync -f` that finds nothing left. Its bytes are every
 object version written, as S3 Files stores each file as a whole object, about a minute after its
-last write. Three runs each.
+last write. Three runs each, five for Pando.
 
 <!-- bench:save -->
 <picture>
@@ -322,7 +323,7 @@ last write. Three runs each.
 
 | time to durable after npm ci | median | range |
 |---|---|---|
-| Pando | 3.37 s | 2.31 s to 8.29 s |
+| Pando | 2.65 s | 2.21 s to 5.97 s |
 | tar from S3 | 3.2 s | 3.17 s to 3.2 s |
 | Docker (overlayfs) | 41.1 s | 40.9 s to 41.2 s |
 | EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
@@ -332,7 +333,7 @@ last write. Three runs each.
 
 | uploaded after npm ci | median | range |
 |---|---|---|
-| Pando | 210 MiB | 207 MiB to 214 MiB |
+| Pando | 216 MiB | 208 MiB to 217 MiB |
 | tar from S3 | 323 MiB | 323 MiB to 323 MiB |
 | Docker (overlayfs) | 194 MiB | 194 MiB to 194 MiB |
 | EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |
@@ -345,13 +346,14 @@ last write. Three runs each.
 
 ### Raw I/O
 
-Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs each. Pando
-(ublk) comes out ahead of the local NVMe because its daemon keeps the branch in cache files read
-and written through the host's page cache: direct I/O skips the page cache of the device, not of
-the daemon, so these rows mostly measure memory. After handoff, reads go through device-mapper
-and a loop device to the image on the NVMe; writes are slow there, about 21 MB/s sequential,
-for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On ZeroFS
-every request goes over NBD to its server and on S3 Files over NFS to the file system, so a
+Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs each, five for
+Pando. Pando (ublk) reads come out ahead of the local NVMe because its daemon keeps the branch in
+cache files read through the host's page cache: direct I/O skips the page cache of the device, not
+of the daemon, so those rows mostly measure memory. Its writes do not: sequential writes match the
+NVMe, and 4 KiB random writes reach about 14k IOPS, a tenth of the NVMe's (467k IOPS in the run
+before this one). After handoff, I/O goes through device-mapper and a loop device to the image on
+the NVMe and runs at the NVMe's speed. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On
+ZeroFS every request goes over NBD to its server and on S3 Files over NFS to the file system, so a
 single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 
 <!-- bench:fio -->
@@ -366,8 +368,8 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 4 KiB random read, QD1 | median | range |
 |---|---|---|
 | local NVMe | 11k | 10.4k to 11.1k |
-| Pando (ublk) | 109k | 108k to 110k |
-| Pando (after handoff) | 6.72k | 5.99k to 7.24k |
+| Pando (ublk) | 103k | 98.4k to 104k |
+| Pando (after handoff) | 7.78k | 5.73k to 8.2k |
 | EBS gp3 | 1.54k | 1.54k to 1.6k |
 | JuiceFS | 6.37k | 5.98k to 6.58k |
 | ZeroFS (NBD) | 5.99k | 4.55k to 6.77k |
@@ -376,8 +378,8 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 4 KiB random read, 4 x QD32 | median | range |
 |---|---|---|
 | local NVMe | 269k | 269k to 269k |
-| Pando (ublk) | 814k | 813k to 817k |
-| Pando (after handoff) | 237k | 233k to 265k |
+| Pando (ublk) | 808k | 795k to 811k |
+| Pando (after handoff) | 254k | 252k to 255k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 76.7k | 76.4k to 77.3k |
 | ZeroFS (NBD) | 31.7k | 28.4k to 32.7k |
@@ -386,8 +388,8 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 4 KiB random write, 4 x QD32 | median | range |
 |---|---|---|
 | local NVMe | 134k | 134k to 134k |
-| Pando (ublk) | 467k | 455k to 481k |
-| Pando (after handoff) | 2.47k | 2.14k to 5.09k |
+| Pando (ublk) | 14.2k | 14.2k to 14.2k |
+| Pando (after handoff) | 132k | 131k to 132k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 484 | 456 to 493 |
 | ZeroFS (NBD) | 1.32k | 1.23k to 1.54k |
@@ -396,8 +398,8 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 1 MiB sequential read | median | range |
 |---|---|---|
 | local NVMe | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
-| Pando (ublk) | 6,430 MB/s | 6,419 MB/s to 6,461 MB/s |
-| Pando (after handoff) | 1,849 MB/s | 1,826 MB/s to 1,856 MB/s |
+| Pando (ublk) | 6,769 MB/s | 6,625 MB/s to 7,132 MB/s |
+| Pando (after handoff) | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,611 MB/s | 1,576 MB/s to 1,660 MB/s |
 | ZeroFS (NBD) | 545 MB/s | 529 MB/s to 594 MB/s |
@@ -406,8 +408,8 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 | 1 MiB sequential write | median | range |
 |---|---|---|
 | local NVMe | 908 MB/s | 908 MB/s to 908 MB/s |
-| Pando (ublk) | 1,689 MB/s | 1,523 MB/s to 1,806 MB/s |
-| Pando (after handoff) | 21 MB/s | 16 MB/s to 24 MB/s |
+| Pando (ublk) | 927 MB/s | 922 MB/s to 936 MB/s |
+| Pando (after handoff) | 902 MB/s | 901 MB/s to 902 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,328 MB/s | 1,317 MB/s to 1,330 MB/s |
 | ZeroFS (NBD) | 190 MB/s | 180 MB/s to 226 MB/s |
@@ -421,14 +423,24 @@ single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 The storage daemon is killed with `kill -9` while a writer writes and fsyncs 256 KiB files, and is
 restarted at once (`pando attach --recover`, a new JuiceFS mount, a new ZeroFS server on the same
 cache; S3 Files' `efs-proxy` is restarted by the efs-utils watchdog). The branch is then opened
-with a new cache and state directory, sharing nothing with the first, its file system checked
-and every acknowledged file read back. Medians of three runs. ZeroFS did not recover: its NBD
-client does not reconnect to the new server, so writes hang until the harness disconnects the
-device after 120 s. What it acknowledged before the kill was intact.
+with a new cache and state directory, sharing nothing with the first, its file system checked and
+every acknowledged file read back. Medians of three runs, five for Pando. ZeroFS did not recover:
+its NBD client does not reconnect to the new server, so writes hang until the harness disconnects
+the device after 120 s. What it acknowledged before the kill was intact.
 
 | System | Failed writes | Stall | fsck | Files correct |
 |---|---|---|---|---|
-| Pando | 0 | 0.12 s | clean | all acknowledged (1,403 to 1,438 per run) |
+| Pando | 0 (4 in one run) | 0.16 s | clean in 4 of 5 runs | all acknowledged (1,379 to 1,445 per run) |
 | JuiceFS | 2 | 0.23 s | clean | all acknowledged (264 to 270 per run) |
 | ZeroFS | 1 | did not recover | clean | all acknowledged (20 per run) |
 | Amazon S3 Files | 0 | 3.16 s | no checker | all acknowledged (348 to 352 per run) |
+
+In one of Pando's five runs the restarted daemon logged `ublk io: File exists (os error 17)`, 4
+writes failed, and the fresh host's `e2fsck -fn` found the root directory, the inode count and the
+block bitmap of one group wrong (exit 4). Every acknowledged file still read back correctly.
+
+Pando also ran a reboot case five times: the same writer, and five seconds in the host reboots
+through `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would. After the
+boot, `pando attach --recover=auto` served the branch in 3.2 s (2.8 s to 3.9 s), `e2fsck -fn` found
+the file system clean there and again on a fresh host, and every acknowledged file (804 to 836 per
+run) read back correctly on both.
