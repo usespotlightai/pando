@@ -124,8 +124,9 @@ impl SimStore {
         self.answering.send_replace(on);
     }
 
-    /// Holds every call of kind `op` on a key that starts with `prefix`: it waits without
-    /// failing until [`SimStore::release`], as a call a slow link holds up does.
+    /// Holds every call of kind `op` on a key that starts with `prefix` and that starts after
+    /// this: it waits without failing until [`SimStore::release`], as a call a slow link holds
+    /// up does. A call that started before goes on.
     pub fn hold(&self, op: StoreOp, prefix: &str) {
         self.held.send_modify(|h| h.push((op, prefix.to_string())));
     }

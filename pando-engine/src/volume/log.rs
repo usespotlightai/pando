@@ -109,6 +109,23 @@ impl Log {
     }
 }
 
+/// Marks a record in flight in [`Log::shipping`] until it drops, so a shipper that ends in any
+/// way does not leave a close waiting.
+struct Shipping<'a>(&'a watch::Sender<bool>);
+
+impl<'a> Shipping<'a> {
+    fn start(flag: &'a watch::Sender<bool>) -> Shipping<'a> {
+        flag.send_replace(true);
+        Shipping(flag)
+    }
+}
+
+impl Drop for Shipping<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
 fn chunk_bytes(f: &Flushed) -> usize {
     f.chunks.iter().filter(|c| c.1.is_some()).count() * CHUNK_SIZE
 }
@@ -499,16 +516,16 @@ impl Inner {
                     return;
                 }
             };
-            {
+            let shipping = {
                 let mut q = self.log.queue.lock();
                 if *self.log.stopped.borrow() {
                     continue;
                 }
                 q.records.push(to);
-                self.log.shipping.send_replace(true);
-            }
+                Shipping::start(&self.log.shipping)
+            };
             let created = self.put_record(n, body, &mut stop).await;
-            self.log.shipping.send_replace(false);
+            drop(shipping);
             if !created {
                 return;
             }
@@ -871,7 +888,7 @@ mod tests {
         a
     }
 
-    async fn assert_closed_clean(ports: &Ports, store: &SimStore) {
+    async fn assert_closed_clean(ports: &Ports, store: &SimStore, seed: u8) {
         assert!(log_keys(store).is_empty(), "{:?}", log_keys(store));
         let r = reference(ports).await;
         assert!(
@@ -879,6 +896,9 @@ mod tests {
                 .is_some_and(|l| l.closed && l.generation == r.generation && l.next == 1),
             "{r:?}"
         );
+        let b = open(ports, "/b", LogMode::Behind).await;
+        assert_eq!(read(&b, data(seed).len()).await, data(seed));
+        b.close().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -892,7 +912,7 @@ mod tests {
         closed.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
         a.close().await;
-        assert_closed_clean(&ports, &store).await;
+        assert_closed_clean(&ports, &store, 12).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -913,7 +933,7 @@ mod tests {
         assert!(t0.elapsed() < RETRY_AFTER / 2, "{:?}", t0.elapsed());
         tokio::time::sleep(Duration::from_secs(5)).await;
         a.close().await;
-        assert_closed_clean(&ports, &store).await;
+        assert_closed_clean(&ports, &store, 13).await;
     }
 
     #[tokio::test(start_paused = true)]
