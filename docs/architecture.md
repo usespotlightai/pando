@@ -36,6 +36,9 @@ A chunk rebuilt from a recipe or built from local blocks is checked against its 
 `Verified` type is the only way such bytes enter the engine. Detach waits until the upload is
 durable in the store.
 
+The store's `format` marker names its format version; a build refuses a store whose major
+version it does not read. See [store-format.md](store-format.md).
+
 ## Durability
 
 A flush commits locally first: the chunks go to the cache log, one sync, then the new root is

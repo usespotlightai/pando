@@ -85,6 +85,7 @@ fn shared(e: Error) -> Arc<Error> {
         | Error::ChunkLost { .. }
         | Error::Store(_)
         | Error::Format(_)
+        | Error::UnknownFormat { .. }
         | Error::Io(_)
         | Error::BeyondEnd
         | Error::Shrink { .. }

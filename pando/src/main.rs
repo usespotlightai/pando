@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use pando_engine::gc::{self, GcOptions};
+use pando_engine::store_format::{Access, check_format};
 use pando_engine::{Cache, Ports, Volume, base, branch};
-use pando_format::{Ref, keys};
+use pando_format::{Ref, StoreFormat, keys};
 use serve::Out;
 use tokio::sync::{OnceCell, watch};
 
@@ -138,6 +139,43 @@ enum Command {
     Resize(device::ResizeArgs),
 }
 
+impl Command {
+    /// How the command uses the store; `None` when it only talks to an attached device's
+    /// daemon, or runs other commands that each say for themselves.
+    fn access(&self) -> Option<Access> {
+        match self {
+            Command::Detach(_) | Command::Resize(_) | Command::Serve => None,
+            Command::Refs | Command::Stat | Command::Checkpoints | Command::Gc { delete: false, .. } => {
+                Some(Access::Read)
+            }
+            Command::Init { .. }
+            | Command::Import { .. }
+            | Command::Branch { .. }
+            | Command::Checkpoint { .. }
+            | Command::DeleteCheckpoint { .. }
+            | Command::Advance { .. }
+            | Command::Delete { .. }
+            | Command::Base { .. }
+            | Command::Follow { .. }
+            | Command::Gc { delete: true, .. }
+            | Command::Attach(_) => Some(Access::Write),
+        }
+    }
+
+    /// Whether the command works through this host's cache.
+    fn uses_cache(&self) -> bool {
+        matches!(
+            self,
+            Command::Import { .. }
+                | Command::Base { .. }
+                | Command::Follow { .. }
+                | Command::Gc { .. }
+                | Command::Stat
+                | Command::Attach(_)
+        )
+    }
+}
+
 impl Cli {
     /// Makes every path argument absolute, against `cwd` where it is relative.
     fn resolve(&mut self, cwd: &Path) {
@@ -205,13 +243,15 @@ pub(crate) fn parse_size(s: &str) -> Result<u64> {
 }
 
 /// What the commands of one process share: the ports, the cache, opened on first use, the
-/// checkpoints read so far, and the devices of attaches that drained, held until the process
-/// exits.
+/// store's format as checked so far, the checkpoints read so far, and the devices of attaches
+/// that drained, held until the process exits.
 #[derive(Debug)]
 pub(crate) struct Host {
     ports: Ports,
     cache_dir: PathBuf,
     cache: OnceCell<Arc<Cache>>,
+    readable: OnceCell<StoreFormat>,
+    marked: OnceCell<StoreFormat>,
     checkpoints: branch::Checkpoints,
     remote: String,
     identity: String,
@@ -287,6 +327,42 @@ impl Host {
         let _ = self.attaches.subscribe().wait_for(|n| *n == 0).await;
     }
 
+    /// Checks the store's format marker for `access`, once per process: a check for writing
+    /// also covers reading.
+    async fn checked(&self, access: Access) -> Result<()> {
+        if self.marked.initialized() {
+            return Ok(());
+        }
+        let cell = match access {
+            Access::Read => &self.readable,
+            Access::Write => &self.marked,
+        };
+        cell.get_or_try_init(|| async {
+            Ok::<_, anyhow::Error>(check_format(self.ports.store.as_ref(), access).await?)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Checks the store's format marker for `command` and, if the command needs it, opens the
+    /// cache alongside the check.
+    async fn prepare(&self, command: &Command) -> Result<()> {
+        let checked = async {
+            match command.access() {
+                Some(access) => self.checked(access).await,
+                None => Ok(()),
+            }
+        };
+        let opened = async {
+            if command.uses_cache() {
+                self.cache().await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(checked, opened)?;
+        Ok(())
+    }
+
     async fn cache(&self) -> Result<Arc<Cache>> {
         let c = self
             .cache
@@ -331,6 +407,8 @@ async fn start(cli: Cli) -> Result<Exit> {
         ports: pando_host::ports(cli.store.open()?, cli.cpu_threads)?,
         cache_dir: cli.cache.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE)),
         cache: OnceCell::new(),
+        readable: OnceCell::new(),
+        marked: OnceCell::new(),
         checkpoints: branch::Checkpoints::default(),
         remote: cli.store.remote().to_owned(),
         identity: cli.store.identity(),
@@ -360,6 +438,7 @@ async fn start(cli: Cli) -> Result<Exit> {
 
 /// Runs one command on `host`, writing its output to `out`.
 pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> {
+    host.prepare(&command).await?;
     let ports = &host.ports;
     let cache = || host.cache();
     match command {
@@ -590,6 +669,26 @@ mod tests {
             attach(&["main", dev[0], dev[1], "--drain-wait", "5m"]).2,
             Duration::from_secs(300)
         );
+    }
+
+    #[test]
+    fn only_commands_that_write_may_mark_the_store() {
+        let access = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("pando").chain(args.iter().copied()))
+                .unwrap()
+                .command
+                .access()
+        };
+        assert_eq!(access(&["refs"]), Some(Access::Read));
+        assert_eq!(access(&["stat"]), Some(Access::Read));
+        assert_eq!(access(&["checkpoints"]), Some(Access::Read));
+        assert_eq!(access(&["gc"]), Some(Access::Read));
+        assert_eq!(access(&["gc", "--delete"]), Some(Access::Write));
+        assert_eq!(access(&["init", "main", "4096"]), Some(Access::Write));
+        assert_eq!(access(&["branch", "main", "run-1"]), Some(Access::Write));
+        assert_eq!(access(&["checkpoint", "main", "c1"]), Some(Access::Write));
+        assert_eq!(access(&["detach", "--device", "/dev/ublkb0"]), None);
+        assert_eq!(access(&["serve"]), None);
     }
 
     #[test]

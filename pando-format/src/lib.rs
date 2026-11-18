@@ -22,6 +22,7 @@ mod node;
 mod recipe;
 mod recording;
 mod reference;
+mod store_format;
 mod verified;
 mod width;
 
@@ -42,5 +43,6 @@ pub use node::{FANOUT, Node, depth_for, digit};
 pub use recipe::{Pick, RECIPE_SOURCES_MAX, Recipe, RecipeError, Run};
 pub use recording::Recording;
 pub use reference::Ref;
+pub use store_format::StoreFormat;
 pub use verified::Verified;
 pub use width::{u64_from, usize_from};
