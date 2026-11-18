@@ -1,0 +1,17 @@
+diff --git a/tests/generic/757 b/tests/generic/757
+--- a/tests/generic/757
++++ b/tests/generic/757
+@@ -76,10 +76,9 @@ cur=$(_log_writes_find_next_fua $prev)
+ while _soak_loop_running $((100 * TIME_FACTOR)); do
+ 	_log_writes_replay_log_range $cur $DMTHIN_VOL_DEV >> $seqres.full
+ 
+-	# xfs_repair won't run if the log is dirty
+-	if [ $FSTYP = "xfs" ]; then
+-		_dmthin_mount
+-	fi
++	# Mount to replay the log first, as generic/482 does: the fsck of a
++	# journalling fs reports a dirty log as an error.
++	_dmthin_mount
+ 	_dmthin_check_fs
+ 
+ 	prev=$cur

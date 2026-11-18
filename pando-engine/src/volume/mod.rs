@@ -7,7 +7,7 @@
 //! [`LogMode::Strict`], a flush returns only once the log or an upload has it.
 
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +30,7 @@ use crate::flight::bounded;
 use crate::gate::Gate;
 use crate::local::{Journal, Record, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
-use crate::ports::{Cpu, CpuClass, FileLock, LocalFs, Version, on_cpu};
+use crate::ports::{Cpu, CpuClass, FileLock, LocalFs, Rng, StoreError, Version, on_cpu};
 use crate::remote::Remote;
 use crate::tree::Tree;
 use crate::{Error, Ports, Result};
@@ -48,6 +48,10 @@ const _: () = assert!(CHUNK_LEN as usize == CHUNK_SIZE);
 const UPLOAD_EVERY: Duration = Duration::from_secs(2);
 /// After a failed upload the uploader waits this long before the next try.
 const RETRY_AFTER: Duration = Duration::from_secs(1);
+/// The longest wait between tries while the store fails transiently; see [`backoff`].
+const RETRY_MAX: Duration = Duration::from_secs(30);
+/// How long a read, write or strict flush waits on the store by default before it fails.
+pub const STORE_WAIT: Duration = Duration::from_secs(30);
 /// Uploads in a row the store may refuse before the uploader stops. The wait before each next
 /// try doubles from [`RETRY_AFTER`], so a refusal that passes within about two minutes, such
 /// as a policy that is still propagating, does not stop it.
@@ -179,6 +183,24 @@ struct Mem {
 }
 
 impl Mem {
+    /// The state of a branch that opened at `root`, with nothing written since.
+    fn opened(root: Entry, tree: Arc<Tree>, size: u64, jfloor: u64) -> Mem {
+        Mem {
+            root,
+            tree,
+            size,
+            opened_now: root,
+            dirty: DirtySet::default(),
+            touched: HashSet::new(),
+            flushing: None,
+            jfloor,
+            dirty_ref: BTreeMap::new(),
+            track: None,
+            flush_seq: 0,
+            ref_seq: HashMap::new(),
+        }
+    }
+
     /// Records that chunk `idx` is dirty now: not the base image's, and not a reference.
     fn written(&mut self, idx: u64) {
         self.touched.insert(idx);
@@ -286,6 +308,12 @@ struct Inner {
     /// The generation the local state names: the ref's when the branch opened, this writer's
     /// once it took the branch.
     state_generation: AtomicU64,
+    /// How long device I/O waits on the store, in milliseconds; zero waits for good.
+    store_wait: AtomicU64,
+    rng: Arc<dyn Rng>,
+    /// When committed flushes not yet uploaded were committed: the earliest time of each run
+    /// of flushes, keyed by the last flush of the run.
+    unuploaded: Mutex<VecDeque<(u64, Instant)>>,
 }
 
 /// One writable branch.
@@ -408,20 +436,7 @@ impl Volume {
         let size = resume.and_then(|s| s.size).map_or(r.size, |n| n.max(r.size));
         let tree = Arc::new(Tree::new(Arc::clone(&cache), size.div_ceil(CHUNK)));
         let root = resume.map_or(r.root, |s| s.root);
-        let mem = Mem {
-            root,
-            tree: Arc::clone(&tree),
-            size,
-            opened_now: root,
-            dirty: DirtySet::default(),
-            touched: HashSet::new(),
-            flushing: None,
-            jfloor: resume.map_or(0, |s| s.jfloor),
-            dirty_ref: BTreeMap::new(),
-            track: None,
-            flush_seq: 0,
-            ref_seq: HashMap::new(),
-        };
+        let mem = Mem::opened(root, Arc::clone(&tree), size, resume.map_or(0, |s| s.jfloor));
         let inner = Arc::new(Inner {
             name: name.to_owned(),
             size: AtomicU64::new(size),
@@ -470,6 +485,9 @@ impl Volume {
             uploaded_seq: watch::Sender::new(0),
             log: log::Log::new(mode, scan.start),
             state_generation: AtomicU64::new(r.generation),
+            store_wait: AtomicU64::new(millis(STORE_WAIT)),
+            rng: Arc::clone(&ports.rng),
+            unuploaded: Mutex::default(),
         });
         inner.start_journal(resume).await?;
         let grown = size != r.size;
@@ -610,14 +628,36 @@ impl Volume {
         if misses.is_empty() {
             return Ok(());
         }
-        let futs = misses
-            .iter()
-            .map(|&(idx, at, _, n)| self.inner.read_chunk(idx, at, n));
-        let got = futures::future::join_all(futs).await;
-        for ((_, _, pos, n), b) in misses.into_iter().zip(got) {
-            p[pos..pos + n].copy_from_slice(&b?);
+        let Some(until) = self.inner.deadline() else {
+            let futs = misses
+                .iter()
+                .map(|&(idx, at, _, n)| self.inner.read_chunk(idx, at, n));
+            let got = futures::future::join_all(futs).await;
+            for ((_, _, pos, n), b) in misses.into_iter().zip(got) {
+                p[pos..pos + n].copy_from_slice(&b?);
+            }
+            return Ok(());
+        };
+        loop {
+            let futs = misses
+                .iter()
+                .map(|&(idx, at, _, n)| self.inner.read_chunk_held(idx, at, n));
+            let got = futures::future::join_all(futs).await;
+            let mut again = Vec::new();
+            for (m, b) in misses.into_iter().zip(got) {
+                let (_, _, pos, n) = m;
+                match b? {
+                    Some(b) => p[pos..pos + n].copy_from_slice(&b),
+                    None => again.push(m),
+                }
+            }
+            if again.is_empty() {
+                return Ok(());
+            }
+            let needs = again.iter().map(|&(idx, ..)| (idx, true)).collect();
+            self.inner.ready(needs, Some(until)).await?;
+            misses = again;
         }
-        Ok(())
     }
 
     /// Reads only from memory and the page cache, without waiting: `false` when it would wait.
@@ -639,10 +679,30 @@ impl Volume {
         if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
-        let writes = parts(off, p.len())
-            .into_iter()
-            .map(|(idx, at, pos, n)| self.inner.write_chunk(idx, at, &p[pos..pos + n], true));
-        futures::future::join_all(writes).await.into_iter().collect()
+        let until = self.inner.deadline();
+        let mut parts = parts(off, p.len());
+        let needs = parts.iter().map(|&(idx, .., n)| (idx, n < CHUNK_SIZE)).collect();
+        self.inner.ready(needs, until).await?;
+        loop {
+            let writes = parts.iter().map(|&(idx, at, pos, n)| {
+                self.inner
+                    .write_chunk(idx, at, &p[pos..pos + n], true, until.is_some())
+            });
+            let done = futures::future::join_all(writes).await;
+            let mut again = Vec::new();
+            for (part, applied) in parts.into_iter().zip(done) {
+                if !applied? {
+                    again.push(part);
+                }
+            }
+            if again.is_empty() {
+                return Ok(());
+            }
+            self.inner
+                .ready(again.iter().map(|&(idx, ..)| (idx, true)).collect(), until)
+                .await?;
+            parts = again;
+        }
     }
 
     /// Clears a range. Whole chunks that hold no data stay sparse.
@@ -650,12 +710,28 @@ impl Volume {
         if beyond(off, len, self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
+        let mut needs = Vec::new();
+        let mut pos = off;
+        while pos < off + len {
+            let (idx, at) = (pos / CHUNK, usize_from(pos % CHUNK));
+            let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
+            needs.push((idx, n < CHUNK_SIZE));
+            pos += u64_from(n);
+        }
+        let until = self.inner.deadline();
+        self.inner.ready(needs, until).await?;
         let mut pos = off;
         while pos < off + len {
             let (idx, at) = (pos / CHUNK, usize_from(pos % CHUNK));
             let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
             if n < CHUNK_SIZE {
-                self.inner.write_chunk(idx, at, &ZEROS[..n], true).await?;
+                while !self
+                    .inner
+                    .write_chunk(idx, at, &ZEROS[..n], true, until.is_some())
+                    .await?
+                {
+                    self.inner.ready(vec![(idx, true)], until).await?;
+                }
             } else if !self.inner.is_sparse(idx).await? {
                 self.inner.zero_chunk(idx, true).await?;
             }
@@ -734,6 +810,22 @@ impl Volume {
         self.inner.up.lock().last
     }
 
+    /// Sets how long a read, write, zero or strict flush waits on the store before it fails
+    /// with a transient store error; zero waits for good. A fetch it gave up on goes on, so
+    /// no write is half applied and a later try may find the bytes here. Opens start at
+    /// [`STORE_WAIT`].
+    pub fn set_store_wait(&self, wait: Duration) {
+        let ms = if wait.is_zero() { 0 } else { millis(wait).max(1) };
+        self.inner.store_wait.store(ms, Ordering::Relaxed);
+    }
+
+    /// How long ago the oldest committed flush that no upload has published yet committed,
+    /// to within two seconds; zero when every flush is published. It grows while the store
+    /// is unreachable.
+    pub fn upload_lag(&self) -> Duration {
+        self.inner.upload_lag()
+    }
+
     /// How this volume logs its flushes.
     pub fn log_mode(&self) -> LogMode {
         self.inner.log.mode()
@@ -796,12 +888,37 @@ fn beyond(off: u64, len: u64, size: u64) -> bool {
     off.checked_add(len).is_none_or(|end| end > size)
 }
 
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The wait before the next try after `failed` tries in a row failed: it doubles from
+/// [`RETRY_AFTER`] up to [`RETRY_MAX`], and a random part in its upper half keeps hosts that
+/// failed together from trying again together.
+fn backoff(failed: u32, rng: &dyn Rng) -> Duration {
+    let full = millis(
+        RETRY_AFTER
+            .saturating_mul(1 << failed.saturating_sub(1).min(16))
+            .min(RETRY_MAX),
+    );
+    let half = full / 2;
+    Duration::from_millis(half + rng.next_u64() % (full - half + 1))
+}
+
+/// The error of device I/O that waited `wait` on the store for `what`.
+fn unanswered(what: String, wait: Duration) -> Error {
+    Error::Store(StoreError::Transient {
+        key: what,
+        source: format!("the store did not answer within {wait:?}").into(),
+    })
+}
+
 fn is_transient(e: &Error) -> bool {
-    matches!(e.kind(), Error::Store(crate::ports::StoreError::Transient { .. }))
+    matches!(e.kind(), Error::Store(StoreError::Transient { .. }))
 }
 
 fn is_permanent(e: &Error) -> bool {
-    matches!(e.kind(), Error::Store(crate::ports::StoreError::Permanent { .. }))
+    matches!(e.kind(), Error::Store(StoreError::Permanent { .. }))
 }
 
 fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
@@ -853,7 +970,9 @@ impl Inner {
             .await?;
         for (idx, r) in writes {
             match r {
-                Record::Data(at, data) => self.write_chunk(idx, at, &data, false).await?,
+                Record::Data(at, data) => {
+                    self.write_chunk(idx, at, &data, false, false).await?;
+                }
                 Record::ZeroChunk => self.zero_chunk(idx, false).await?,
             }
         }
@@ -921,6 +1040,108 @@ impl Inner {
         self.size.store(size, Ordering::Release);
         self.kick.notify_one();
         Ok(())
+    }
+
+    fn store_wait(&self) -> Option<Duration> {
+        match self.store_wait.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    /// When device I/O that starts now must stop waiting on the store; `None` waits for good.
+    fn deadline(&self) -> Option<Instant> {
+        self.store_wait().map(|w| Instant::now() + w)
+    }
+
+    /// Whether chunk `idx` is readable without the store: its tree nodes, and with `data` its
+    /// bytes, are on this host.
+    fn is_local(&self, idx: u64, data: bool) -> bool {
+        let (tree, root) = {
+            let m = self.mem.lock();
+            if m.dirty.contains_key(idx) || m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
+                return true;
+            }
+            (Arc::clone(&m.tree), m.root)
+        };
+        if data && self.base_of(idx).is_some() {
+            return true;
+        }
+        match tree.lookup_nowait(&root, idx) {
+            None => false,
+            Some(e) if !data || e.is_empty() => true,
+            Some(e) => self.cache.holds(&e.hash),
+        }
+    }
+
+    /// Fetches what [`Self::is_local`] needs of chunk `idx`. It takes no stripe lock, so a
+    /// fetch the store does not answer holds up no write or flush.
+    async fn warm(&self, idx: u64, data: bool) -> Result<()> {
+        let (tree, root) = {
+            let m = self.mem.lock();
+            if m.dirty.contains_key(idx) || m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
+                return Ok(());
+            }
+            (Arc::clone(&m.tree), m.root)
+        };
+        if data && self.base_of(idx).is_some() {
+            return Ok(());
+        }
+        let e = tree.lookup(&root, idx, false).await?;
+        if data && !e.is_empty() {
+            self.cache.warm(&e).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches what each `(chunk, data)` of `needs` lacks, as [`Self::warm`] does, waiting
+    /// until `until` at most: device I/O then fails instead of hanging while the store does not
+    /// answer. The fetches go on after it gives up, so the next try may find them done, and a
+    /// try that finds a fetch of the same frame running waits for it instead of fetching again.
+    async fn ready(self: &Arc<Self>, mut needs: Vec<(u64, bool)>, until: Option<Instant>) -> Result<()> {
+        needs.retain(|&(idx, data)| !self.is_local(idx, data));
+        let Some(&(first, _)) = needs.first() else {
+            return Ok(());
+        };
+        let inner = Arc::clone(self);
+        let fetch = tokio::spawn(async move {
+            let futs = needs.iter().map(|&(idx, data)| inner.warm(idx, data)).collect();
+            bounded(futs, STORE_PARALLEL)
+                .await
+                .into_iter()
+                .collect::<Result<()>>()
+        });
+        let joined = match until {
+            None => fetch.await,
+            Some(until) => tokio::time::timeout_at(until, fetch).await.map_err(|_| {
+                let wait = self.store_wait().unwrap_or_default();
+                unanswered(format!("chunk {first} of {}", self.name), wait)
+            })?,
+        };
+        joined.map_err(|_| Error::Cancelled)?
+    }
+
+    /// Records that flush `seq` committed now.
+    fn committed(&self, seq: u64) {
+        let now = Instant::now();
+        let uploaded = *self.uploaded_seq.borrow();
+        let mut q = self.unuploaded.lock();
+        while q.front().is_some_and(|&(s, _)| s <= uploaded) {
+            q.pop_front();
+        }
+        match q.back_mut() {
+            Some((last, at)) if now.duration_since(*at) < UPLOAD_EVERY => *last = seq,
+            _ => q.push_back((seq, now)),
+        }
+    }
+
+    fn upload_lag(&self) -> Duration {
+        let uploaded = *self.uploaded_seq.borrow();
+        let mut q = self.unuploaded.lock();
+        while q.front().is_some_and(|&(s, _)| s <= uploaded) {
+            q.pop_front();
+        }
+        q.front().map_or(Duration::ZERO, |&(_, at)| at.elapsed())
     }
 
     fn stripe(&self, idx: u64) -> &RwLock<()> {
@@ -996,24 +1217,61 @@ impl Inner {
         self.cache.read(&e, at, n).await
     }
 
+    /// Bytes `[at, at + n)` of chunk `idx` when memory holds them, or else the tree and root
+    /// to read them from.
+    fn in_memory(&self, idx: u64, at: usize, n: usize) -> std::result::Result<Bytes, (Arc<Tree>, Entry)> {
+        let m = self.mem.lock();
+        match m.dirty.get(idx) {
+            Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
+            Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
+            None => {}
+        }
+        if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
+            return Ok(f.slice(at..at + n));
+        }
+        Err((Arc::clone(&m.tree), m.root))
+    }
+
     async fn read_chunk(&self, idx: u64, at: usize, n: usize) -> Result<Bytes> {
         let _g = self.stripe(idx).read().await;
-        let (tree, root) = {
-            let m = self.mem.lock();
-            match m.dirty.get(idx) {
-                Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
-                Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
-                None => {}
-            }
-            if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
-                return Ok(f.slice(at..at + n));
-            }
-            (Arc::clone(&m.tree), m.root)
+        let (tree, root) = match self.in_memory(idx, at, n) {
+            Ok(b) => return Ok(b),
+            Err(t) => t,
         };
         if let Some(b) = self.read_base(idx, at, n).await {
             return Ok(b);
         }
         self.read_committed(&tree, idx, &root, at, n).await
+    }
+
+    /// [`Self::read_chunk`] from this host only: `None` when it would wait on the store, which
+    /// it never does while it holds the stripe lock.
+    async fn read_chunk_held(&self, idx: u64, at: usize, n: usize) -> Result<Option<Bytes>> {
+        let _g = self.stripe(idx).read().await;
+        let (tree, root) = match self.in_memory(idx, at, n) {
+            Ok(b) => return Ok(Some(b)),
+            Err(t) => t,
+        };
+        if let Some(b) = self.read_base(idx, at, n).await {
+            return Ok(Some(b));
+        }
+        self.read_held(&tree, idx, &root, at, n).await
+    }
+
+    /// [`Self::read_committed`] from this host only: `None` when it needs the store.
+    async fn read_held(
+        &self,
+        tree: &Tree,
+        idx: u64,
+        root: &Entry,
+        at: usize,
+        n: usize,
+    ) -> Result<Option<Bytes>> {
+        match tree.lookup_nowait(root, idx) {
+            None => Ok(None),
+            Some(e) if e.is_empty() => Ok(Some(Bytes::from(vec![0; n]))),
+            Some(e) => self.cache.read_held(&e, at, n).await,
+        }
     }
 
     /// The base image's bytes of chunk `idx`, when no write since open changed it.
@@ -1087,8 +1345,17 @@ impl Inner {
 
     /// Applies one write to a chunk. The chunk's stripe lock orders writes to the same chunk,
     /// in the buffer and in the journal; writes to other chunks run in parallel. A flush takes
-    /// every stripe, so no write is half applied when it takes the dirty set.
-    async fn write_chunk(&self, idx: u64, at: usize, data: &[u8], journaled: bool) -> Result<()> {
+    /// every stripe, so no write is half applied when it takes the dirty set. With `held_only`
+    /// it never waits on the store under the lock: it applies nothing and returns `false` when
+    /// the rest of a partial chunk is not on this host.
+    async fn write_chunk(
+        &self,
+        idx: u64,
+        at: usize,
+        data: &[u8],
+        journaled: bool,
+        held_only: bool,
+    ) -> Result<bool> {
         if journaled {
             self.make_room(idx).await?;
         }
@@ -1111,6 +1378,10 @@ impl Inner {
             if !self.try_read_stored(&tree, idx, &root, 0, &mut v[..n])? {
                 let b = match self.read_base(idx, 0, n).await {
                     Some(b) => b,
+                    None if held_only => match self.read_held(&tree, idx, &root, 0, n).await? {
+                        Some(b) => b,
+                        None => return Ok(false),
+                    },
                     None => self.read_committed(&tree, idx, &root, 0, n).await?,
                 };
                 v[..b.len()].copy_from_slice(&b);
@@ -1138,7 +1409,7 @@ impl Inner {
                 m.dirty.insert(idx, Dirty::Bytes(buf));
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Keeps the dirty set's buffers near [`DIRTY_MAX`] before a write to chunk `idx`: past
@@ -1192,7 +1463,12 @@ impl Inner {
     async fn flush(&self) -> Result<()> {
         let seq = self.commit_flush().await?;
         if self.log.mode() == LogMode::Strict {
-            self.wait_logged(seq).await?;
+            match self.store_wait() {
+                None => self.wait_logged(seq).await?,
+                Some(wait) => tokio::time::timeout(wait, self.wait_logged(seq))
+                    .await
+                    .map_err(|_| unanswered(format!("the write log of {}", self.name), wait))??,
+            }
         }
         Ok(())
     }
@@ -1251,6 +1527,7 @@ impl Inner {
                     }
                     (seq, m.size)
                 };
+                self.committed(seq);
                 self.persist().await?;
                 self.journal.drop_below(generation).await;
                 let chunks = updates
@@ -1357,6 +1634,7 @@ impl Inner {
             }
         }
         let mut refused = 0;
+        let mut failed = 0;
         loop {
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => return,
@@ -1366,6 +1644,7 @@ impl Inner {
             let e = match self.upload().await {
                 Ok(()) => {
                     refused = 0;
+                    failed = 0;
                     continue;
                 }
                 Err(e) => e,
@@ -1382,7 +1661,8 @@ impl Inner {
                 }
                 RETRY_AFTER * (1 << (refused - 1))
             } else {
-                RETRY_AFTER
+                failed += 1;
+                backoff(failed, self.rng.as_ref())
             };
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => return,

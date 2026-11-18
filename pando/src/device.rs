@@ -150,6 +150,10 @@ pub(crate) struct AttachArgs {
     /// log in the store has it (not with --images); `off` leaves it to the next upload.
     #[arg(long, value_enum, default_value_t = Log::Behind)]
     pub(crate) log: Log,
+    /// How long a read, write or strict flush of the device waits on the store before it
+    /// fails with EIO, so no process hangs while the store is unreachable (0: for good).
+    #[arg(long, value_parser = crate::parse_duration, default_value = "30s")]
+    pub(crate) store_wait: Duration,
 }
 
 /// How `attach` logs flushes; see [`pando_engine::LogMode`].
@@ -246,7 +250,7 @@ mod linux {
 
     use anyhow::{Context, Result, bail};
     use pando_engine::ports::DeviceSwitch;
-    use pando_engine::{AttachOptions, Attachment, Cache, Ports};
+    use pando_engine::{AttachOptions, Attachment, Cache, Ports, Volume};
     use pando_format::Hash;
     use pando_linux::{Daemon, DmSwitch, Frontend, FrontendOptions, FuseFrontend, FuseOptions};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -263,6 +267,12 @@ mod linux {
     const CONTROL_DIR: &str = "/run/pando";
     /// How long a daemon waits for the request of a client that connected.
     const REQUEST_WAIT: Duration = Duration::from_secs(5);
+    /// How far uploads may fall behind the flushes before the daemon reports it degraded.
+    const LAGGING: Duration = Duration::from_secs(60);
+    /// How far behind uploads may be once the daemon reports them caught up: flushes that come
+    /// every few seconds keep the lag above zero even while uploads keep up.
+    const CAUGHT_UP: Duration = Duration::from_secs(10);
+    const LAG_CHECK: Duration = Duration::from_secs(5);
 
     /// Serves branch `a.name` until `detach` stops its device, then publishes it, or until a
     /// signal drains it. `store` names the store, so chunks learned from one store never serve
@@ -501,10 +511,39 @@ mod linux {
     /// Reports why the uploads of branch `name` stopped, once they stop for good.
     fn watch_uploads(att: &Attachment, name: &str, out: &Out) -> JoinHandle<()> {
         let (v, name, out) = (Arc::clone(att.volume()), name.to_owned(), out.clone());
-        tokio::spawn(async move {
-            let e = v.upload_stopped().await;
-            out.err(format!("uploads of {name} stopped: {e}"));
-        })
+        tokio::spawn(async move { watch_lag(&v, &name, &out).await })
+    }
+
+    /// Reports when the uploads of branch `name` fall more than [`LAGGING`] behind its flushes,
+    /// as they do while the store is unreachable, and when they catch up; returns once they stop
+    /// for good.
+    async fn watch_lag(v: &Volume, name: &str, out: &Out) {
+        let mut lagging = false;
+        loop {
+            tokio::select! {
+                e = v.upload_stopped() => {
+                    out.err(format!("uploads of {name} stopped: {e}"));
+                    return;
+                }
+                () = tokio::time::sleep(LAG_CHECK) => {}
+            }
+            let lag = v.upload_lag();
+            if !lagging && lag >= LAGGING {
+                lagging = true;
+                out.err(format!(
+                    "uploads of {name} are {lag:.0?} behind the flushes: the writes since are on this host only"
+                ));
+                if out.is_stdio() {
+                    notify(&format!("STATUS=degraded: uploads {lag:.0?} behind"));
+                }
+            } else if lagging && lag < CAUGHT_UP {
+                lagging = false;
+                out.line(format!("uploads of {name} caught up"));
+                if out.is_stdio() {
+                    notify("STATUS=serving");
+                }
+            }
+        }
     }
 
     /// Publishes the branch as [`finish`] does, and leaves an error for the `detach` that
@@ -664,6 +703,7 @@ mod linux {
             hydrate: a.hydrate,
             rejoin,
             log: a.log.into(),
+            store_wait: Some(a.store_wait),
         }
     }
 
@@ -1028,7 +1068,7 @@ mod linux {
 
     /// Stops the device of `d`. A live daemon publishes the branch before the device is
     /// deleted, so this returns once the branch is in the store, or fails with why the daemon
-    /// could not publish it.
+    /// could not publish it. A device an earlier detach stopped is only waited for again.
     pub(crate) async fn detach(d: DetachArgs) -> Result<()> {
         if let Some(dir) = &d.fuse {
             return detach_fuse(dir, d.force, d.publish_wait).await;
@@ -1081,6 +1121,10 @@ mod linux {
     /// Stops ublk device `device`, as [`detach`] does.
     async fn detach_ublk(d: &DetachArgs, device: &Path) -> Result<()> {
         let id = pando_linux::device_id(device)?;
+        if !device.exists() && Path::new(&format!("/dev/ublkc{id}")).exists() {
+            pando_linux::delete(id, d.publish_wait).await?;
+            return published(Path::new(CONTROL_DIR), id, device);
+        }
         let switch = DmSwitch::new();
         if !d.force {
             if let Some(dm) = &d.dm {

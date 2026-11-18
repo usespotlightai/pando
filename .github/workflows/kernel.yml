@@ -1,16 +1,16 @@
 name: kernel
 
 # The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
-# container (tests/kernel). fio verify, the crash checks, discard, drain, the FUSE frontend and
-# the daemon's memory in a small cgroup run on every push to main; xfstests and the
-# dm-log-writes tests run each night, since the quick group takes hours. The FUSE frontend and
-# the memory test also run on an aarch64 runner, the architecture of AgentCore Runtime, whose
-# kernels offer FUSE and loop devices but not ublk.
+# container (tests/kernel). fio verify, the crash checks, discard, drain, the store outage, the
+# FUSE frontend and the daemon's memory in a small cgroup run on every push to main; the
+# dm-log-writes tests run each night. xfstests has its own workflow, xfstests.yml. The FUSE
+# frontend and the memory test also run on an aarch64 runner, the architecture of AgentCore
+# Runtime, whose kernels offer FUSE and loop devices but not ublk.
 # The systemd test also runs on every push: on the runner itself, it installs pando with
 # packaging/install.sh and runs a branch under the pando-attach@ unit (tests/systemd).
 # Start any of them by hand from the Actions tab. The nightly run also builds pando with
-# AddressSanitizer and runs fio verify, the crash checks, discard and drain against that build;
-# any sanitizer report fails the job.
+# AddressSanitizer and runs fio verify, the crash checks, discard, drain and the store outage
+# against that build; any sanitizer report fails the job.
 
 on:
   push:
@@ -22,7 +22,7 @@ on:
       tests:
         description: "Tests to run, from tests/kernel, or systemd"
         type: string
-        default: "fio-verify crash discard drain fuse memory systemd"
+        default: "fio-verify crash discard drain outage fuse memory systemd"
       asan:
         description: "Build pando with AddressSanitizer"
         type: boolean
@@ -55,9 +55,9 @@ jobs:
           ASKED: ${{ inputs.tests }}
         run: |
           case $EVENT in
-            schedule) tests="xfstests log-writes" ;;
+            schedule) tests="log-writes" ;;
             workflow_dispatch) tests=$ASKED ;;
-            *) tests="fio-verify crash discard drain fuse memory systemd" ;;
+            *) tests="fio-verify crash discard drain outage fuse memory systemd" ;;
           esac
           case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel, or systemd" >&2; exit 2 ;; esac
           inside=
@@ -200,7 +200,7 @@ jobs:
         run: |
           sudo mkdir -p "$DATA"
           status=0
-          tests/kernel/host.sh fio-verify crash discard drain || status=$?
+          tests/kernel/host.sh fio-verify crash discard drain outage || status=$?
           if compgen -G "$RESULTS/asan.*" > /dev/null; then
             cat "$RESULTS"/asan.*
             exit 1

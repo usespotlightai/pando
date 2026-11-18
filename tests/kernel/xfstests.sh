@@ -4,7 +4,8 @@
 # container decide the rest. Tests in xfstests.known are pando failures with a known cause.
 # The dm-log-writes tests get a loop device over a sparse file as LOGWRITES_DEV.
 # TESTS goes to ./check (default "-g quick"). DEVS picks the runs (default "loop pando").
-# XFST_NAME names the results (default xfstests). MUST_RUN=1 makes a test that does not run a
+# XFST_NAME names the results (default xfstests); each run keeps the kernel log and the files
+# of each failed test under its own directory. MUST_RUN=1 makes a test that does not run a
 # failure. ublk ids 64-65.
 TEST=${XFST_NAME:-xfstests}
 # shellcheck source=SCRIPTDIR/lib.sh
@@ -81,12 +82,19 @@ run() {
 		export LOGWRITES_DEV=$ld
 		export MKFS_OPTIONS="-b 4096"
 	EOF
+	dmesg -W >"$out/dmesg.txt" 2>&1 &
+	local dpid=$!
 	mark "$TEST start $devs $$"
 	(cd "$XFST" && ./check -E "$here/xfstests.exclude" "${tests[@]}" >"$out/check.out" 2>&1)
 	local rc=$?
+	kill "$dpid" 2>/dev/null
+	wait "$dpid" 2>/dev/null
 	cp "$XFST/results/check.log" "$out/" 2>/dev/null
-	cp "$XFST/results/"*/*.out.bad "$XFST/results/"*/*.full "$XFST/results/"*/*.dmesg "$out/" 2>/dev/null
-	dmesg | sed -n "/$TEST start $devs $$/,\$p" >"$out/dmesg.txt"
+	local d
+	for d in "$XFST/results/"*/; do
+		mkdir -p "$out/$(basename "$d")"
+		cp "$d"*.out.bad "$d"*.full "$d"*.dmesg "$out/$(basename "$d")/" 2>/dev/null
+	done
 	grep -E "^(Ran|Not run|Failures|Passed)" "$out/check.out" | sed "s/^/$devs: /" | tee -a "$R/$TEST.log"
 	grep "^Failures:" "$out/check.out" | cut -d: -f2 | tr ' ' '\n' | sed '/^$/d' | sort >"$W/failed-$devs"
 	stopall
