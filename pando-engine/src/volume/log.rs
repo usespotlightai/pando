@@ -356,7 +356,7 @@ impl Inner {
             }
             for (idx, c) in w.chunks {
                 let data: &[u8] = c.as_ref().map_or(&zeros, |v| v.bytes());
-                self.write_chunk(idx, 0, data, true).await?;
+                self.write_chunk(idx, 0, data, true, false).await?;
             }
         }
         self.commit_flush().await.map(drop)

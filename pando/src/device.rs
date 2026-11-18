@@ -237,6 +237,9 @@ mod linux {
     const REQUEST_WAIT: Duration = Duration::from_secs(5);
     /// How far uploads may fall behind the flushes before the daemon reports it degraded.
     const LAGGING: Duration = Duration::from_secs(60);
+    /// How far behind uploads may be once the daemon reports them caught up: flushes that come
+    /// every few seconds keep the lag above zero even while uploads keep up.
+    const CAUGHT_UP: Duration = Duration::from_secs(10);
     const LAG_CHECK: Duration = Duration::from_secs(5);
 
     /// Serves branch `a.name` until `detach` stops its device, then publishes it, or until a
@@ -376,7 +379,7 @@ mod linux {
                 if out.is_stdio() {
                     notify(&format!("STATUS=degraded: uploads {lag:.0?} behind"));
                 }
-            } else if lagging && lag.is_zero() {
+            } else if lagging && lag < CAUGHT_UP {
                 lagging = false;
                 out.line(format!("uploads of {name} caught up"));
                 if out.is_stdio() {

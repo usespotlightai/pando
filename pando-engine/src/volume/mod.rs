@@ -565,17 +565,36 @@ impl Volume {
         if misses.is_empty() {
             return Ok(());
         }
-        self.inner
-            .ready(misses.iter().map(|&(idx, ..)| (idx, true)).collect())
-            .await?;
-        let futs = misses
-            .iter()
-            .map(|&(idx, at, _, n)| self.inner.read_chunk(idx, at, n));
-        let got = futures::future::join_all(futs).await;
-        for ((_, _, pos, n), b) in misses.into_iter().zip(got) {
-            p[pos..pos + n].copy_from_slice(&b?);
+        let Some(until) = self.inner.deadline() else {
+            let futs = misses
+                .iter()
+                .map(|&(idx, at, _, n)| self.inner.read_chunk(idx, at, n));
+            let got = futures::future::join_all(futs).await;
+            for ((_, _, pos, n), b) in misses.into_iter().zip(got) {
+                p[pos..pos + n].copy_from_slice(&b?);
+            }
+            return Ok(());
+        };
+        loop {
+            let futs = misses
+                .iter()
+                .map(|&(idx, at, _, n)| self.inner.read_chunk_held(idx, at, n));
+            let got = futures::future::join_all(futs).await;
+            let mut again = Vec::new();
+            for (m, b) in misses.into_iter().zip(got) {
+                let (_, _, pos, n) = m;
+                match b? {
+                    Some(b) => p[pos..pos + n].copy_from_slice(&b),
+                    None => again.push(m),
+                }
+            }
+            if again.is_empty() {
+                return Ok(());
+            }
+            let needs = again.iter().map(|&(idx, ..)| (idx, true)).collect();
+            self.inner.ready(needs, Some(until)).await?;
+            misses = again;
         }
-        Ok(())
     }
 
     /// Reads only from memory and the page cache, without waiting: `false` when it would wait.
@@ -597,13 +616,30 @@ impl Volume {
         if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
-        let parts = parts(off, p.len());
+        let until = self.inner.deadline();
+        let mut parts = parts(off, p.len());
         let needs = parts.iter().map(|&(idx, .., n)| (idx, n < CHUNK_SIZE)).collect();
-        self.inner.ready(needs).await?;
-        let writes = parts
-            .into_iter()
-            .map(|(idx, at, pos, n)| self.inner.write_chunk(idx, at, &p[pos..pos + n], true));
-        futures::future::join_all(writes).await.into_iter().collect()
+        self.inner.ready(needs, until).await?;
+        loop {
+            let writes = parts.iter().map(|&(idx, at, pos, n)| {
+                self.inner
+                    .write_chunk(idx, at, &p[pos..pos + n], true, until.is_some())
+            });
+            let done = futures::future::join_all(writes).await;
+            let mut again = Vec::new();
+            for (part, applied) in parts.into_iter().zip(done) {
+                if !applied? {
+                    again.push(part);
+                }
+            }
+            if again.is_empty() {
+                return Ok(());
+            }
+            self.inner
+                .ready(again.iter().map(|&(idx, ..)| (idx, true)).collect(), until)
+                .await?;
+            parts = again;
+        }
     }
 
     /// Clears a range. Whole chunks that hold no data stay sparse.
@@ -619,13 +655,20 @@ impl Volume {
             needs.push((idx, n < CHUNK_SIZE));
             pos += u64_from(n);
         }
-        self.inner.ready(needs).await?;
+        let until = self.inner.deadline();
+        self.inner.ready(needs, until).await?;
         let mut pos = off;
         while pos < off + len {
             let (idx, at) = (pos / CHUNK, usize_from(pos % CHUNK));
             let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
             if n < CHUNK_SIZE {
-                self.inner.write_chunk(idx, at, &ZEROS[..n], true).await?;
+                while !self
+                    .inner
+                    .write_chunk(idx, at, &ZEROS[..n], true, until.is_some())
+                    .await?
+                {
+                    self.inner.ready(vec![(idx, true)], until).await?;
+                }
             } else if !self.inner.is_sparse(idx).await? {
                 self.inner.zero_chunk(idx, true).await?;
             }
@@ -853,7 +896,9 @@ impl Inner {
             .await?;
         for (idx, r) in writes {
             match r {
-                Record::Data(at, data) => self.write_chunk(idx, at, &data, false).await?,
+                Record::Data(at, data) => {
+                    self.write_chunk(idx, at, &data, false, false).await?;
+                }
                 Record::ZeroChunk => self.zero_chunk(idx, false).await?,
             }
         }
@@ -930,6 +975,11 @@ impl Inner {
         }
     }
 
+    /// When device I/O that starts now must stop waiting on the store; `None` waits for good.
+    fn deadline(&self) -> Option<Instant> {
+        self.store_wait().map(|w| Instant::now() + w)
+    }
+
     /// Whether chunk `idx` is readable without the store: its tree nodes, and with `data` its
     /// bytes, are on this host.
     fn is_local(&self, idx: u64, data: bool) -> bool {
@@ -946,7 +996,7 @@ impl Inner {
         match tree.lookup_nowait(&root, idx) {
             None => false,
             Some(e) if !data || e.is_empty() => true,
-            Some(e) => matches!(self.cache.read_nowait(&e, 0, &mut [0]), Ok(true)),
+            Some(e) => self.cache.holds(&e.hash),
         }
     }
 
@@ -970,10 +1020,11 @@ impl Inner {
         Ok(())
     }
 
-    /// Fetches what each `(chunk, data)` of `needs` lacks, as [`Self::warm`] does, waiting at
-    /// most the store wait: device I/O then fails instead of hanging while the store does not
-    /// answer. The fetches go on after it gives up, so the next try may find them done.
-    async fn ready(self: &Arc<Self>, mut needs: Vec<(u64, bool)>) -> Result<()> {
+    /// Fetches what each `(chunk, data)` of `needs` lacks, as [`Self::warm`] does, waiting
+    /// until `until` at most: device I/O then fails instead of hanging while the store does not
+    /// answer. The fetches go on after it gives up, so the next try may find them done, and a
+    /// try that finds a fetch of the same frame running waits for it instead of fetching again.
+    async fn ready(self: &Arc<Self>, mut needs: Vec<(u64, bool)>, until: Option<Instant>) -> Result<()> {
         needs.retain(|&(idx, data)| !self.is_local(idx, data));
         let Some(&(first, _)) = needs.first() else {
             return Ok(());
@@ -986,11 +1037,12 @@ impl Inner {
                 .into_iter()
                 .collect::<Result<()>>()
         });
-        let joined = match self.store_wait() {
+        let joined = match until {
             None => fetch.await,
-            Some(wait) => tokio::time::timeout(wait, fetch)
-                .await
-                .map_err(|_| unanswered(format!("chunk {first} of {}", self.name), wait))?,
+            Some(until) => tokio::time::timeout_at(until, fetch).await.map_err(|_| {
+                let wait = self.store_wait().unwrap_or_default();
+                unanswered(format!("chunk {first} of {}", self.name), wait)
+            })?,
         };
         joined.map_err(|_| Error::Cancelled)?
     }
@@ -1091,24 +1143,61 @@ impl Inner {
         self.cache.read(&e, at, n).await
     }
 
+    /// Bytes `[at, at + n)` of chunk `idx` when memory holds them, or else the tree and root
+    /// to read them from.
+    fn in_memory(&self, idx: u64, at: usize, n: usize) -> std::result::Result<Bytes, (Arc<Tree>, Entry)> {
+        let m = self.mem.lock();
+        match m.dirty.get(&idx) {
+            Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
+            Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
+            None => {}
+        }
+        if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
+            return Ok(f.slice(at..at + n));
+        }
+        Err((Arc::clone(&m.tree), m.root))
+    }
+
     async fn read_chunk(&self, idx: u64, at: usize, n: usize) -> Result<Bytes> {
         let _g = self.stripe(idx).read().await;
-        let (tree, root) = {
-            let m = self.mem.lock();
-            match m.dirty.get(&idx) {
-                Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
-                Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
-                None => {}
-            }
-            if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
-                return Ok(f.slice(at..at + n));
-            }
-            (Arc::clone(&m.tree), m.root)
+        let (tree, root) = match self.in_memory(idx, at, n) {
+            Ok(b) => return Ok(b),
+            Err(t) => t,
         };
         if let Some(b) = self.read_base(idx, at, n).await {
             return Ok(b);
         }
         self.read_committed(&tree, idx, &root, at, n).await
+    }
+
+    /// [`Self::read_chunk`] from this host only: `None` when it would wait on the store, which
+    /// it never does while it holds the stripe lock.
+    async fn read_chunk_held(&self, idx: u64, at: usize, n: usize) -> Result<Option<Bytes>> {
+        let _g = self.stripe(idx).read().await;
+        let (tree, root) = match self.in_memory(idx, at, n) {
+            Ok(b) => return Ok(Some(b)),
+            Err(t) => t,
+        };
+        if let Some(b) = self.read_base(idx, at, n).await {
+            return Ok(Some(b));
+        }
+        self.read_held(&tree, idx, &root, at, n).await
+    }
+
+    /// [`Self::read_committed`] from this host only: `None` when it needs the store.
+    async fn read_held(
+        &self,
+        tree: &Tree,
+        idx: u64,
+        root: &Entry,
+        at: usize,
+        n: usize,
+    ) -> Result<Option<Bytes>> {
+        match tree.lookup_nowait(root, idx) {
+            None => Ok(None),
+            Some(e) if e.is_empty() => Ok(Some(Bytes::from(vec![0; n]))),
+            Some(e) => self.cache.read_held(&e, at, n).await,
+        }
     }
 
     /// The base image's bytes of chunk `idx`, when no write since open changed it.
@@ -1182,8 +1271,17 @@ impl Inner {
 
     /// Applies one write to a chunk. The chunk's stripe lock orders writes to the same chunk,
     /// in the buffer and in the journal; writes to other chunks run in parallel. A flush takes
-    /// every stripe, so no write is half applied when it takes the dirty set.
-    async fn write_chunk(&self, idx: u64, at: usize, data: &[u8], journaled: bool) -> Result<()> {
+    /// every stripe, so no write is half applied when it takes the dirty set. With `held_only`
+    /// it never waits on the store under the lock: it applies nothing and returns `false` when
+    /// the rest of a partial chunk is not on this host.
+    async fn write_chunk(
+        &self,
+        idx: u64,
+        at: usize,
+        data: &[u8],
+        journaled: bool,
+        held_only: bool,
+    ) -> Result<bool> {
         let _g = self.stripe(idx).write().await;
         let (dirty, flushing, tree, root, size) = {
             let m = self.mem.lock();
@@ -1203,6 +1301,10 @@ impl Inner {
             if !self.try_read_stored(&tree, idx, &root, 0, &mut v[..n])? {
                 let b = match self.read_base(idx, 0, n).await {
                     Some(b) => b,
+                    None if held_only => match self.read_held(&tree, idx, &root, 0, n).await? {
+                        Some(b) => b,
+                        None => return Ok(false),
+                    },
                     None => self.read_committed(&tree, idx, &root, 0, n).await?,
                 };
                 v[..b.len()].copy_from_slice(&b);
@@ -1230,7 +1332,7 @@ impl Inner {
                 m.dirty.insert(idx, Dirty::Bytes(buf));
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Makes chunk `idx` all zeros, as [`Self::write_chunk`] would with a chunk of zeros.

@@ -259,6 +259,28 @@ impl Cache {
         self.read_counted(e, 0, 1, false).await.map(drop)
     }
 
+    /// Whether this host holds object `h` itself, so a read of it needs no store. Counts no hit
+    /// and leaves its age as it is.
+    pub(crate) fn holds(&self, h: &Hash) -> bool {
+        self.log.has(h) || self.base_has(h)
+    }
+
+    /// [`Self::read`] from this host only: `None` when the read would fetch from the store.
+    pub(crate) async fn read_held(&self, e: &Entry, inner: usize, len: usize) -> Result<Option<Bytes>> {
+        let b = match self.log.read_at(&e.hash, inner, len).await? {
+            Some(b) => {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                b
+            }
+            None => match self.base_read(&e.hash, inner, len).await {
+                Some(b) => b,
+                None => return Ok(None),
+            },
+        };
+        self.touched(e);
+        Ok(Some(b))
+    }
+
     async fn read_as(&self, e: &Entry, inner: usize, len: usize) -> Result<Bytes> {
         self.read_counted(e, inner, len, true).await
     }
