@@ -17,20 +17,27 @@ use crate::ports::{LocalFile, LocalFs, Open};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn tmp_path(p: &Path) -> PathBuf {
-    let mut s = p.as_os_str().to_owned();
-    s.push(format!(".{}.tmp", TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
-    PathBuf::from(s)
-}
+/// How many names in a row [`create_tmp`] tries when each one exists already, before it fails.
+const TMP_TRIES: u64 = 1 << 16;
 
-/// Creates a new temporary file next to `p` and returns its path. A name that exists already
-/// is skipped, never reused: a process killed before its rename leaves its file behind, and the
-/// counter of a restarted process starts again at the names it used.
-async fn create_tmp(fs: &dyn LocalFs, p: &Path) -> io::Result<(PathBuf, Arc<dyn LocalFile>)> {
+/// Creates a new temporary file next to `p` and returns its path. The name takes the next value
+/// of `seq`, and a name that exists already is skipped, never reused: a process killed before its
+/// rename leaves its file behind, and the counter of a restarted process starts again at the
+/// names it used. The counter only goes up, so a process skips each such name once.
+async fn create_tmp(
+    fs: &dyn LocalFs,
+    p: &Path,
+    seq: &AtomicU64,
+) -> io::Result<(PathBuf, Arc<dyn LocalFile>)> {
+    let mut taken = 0;
     loop {
-        let tmp = tmp_path(p);
+        let mut s = p.as_os_str().to_owned();
+        s.push(format!(".{}.tmp", seq.fetch_add(1, Ordering::Relaxed)));
+        let tmp = PathBuf::from(s);
         match fs.open(&tmp, Open::CreateNew).await {
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && taken + 1 < TMP_TRIES => {
+                taken += 1;
+            }
             opened => return opened.map(|f| (tmp, f)),
         }
     }
@@ -41,7 +48,7 @@ async fn create_tmp(fs: &dyn LocalFs, p: &Path) -> io::Result<(PathBuf, Arc<dyn 
 pub(crate) async fn write_durable(fs: &dyn LocalFs, p: &Path, b: Bytes) -> io::Result<()> {
     let dir = p.parent().unwrap_or_else(|| Path::new(""));
     fs.create_dir_all(dir).await?;
-    let (tmp, f) = create_tmp(fs, p).await?;
+    let (tmp, f) = create_tmp(fs, p, &TMP_SEQ).await?;
     f.write_at(vec![b], 0).await?;
     f.sync_data().await?;
     fs.rename(&tmp, p).await?;
@@ -52,7 +59,7 @@ pub(crate) async fn write_durable(fs: &dyn LocalFs, p: &Path, b: Bytes) -> io::R
 pub(crate) async fn write_atomic(fs: &dyn LocalFs, p: &Path, b: Bytes) -> io::Result<()> {
     let dir = p.parent().unwrap_or_else(|| Path::new(""));
     fs.create_dir_all(dir).await?;
-    let (tmp, f) = create_tmp(fs, p).await?;
+    let (tmp, f) = create_tmp(fs, p, &TMP_SEQ).await?;
     f.write_at(vec![b], 0).await?;
     fs.rename(&tmp, p).await
 }
@@ -82,13 +89,9 @@ mod tests {
     use super::*;
     use crate::sim::SimFs;
 
-    #[tokio::test]
-    async fn temporary_files_a_killed_process_left_do_not_block_a_replace() {
-        let fs = SimFs::default();
-        let p = Path::new("/c/objects.synced");
+    async fn leave_stale(fs: &SimFs, seqs: std::ops::Range<u64>) {
         fs.create_dir_all(Path::new("/c")).await.unwrap();
-        let next = TMP_SEQ.load(Ordering::Relaxed);
-        for seq in next..next + 1000 {
+        for seq in seqs {
             let stale = fs
                 .open(
                     &PathBuf::from(format!("/c/objects.synced.{seq}.tmp")),
@@ -101,15 +104,44 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_restarted_process_skips_the_temporary_files_a_killed_one_left() {
+        let fs = SimFs::default();
+        let p = Path::new("/c/objects.synced");
+        leave_stale(&fs, 0..1000).await;
+        let restarted = AtomicU64::new(0);
+        let (tmp, _) = create_tmp(&fs, p, &restarted).await.unwrap();
+        assert_eq!(tmp, Path::new("/c/objects.synced.1000.tmp"));
+        assert_eq!(
+            read_file(&fs, Path::new("/c/objects.synced.999.tmp"))
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"stale"))
+        );
+        let (tmp, _) = create_tmp(&fs, p, &restarted).await.unwrap();
+        assert_eq!(tmp, Path::new("/c/objects.synced.1001.tmp"));
+    }
+
+    #[tokio::test]
+    async fn a_temporary_name_is_not_searched_for_without_end() {
+        let fs = SimFs::default();
+        leave_stale(&fs, 0..TMP_TRIES).await;
+        let err = create_tmp(&fs, Path::new("/c/objects.synced"), &AtomicU64::new(0))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn replaces_write_the_new_content() {
+        let fs = SimFs::default();
+        let p = Path::new("/c/objects.synced");
         write_atomic(&fs, p, Bytes::from_static(b"42")).await.unwrap();
-        assert_eq!(
-            read_file(&fs, p).await.unwrap().unwrap(),
-            Bytes::from_static(b"42")
-        );
+        assert_eq!(read_file(&fs, p).await.unwrap(), Some(Bytes::from_static(b"42")));
         write_durable(&fs, p, Bytes::from_static(b"43")).await.unwrap();
-        assert_eq!(
-            read_file(&fs, p).await.unwrap().unwrap(),
-            Bytes::from_static(b"43")
-        );
+        assert_eq!(read_file(&fs, p).await.unwrap(), Some(Bytes::from_static(b"43")));
     }
 }

@@ -346,6 +346,15 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_file_over_an_existing_one_is_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        HostFs.open(&a, Open::CreateNew).await.unwrap();
+        let err = HostFs.open(&a, Open::CreateNew).await.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn files_write_read_clone_and_punch() {
         let dir = tempfile::tempdir().unwrap();
         let fs = HostFs;
