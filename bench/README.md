@@ -112,6 +112,13 @@ base where it would in production, and every branch is opened on the bench host:
   | EBS snapshot to volume | unmount, `create-snapshot`, until it completes | blocks the snapshot holds beyond the workspace snapshot (`ListChangedBlocks`) |
   | JuiceFS | `sync` of the mount; data uploads as each file closes, metadata is in SQLite on the host | growth of its bucket prefix |
 
+  Pando's time is also split into the unmount, `pando detach` and the end of `pando attach`,
+  with the publish's own flush, upload wait, pack and ref times, the bytes the device took
+  during `npm ci` and during the unmount, the page cache's dirty bytes before the unmount, and
+  what the uploads put before and during the detach (`save.*` rows in `save.csv`).
+  `pando-capped` is Pando attached with `--dirty-limit` at 64 MiB, so the kernel writes the
+  branch back while `npm ci` runs.
+
 - **fio** opens a fresh branch on a warm host, lays out one 1 GiB file and runs each job for 20 s
   after a 2 s ramp with direct I/O, page cache dropped before each job. Pando (after handoff)
   waits until the device has switched to its local image. Local NVMe is the `/native` ext4 file

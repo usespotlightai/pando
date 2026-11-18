@@ -20,6 +20,7 @@ use pando_format::{
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::base::{BaseView, Bases};
 use crate::cache::Cache;
@@ -143,6 +144,38 @@ struct Up {
     gen_taken: bool,
     error: Option<Arc<Error>>,
     last: Option<PackStats>,
+    /// Upload passes that moved the ref since the branch opened, and the segment bytes they put.
+    passes: u64,
+    put_bytes: u64,
+    last_times: Option<PassTimes>,
+}
+
+/// How long the parts of one upload pass took.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PassTimes {
+    /// Packing the pending objects and putting their segments and the change list.
+    pub pack: Duration,
+    /// Recording the packed root on this host and moving the branch's ref.
+    pub publish: Duration,
+}
+
+/// What [`Volume::checkpoint_report`] did.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckpointReport {
+    /// Committing the completed writes on this host.
+    pub flush: Duration,
+    /// From the end of the flush until the store had everything.
+    pub wait: Duration,
+    /// Upload passes that moved the ref before the checkpoint started.
+    pub passes_before: u64,
+    /// The segment bytes those passes put.
+    pub bytes_before: u64,
+    /// Upload passes that moved the ref during the checkpoint.
+    pub passes: u64,
+    /// The segment bytes those passes put.
+    pub bytes: u64,
+    /// The last of those passes; `None` when there was none.
+    pub last: Option<PassTimes>,
 }
 
 #[derive(Debug)]
@@ -296,11 +329,8 @@ impl Volume {
             .ok_or_else(|| Error::Corrupt(format!("open {name}: no such branch")))?;
         let generation = r.generation + 1;
         let state_path = dir.join("state").join(name);
-        let state_lock = lock_state(ports.fs.as_ref(), &state_path).await?;
+        let (state_lock, state) = open_state(ports.fs.as_ref(), &state_path).await?;
         let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
-        let state = read_file(ports.fs.as_ref(), &state_path)
-            .await?
-            .and_then(|b| VolState::decode(&b));
         let resume = state.filter(|s| s.resumes(&r));
         let scan = match resume {
             Some(_) => log::Scan::resumed(&r),
@@ -354,6 +384,9 @@ impl Volume {
                 gen_taken: false,
                 error: None,
                 last: None,
+                passes: 0,
+                put_bytes: 0,
+                last_times: None,
             }),
             changed: watch::Sender::new(0),
             kick: Notify::new(),
@@ -571,8 +604,19 @@ impl Volume {
 
     /// Flushes and waits until everything is published in the store.
     pub async fn checkpoint(&self) -> Result<()> {
+        self.checkpoint_report().await.map(|_| ())
+    }
+
+    /// [`Self::checkpoint`], reporting how long its parts took and what the uploads put.
+    pub async fn checkpoint_report(&self) -> Result<CheckpointReport> {
         let _hurry = self.inner.gate.hurry();
+        let t0 = Instant::now();
+        let (passes_before, bytes_before) = {
+            let up = self.inner.up.lock();
+            (up.passes, up.put_bytes)
+        };
         self.inner.flush().await?;
+        let flushed = Instant::now();
         let (target, size) = {
             let m = self.inner.mem.lock();
             (m.root.hash, m.size)
@@ -583,7 +627,16 @@ impl Volume {
             {
                 let up = self.inner.up.lock();
                 if (up.last_from == target || up.uploaded.hash == target) && up.published_size >= size {
-                    return Ok(());
+                    let passes = up.passes - passes_before;
+                    return Ok(CheckpointReport {
+                        flush: flushed - t0,
+                        wait: flushed.elapsed(),
+                        passes_before,
+                        bytes_before,
+                        passes,
+                        bytes: up.put_bytes - bytes_before,
+                        last: up.last_times.filter(|_| passes > 0),
+                    });
                 }
                 if let Some(e) = &up.error {
                     return Err(Error::Shared(Arc::clone(e)));
@@ -625,19 +678,23 @@ impl Volume {
 }
 
 /// Locks the local state at `state_path`, so one process at a time writes the branch from it
-/// and a writer that resumes the state knows the one before it is gone.
-async fn lock_state(fs: &dyn LocalFs, state_path: &Path) -> Result<Box<dyn FileLock>> {
+/// and a writer that resumes the state knows the one before it is gone, then reads it.
+async fn open_state(fs: &dyn LocalFs, state_path: &Path) -> Result<(Box<dyn FileLock>, Option<VolState>)> {
     if let Some(dir) = state_path.parent() {
         fs.create_dir_all(dir).await?;
     }
     let mut lock_path = state_path.as_os_str().to_owned();
     lock_path.push(".lock");
-    fs.try_lock(Path::new(&lock_path)).await.map_err(|e| {
+    let lock = fs.try_lock(Path::new(&lock_path)).await.map_err(|e| {
         Error::Io(std::io::Error::new(
             e.kind(),
             format!("the branch state {} is in use: {e}", state_path.display()),
         ))
-    })
+    })?;
+    let state = read_file(fs, state_path)
+        .await?
+        .and_then(|b| VolState::decode(&b));
+    Ok((lock, state))
 }
 
 /// The chunk pieces of `len` bytes at `off`: chunk, offset in it, offset in the buffer, length.
@@ -1187,6 +1244,7 @@ impl Inner {
             }
             (Arc::clone(&up.known), up.version.clone())
         };
+        let t0 = Instant::now();
         let dedup = self.dedup.lock().clone();
         let learner = self.learner.lock().clone();
         let prepared = self.prepared.lock().clone();
@@ -1214,6 +1272,7 @@ impl Inner {
         let keys = p.keys().clone();
         let (done, ()) = futures::join!(p.finish(), self.put_change_list(&tree, size, &packed, &keys));
         done?;
+        let packed_at = Instant::now();
         self.up.lock().publishing = packed;
         self.persist().await?;
         let pos = self.log_pos(seq);
@@ -1240,15 +1299,7 @@ impl Inner {
         };
         let stats = p.stats();
         let added = p.added().clone();
-        if let Some(learned) = dedup.as_ref().and_then(|d| d.learned.as_ref()) {
-            learned.mark_used(p.used_learned());
-            if let Some(l) = &learner {
-                l.published(p.learned());
-                learned.add_published(l, p.learned()).await;
-            }
-        } else if let Some(l) = &learner {
-            l.published(p.learned());
-        }
+        record_learned(dedup.as_ref(), learner.as_ref(), &p).await;
         drop(p);
         {
             let mut up = self.up.lock();
@@ -1260,6 +1311,12 @@ impl Inner {
             up.uploaded = root;
             up.last_from = root.hash;
             up.last = Some(stats);
+            up.passes += 1;
+            up.put_bytes += stats.bytes;
+            up.last_times = Some(PassTimes {
+                pack: packed_at - t0,
+                publish: packed_at.elapsed(),
+            });
             let mut m = self.mem.lock();
             if m.root.hash == root.hash {
                 m.root = packed;
@@ -1299,6 +1356,18 @@ impl Inner {
             .remote
             .put_change_list(root.hash, from.hash, Bytes::from(cl.encode()))
             .await;
+    }
+}
+
+async fn record_learned(dedup: Option<&Arc<Dedup>>, learner: Option<&Arc<Learner>>, p: &Packer) {
+    if let Some(learned) = dedup.and_then(|d| d.learned.as_ref()) {
+        learned.mark_used(p.used_learned());
+        if let Some(l) = learner {
+            l.published(p.learned());
+            learned.add_published(l, p.learned()).await;
+        }
+    } else if let Some(l) = learner {
+        l.published(p.learned());
     }
 }
 
@@ -1365,6 +1434,35 @@ mod tests {
         );
         assert_eq!(read(&other, SIZE - 10, 10).await, vec![0; 10]);
         other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_checkpoint_reports_the_passes_before_it_and_its_own() {
+        let (ports, _, _) = sim::ports(3);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 300_000), 0).await.unwrap();
+        let first = v.checkpoint_report().await.unwrap();
+        assert_eq!((first.passes_before, first.bytes_before), (0, 0));
+        assert!(first.passes >= 1 && first.bytes > 0);
+        assert!(first.last.is_some());
+
+        let again = v.checkpoint_report().await.unwrap();
+        assert_eq!(again.passes, 0, "nothing new to publish");
+        assert!(again.last.is_none());
+        assert_eq!(again.bytes_before, first.bytes);
+
+        v.write_at(&data(2, 100_000), 1 << 20).await.unwrap();
+        v.flush().await.unwrap();
+        v.checkpoint().await.unwrap();
+        v.write_at(&data(3, 10), 0).await.unwrap();
+        let third = v.checkpoint_report().await.unwrap();
+        assert!(third.passes_before > first.passes);
+        assert!(third.bytes_before > first.bytes);
+        assert!(third.passes >= 1 && third.bytes > 0);
+        v.close().await;
     }
 
     #[tokio::test(start_paused = true)]

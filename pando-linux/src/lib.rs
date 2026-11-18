@@ -12,6 +12,7 @@
     reason = "the ublk frontend and the device switch talk to the kernel through ioctls, io_uring and shared mappings"
 )]
 
+mod bdi;
 mod dm;
 mod sys;
 mod ublk;
@@ -27,6 +28,21 @@ pub use ublk::{Frontend, FrontendOptions, daemon_dead, delete, device_id, resize
 pub async fn users(dev: &std::path::Path, over: Option<&str>) -> std::io::Result<Vec<String>> {
     let (dev, over) = (dev.to_owned(), over.map(str::to_owned));
     dm::blocking(move || users::users(&dev, over.as_deref())).await
+}
+
+/// Caps the page cache's dirty data on block device `dev` at about `bytes`. The kernel starts
+/// writing the device's dirty data back before it reaches the cap and throttles writers at the
+/// cap, so a file system on `dev` holds little its device has not taken. Needs Linux 6.2 or
+/// later. On an error, which names the sysfs file it could not write, the kernel's own limits
+/// stay in force.
+pub async fn limit_dirty(dev: &std::path::Path, bytes: u64) -> std::io::Result<()> {
+    let dev = dev.to_owned();
+    dm::blocking(move || bdi::limit_dirty(&dev, bytes)).await
+}
+
+/// The node of device-mapper device `name`, `/dev/mapper/<name>`.
+pub fn mapper_path(name: &str) -> std::path::PathBuf {
+    dm::mapper_node(name)
 }
 
 /// Whether `path` is a block device.
