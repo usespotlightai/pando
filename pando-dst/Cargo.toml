@@ -11,6 +11,7 @@ repository.workspace = true
 bytes.workspace = true
 pando-engine = { workspace = true, features = ["sim"] }
 pando-format.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 object_store.workspace = true

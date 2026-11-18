@@ -60,3 +60,21 @@ async fn a_refusing_store_stops_the_uploader_and_loses_nothing() {
     }
     assert!(total.checkpoints > 0 && total.faults == 20, "{total:?}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_store_outage_fails_io_in_time_and_loses_nothing() {
+    let mut total = scenario::Report::default();
+    for seed in 0..20 {
+        let r = scenario::a_store_outage(seed, 60)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        total.writes += r.writes;
+        total.flushes += r.flushes;
+        total.reads += r.reads;
+        total.unanswered += r.unanswered;
+    }
+    assert!(
+        total.unanswered > 0 && total.reads > 0 && total.writes > 0 && total.flushes > 0,
+        "{total:?}"
+    );
+}
