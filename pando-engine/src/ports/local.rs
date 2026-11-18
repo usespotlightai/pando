@@ -115,6 +115,11 @@ pub trait LocalImage: Send + Sync + fmt::Debug {
     /// Makes `to` a copy of `from` that shares its extents where the file system can (a
     /// reflink); a plain copy elsewhere.
     async fn clone_file(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Puts the bytes of `from` in each of `ranges` into `to` at the same offsets, sharing
+    /// their extents where the file system can. A missing `to` starts empty; `to` grows to the
+    /// length of `from` and keeps its bytes outside `ranges`. Ranges are block aligned, except
+    /// that the last may end at the end of `from`.
+    async fn clone_ranges(&self, from: &Path, to: &Path, ranges: &[std::ops::Range<u64>]) -> io::Result<()>;
     /// Sets up a new, empty image: no copy-on-write where the file system has a switch for it,
     /// and an extent size hint of `hint` bytes where it has those.
     async fn prepare(&self, path: &Path, hint: Option<u64>) -> io::Result<()>;

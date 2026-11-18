@@ -35,3 +35,15 @@ async fn writers_taking_turns_fence_each_other() {
             .unwrap_or_else(|e| panic!("{e}"));
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_strict_log_survives_lost_hosts() {
+    let mut flushes = 0;
+    for seed in 0..20 {
+        let r = scenario::hosts_lost_with_a_strict_log(seed, 4, 40)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        flushes += r.flushes;
+    }
+    assert!(flushes > 0);
+}

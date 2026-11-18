@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use bytes::Bytes;
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 
 use super::SimFs;
-use crate::ports::{DeviceSwitch, LocalFs, Open};
+use crate::ports::{DeviceSwitch, EraDevice, LocalFs, Open};
 
 /// A block device the simulated device-mapper can map onto, such as a branch's frontend.
 #[async_trait]
@@ -29,19 +30,35 @@ struct Dev {
     held: Option<Arc<OwnedRwLockWriteGuard<()>>>,
 }
 
+#[derive(Debug)]
+struct Era {
+    dev: EraDevice,
+    size: u64,
+    block: u64,
+    now: u32,
+    /// The era in which each written block was last written.
+    last: BTreeMap<u64, u32>,
+    /// The records the last `era_begin` held.
+    held: Option<BTreeMap<u64, u32>>,
+    /// Writes to land, one batch at each later `era_begin`, just before the era begins.
+    at_begins: VecDeque<Vec<(u64, Vec<u8>)>>,
+}
+
 #[derive(Default)]
 struct State {
     devs: HashMap<String, Dev>,
     /// Each loop device's image and size.
     loops: HashMap<PathBuf, (PathBuf, u64)>,
+    eras: HashMap<String, Era>,
     written: HashMap<PathBuf, u64>,
     blocks: HashMap<PathBuf, Arc<dyn SimBlock>>,
     next_loop: u32,
+    no_eras: bool,
 }
 
-/// Device-mapper devices over block devices and loop devices over [`SimFs`] files. Reads and
-/// writes through a device go to its live table's target and wait while it is suspended; past
-/// the size of the table or of the loop device they fail.
+/// Device-mapper devices over block devices, era devices and loop devices over [`SimFs`]
+/// files. Reads and writes through a device go to its live table's target and wait while it
+/// is suspended; past the size of the table or of the loop device they fail.
 #[derive(Clone)]
 pub struct SimDevices {
     fs: SimFs,
@@ -67,7 +84,11 @@ fn beyond(name: &str, end: u64, size: u64) -> io::Error {
 
 enum Target {
     Block(Arc<dyn SimBlock>),
-    Image(PathBuf),
+    /// An image under a loop device, and the era device above the loop device, if any.
+    Image {
+        image: PathBuf,
+        era: Option<String>,
+    },
 }
 
 impl SimDevices {
@@ -77,6 +98,13 @@ impl SimDevices {
             fs,
             state: Arc::default(),
         }
+    }
+
+    /// Devices of a host whose kernel has no era target.
+    pub fn without_eras(fs: SimFs) -> SimDevices {
+        let d = SimDevices::new(fs);
+        d.lock().no_eras = true;
+        d
     }
 
     fn lock(&self) -> parking_lot::MutexGuard<'_, State> {
@@ -93,21 +121,38 @@ impl SimDevices {
         self.lock().blocks.remove(path);
     }
 
+    /// Makes each later begin of a new era on era device `name` first take one of `batches`
+    /// of writes at byte offsets of its origin, as if the device above had just written them.
+    pub fn write_at_era_begins(&self, name: &str, batches: Vec<Vec<(u64, Vec<u8>)>>) {
+        if let Some(e) = self.lock().eras.get_mut(name) {
+            e.at_begins.extend(batches);
+        }
+    }
+
     fn route(&self, name: &str) -> io::Result<(Arc<RwLock<()>>, PathBuf, u64)> {
         let s = self.lock();
         let d = s.devs.get(name).ok_or_else(|| no_device(name))?;
         Ok((Arc::clone(&d.io), d.live.clone(), d.size))
     }
 
-    /// The target of the live table of `name`, for I/O that ends at byte `end`.
+    /// The target of the live table of `name`, for I/O that ends at byte `end`, and the loop
+    /// device it reaches.
     fn target(&self, name: &str, end: u64) -> io::Result<(PathBuf, Target)> {
-        let (_, live, size) = self.route(name)?;
+        let (_, mut live, size) = self.route(name)?;
         if end > size {
             return Err(beyond(name, end, size));
         }
         let s = self.lock();
         if let Some(b) = s.blocks.get(&live) {
             return Ok((live, Target::Block(Arc::clone(b))));
+        }
+        let mut era = None;
+        if let Some((n, e)) = s.eras.iter().find(|(_, e)| e.dev.path == live) {
+            if end > e.size {
+                return Err(beyond(n, end, e.size));
+            }
+            era = Some(n.clone());
+            live.clone_from(&e.dev.origin);
         }
         let (image, cap) = s
             .loops
@@ -117,7 +162,7 @@ impl SimDevices {
         if end > cap {
             return Err(beyond(&live.display().to_string(), end, cap));
         }
-        Ok((live, Target::Image(image)))
+        Ok((live, Target::Image { image, era }))
     }
 
     /// The size of the live table of device `name`.
@@ -131,10 +176,10 @@ impl SimDevices {
         let _g = io.read().await;
         match self.target(name, off + buf.len() as u64)?.1 {
             Target::Block(b) => b.read(buf, off).await,
-            Target::Image(p) => {
+            Target::Image { image, .. } => {
                 let got = self
                     .fs
-                    .open(&p, Open::Read)
+                    .open(&image, Open::Read)
                     .await?
                     .read_at(buf.len(), off)
                     .await?;
@@ -152,9 +197,16 @@ impl SimDevices {
         let (live, target) = self.target(name, off + b.len() as u64)?;
         match target {
             Target::Block(t) => t.write(b, off).await,
-            Target::Image(p) => {
+            Target::Image { image, era } => {
+                if let Some(e) = era.as_ref().filter(|_| !b.is_empty())
+                    && let Some(e) = self.lock().eras.get_mut(e)
+                {
+                    for blk in off / e.block..=(off + b.len() as u64 - 1) / e.block {
+                        e.last.insert(blk, e.now);
+                    }
+                }
                 self.fs
-                    .open(&p, Open::ReadWrite)
+                    .open(&image, Open::ReadWrite)
                     .await?
                     .write_at(vec![Bytes::copy_from_slice(b)], off)
                     .await?;
@@ -179,7 +231,7 @@ impl SimDevices {
 impl DeviceSwitch for SimDevices {
     async fn create(&self, name: &str, target: &Path, size: u64) -> io::Result<()> {
         let mut s = self.lock();
-        if s.devs.contains_key(name) {
+        if s.devs.contains_key(name) || s.eras.contains_key(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, name.to_owned()));
         }
         let dev = Dev {
@@ -194,11 +246,19 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn remove(&self, name: &str) -> io::Result<()> {
-        self.lock()
-            .devs
-            .remove(name)
-            .map(drop)
-            .ok_or_else(|| no_device(name))
+        let mut s = self.lock();
+        if s.devs.remove(name).is_some() {
+            return Ok(());
+        }
+        let e = s.eras.get(name).ok_or_else(|| no_device(name))?;
+        if s.devs.values().any(|d| d.live == e.dev.path) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("{name} is mapped by another device"),
+            ));
+        }
+        s.eras.remove(name);
+        Ok(())
     }
 
     async fn live_target(&self, name: &str) -> io::Result<Option<PathBuf>> {
@@ -271,5 +331,123 @@ impl DeviceSwitch for SimDevices {
 
     async fn bytes_written(&self, device: &Path) -> io::Result<u64> {
         Ok(self.lock().written.get(device).copied().unwrap_or(0))
+    }
+
+    async fn create_era(
+        &self,
+        name: &str,
+        metadata: &Path,
+        origin: &Path,
+        size: u64,
+        block: u64,
+    ) -> io::Result<PathBuf> {
+        let mut s = self.lock();
+        if s.no_eras {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "no era target"));
+        }
+        if s.devs.contains_key(name) || s.eras.contains_key(name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, name.to_owned()));
+        }
+        let cap = s
+            .loops
+            .get(origin)
+            .map(|l| l.1)
+            .ok_or_else(|| no_device(&origin.display().to_string()))?;
+        if size > cap || block == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("era of {size} bytes in blocks of {block} over {cap}"),
+            ));
+        }
+        let path = PathBuf::from(format!("/dev/mapper/{name}"));
+        let dev = EraDevice {
+            path: path.clone(),
+            origin: origin.to_owned(),
+            metadata: metadata.to_owned(),
+        };
+        s.eras.insert(
+            name.to_owned(),
+            Era {
+                dev,
+                size,
+                block,
+                now: 1,
+                last: BTreeMap::new(),
+                held: None,
+                at_begins: VecDeque::new(),
+            },
+        );
+        Ok(path)
+    }
+
+    async fn era(&self, name: &str) -> io::Result<Option<EraDevice>> {
+        Ok(self.lock().eras.get(name).map(|e| e.dev.clone()))
+    }
+
+    async fn resize_era(&self, name: &str, size: u64) -> io::Result<()> {
+        let mut s = self.lock();
+        let origin = s
+            .eras
+            .get(name)
+            .ok_or_else(|| no_device(name))?
+            .dev
+            .origin
+            .clone();
+        let cap = s.loops.get(&origin).map_or(0, |l| l.1);
+        if size > cap {
+            return Err(beyond(name, size, cap));
+        }
+        if let Some(e) = s.eras.get_mut(name) {
+            e.size = size;
+        }
+        Ok(())
+    }
+
+    async fn era_begin(&self, name: &str) -> io::Result<u32> {
+        let (batch, origin) = {
+            let mut s = self.lock();
+            let e = s.eras.get_mut(name).ok_or_else(|| no_device(name))?;
+            let batch = e.at_begins.pop_front().unwrap_or_default();
+            for (off, b) in &batch {
+                for blk in off / e.block..=(off + b.len() as u64 - 1) / e.block {
+                    e.last.insert(blk, e.now);
+                }
+            }
+            (batch, e.dev.origin.clone())
+        };
+        if !batch.is_empty() {
+            let image = self
+                .lock()
+                .loops
+                .get(&origin)
+                .map(|l| l.0.clone())
+                .ok_or_else(|| no_device(&origin.display().to_string()))?;
+            let f = self.fs.open(&image, Open::ReadWrite).await?;
+            for (off, b) in batch {
+                f.write_at(vec![Bytes::from(b)], off).await?;
+            }
+        }
+        let mut s = self.lock();
+        let e = s.eras.get_mut(name).ok_or_else(|| no_device(name))?;
+        e.held = Some(e.last.clone());
+        e.now += 1;
+        Ok(e.now)
+    }
+
+    async fn era_listed(&self, name: &str, since: u32) -> io::Result<Vec<Range<u64>>> {
+        let mut s = self.lock();
+        let e = s.eras.get_mut(name).ok_or_else(|| no_device(name))?;
+        let held = e
+            .held
+            .take()
+            .ok_or_else(|| io::Error::other(format!("{name} holds no records")))?;
+        let mut blocks: Vec<Range<u64>> = Vec::new();
+        for (&b, _) in held.iter().filter(|(_, era)| **era >= since) {
+            match blocks.last_mut() {
+                Some(r) if r.end == b => r.end += 1,
+                _ => blocks.push(b..b + 1),
+            }
+        }
+        Ok(blocks)
     }
 }

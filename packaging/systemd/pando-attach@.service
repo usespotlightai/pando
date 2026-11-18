@@ -1,0 +1,21 @@
+[Unit]
+Description=Pando branch served as a block device (%i)
+Documentation=https://github.com/usespotlightai/pando/blob/main/docs/hosts.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/pando/pando.env
+EnvironmentFile=/etc/pando/attach/%i.env
+ExecStart=/usr/local/bin/pando $PANDO_ARGS attach ${PANDO_BRANCH} --device ${PANDO_DEVICE} --recover=auto $PANDO_ATTACH_ARGS
+Restart=on-failure
+RestartSec=1s
+SuccessExitStatus=75
+RestartForceExitStatus=75
+KillMode=mixed
+TimeoutStartSec=30min
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target

@@ -112,12 +112,14 @@ impl<K: Eq + Hash + Clone> Claim<'_, K> {
             | Error::ChunkLost { .. }
             | Error::Store(_)
             | Error::Format(_)
+            | Error::UnknownFormat { .. }
             | Error::Io(_)
             | Error::BeyondEnd
             | Error::Shrink { .. }
             | Error::Corrupt(_)
             | Error::SegmentExists(_)
             | Error::RefExists(_)
+            | Error::CheckpointExists(_)
             | Error::Cancelled) => Arc::new(e),
         });
         self.settle(outcome.clone());

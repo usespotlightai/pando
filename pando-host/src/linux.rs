@@ -50,6 +50,39 @@ pub(crate) fn reflink(from: &Path, to: &Path) -> io::Result<bool> {
     }
 }
 
+/// `struct file_clone_range` of linux/fs.h.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FileCloneRange {
+    src_fd: i64,
+    src_offset: u64,
+    src_length: u64,
+    dest_offset: u64,
+}
+
+const FICLONERANGE: rustix::ioctl::Opcode = opcode::write::<FileCloneRange>(0x94, 13);
+
+/// Makes bytes `offset..offset + len` of `to` share the extents of the same bytes of `from`;
+/// `false` when the file system cannot.
+pub(crate) fn reflink_range(from: &File, to: &File, offset: u64, len: u64) -> io::Result<bool> {
+    let arg = FileCloneRange {
+        src_fd: i64::from(from.as_raw_fd()),
+        src_offset: offset,
+        src_length: len,
+        dest_offset: offset,
+    };
+    // SAFETY: FICLONERANGE is a write ioctl whose argument is one `struct file_clone_range`,
+    // which FileCloneRange mirrors.
+    let set = unsafe { Setter::<FICLONERANGE, FileCloneRange>::new(arg) };
+    // SAFETY: `set` pairs the opcode with the type the kernel reads, and `to` and `from`, whose
+    // descriptor it names, stay open for the call.
+    match unsafe { ioctl(to, set) } {
+        Ok(()) => Ok(true),
+        Err(Errno::OPNOTSUPP | Errno::XDEV | Errno::INVAL) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub(crate) fn punch_hole(f: &File, offset: u64, len: u64) -> io::Result<()> {
     Ok(fallocate(
         f,

@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 use super::extents::changed_chunks;
 use super::owner::{self, Owner};
-use super::{Handoff, HostEnv, SnapshotOptions, use_dedup};
+use super::{Handoff, HostEnv, SnapshotOptions, era_name, era_records, use_dedup};
 use crate::ports::{DeviceSwitch, LocalFs, Open};
 use crate::{Error, Result, Volume};
 
@@ -59,7 +59,10 @@ async fn leftover_clones(fs: &dyn LocalFs, image: &Path) -> (Vec<PathBuf>, u32) 
 
 async fn remove_image(fs: &dyn LocalFs, v: &Volume, image: &Path) {
     let (clones, _) = leftover_clones(fs, image).await;
-    for p in clones.iter().chain([&image.to_owned(), &owner::path(image)]) {
+    for p in clones
+        .iter()
+        .chain([&image.to_owned(), &era_records(image), &owner::path(image)])
+    {
         v.tree().cache().drop_file(p);
         let _ = fs.remove(p).await;
     }
@@ -128,7 +131,9 @@ pub(crate) async fn adopt_leftovers(env: &HostEnv, v: &Volume, dir: &Path) -> Re
 /// Takes over branch `v` whose writer died after the handoff while the device `dm` still serves
 /// its image from `dir`. The first snapshot compares the image with the base it was cloned from,
 /// or takes every chunk that differs from the root, so it publishes all the dead writer did not;
-/// later snapshots go on as before. `None` when `dm` does not serve an image of this branch.
+/// later snapshots go on as before. When an era device sits between `dm` and the image, the
+/// first snapshot clones the whole image during the suspend that begins a new era, and later
+/// ones clone what each era wrote. `None` when `dm` does not serve an image of this branch.
 pub(crate) async fn rejoin(
     env: &HostEnv,
     v: &Arc<Volume>,
@@ -138,9 +143,15 @@ pub(crate) async fn rejoin(
 ) -> Result<Option<Arc<Handoff>>> {
     let devices = env.devices.as_ref();
     recover_device(devices, dm).await?;
-    let Some(lp) = devices.live_target(dm).await? else {
+    let Some(live) = devices.live_target(dm).await? else {
         return Ok(None);
     };
+    let era = devices
+        .era(&era_name(dm))
+        .await?
+        .filter(|e| e.path == live)
+        .map(|e| (era_name(dm), e.origin));
+    let lp = era.as_ref().map_or(live, |(_, origin)| origin.clone());
     let Some(image) = devices.loop_image(&lp).await? else {
         return Ok(None);
     };
@@ -185,11 +196,33 @@ pub(crate) async fn rejoin(
         }
     }
     let first = h.snaps.lock().await.prev.is_some();
-    if first {
+    if let Some((name, _)) = era {
+        *h.era.lock() = Some(name.clone());
+        let mut s = h.snaps.lock().await;
+        let base = s.prev.take();
+        let path = s.next_path(&image);
+        let (_, now) = h.frozen_clone(&path, Some(&name)).await?;
+        let snap = fs.open(&path, Open::Read).await?;
+        let cur = match base {
+            Some(_) => env.ports.image.extents(&path).await.ok(),
+            None => None,
+        };
+        match base.zip(cur) {
+            Some((be, cur)) => {
+                v.absorb_chunks(&snap, &path, &changed_chunks(&be, &cur).0)
+                    .await?
+            }
+            None => v.absorb_image(env.ports.image.as_ref(), &snap, &path).await?,
+        };
+        s.prev_path = Some(path);
+        s.since = now.unwrap_or(1);
+        drop(s);
+        v.flush().await?;
+    } else if first {
         h.snapshot_once(v).await?;
     } else {
         let path = h.snaps.lock().await.next_path(&image);
-        h.frozen_clone(&path).await?;
+        h.frozen_clone(&path, None).await?;
         let snap = fs.open(&path, Open::Read).await?;
         v.absorb_image(env.ports.image.as_ref(), &snap, &path).await?;
         let mut s = h.snaps.lock().await;
