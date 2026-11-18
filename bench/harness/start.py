@@ -1139,7 +1139,7 @@ class S3Files(Workspace):
     """
 
     name = fork.S3Files.name
-    max_reps = 3  # every branch copies all of the workspace's objects
+    max_reps = 3  # every branch copies every file of the workspace
 
     @override
     def unavailable(self) -> str | None:

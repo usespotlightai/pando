@@ -756,8 +756,8 @@ class S3FilesMount:
 
     Its mount helper, from efs-utils, runs an efs-proxy process per mount that carries NFS over
     TLS; the efs-utils watchdog restarts it if it dies. Files written through the mount reach the
-    bucket about a minute after their last write. A branch is a copy of the base's objects in the
-    bucket, which the file system then imports.
+    bucket about a minute after their last write. S3 Files has no branches or snapshots, so a branch
+    is a copy of the base's files through the mount.
     """
 
     def __init__(self, mnt: Path, prefix: str) -> None:
@@ -819,38 +819,20 @@ class S3FilesMount:
         return self.mnt / self.prefix / name
 
     def load_base(self) -> None:
-        """Copy the workspace into base through the mount and wait until the bucket holds all of it."""
+        """Copy the workspace into base through the mount."""
         self.ensure_mounted()
         parallel_copy(workspace.SRC, self.path("base"))
         run("sync", "-f", self.path("base"))
-        log("waiting for S3 Files to export the base to its bucket")
-        settled_bytes(self.bucket, f"{self.prefix}/base")
-        self.entries = count_entries(self.path("base"))
 
     def branch(self, name: str) -> None:
-        """Copy the base's objects to name/ in the bucket, then wait until the mount shows all of them.
-
-        Raises SystemExit when the file system has not imported them within MOUNT_TIMEOUT.
-        """
-        run(
-            "aws",
-            "s3",
-            "cp",
-            "--recursive",
-            "--quiet",
-            f"s3://{self.bucket}/{self.prefix}/base/",
-            f"s3://{self.bucket}/{self.prefix}/{name}/",
-            env_extra={"AWS_CONFIG_FILE": str(s3_config())},
-        )
-        deadline = time.monotonic() + MOUNT_TIMEOUT
-        while not self.path(name).is_dir() or count_entries(self.path(name)) < self.entries:
-            if time.monotonic() > deadline:
-                msg = f"S3 Files did not show {name} within {MOUNT_TIMEOUT} s"
-                raise SystemExit(msg)
-            time.sleep(2)
+        """Copy base to name through the mount and flush it to the file system."""
+        parallel_copy(self.path("base"), self.path(name))
+        run("sync", "-f", self.path(name))
 
     def remove(self, name: str = "") -> None:
-        """Delete name's objects, or all under prefix/, from the bucket and so from the file system."""
+        """Delete name, or all under prefix/, through the mount, then any objects of it left in the bucket."""
+        if self.mnt.is_mount():
+            parallel_remove(self.path(name) if name else self.mnt / self.prefix)
         key = f"{self.prefix}/{name}/" if name else f"{self.prefix}/"
         run(
             "aws",
@@ -881,16 +863,29 @@ def parallel_copy(src: Path, dest: Path, jobs: int = 64) -> None:
         run("sh", "-c", script, "-", src, dest)
 
 
-def count_entries(path: Path) -> int:
-    """Return the number of files, directories and links under path."""
-    return int(run("bash", "-c", f"find {path} -mindepth 1 | wc -l", capture=True))
+def parallel_remove(path: Path, jobs: int = 64) -> None:
+    """Delete the tree path with jobs deletes at once, for file systems with a round trip per file.
+
+    Raises SystemExit when directories are left after 64 passes.
+    """
+    if not path.exists():
+        return
+    xargs = f"xargs -0 -r -P {jobs} -n 256"
+    run("sh", "-c", f'find "$1" ! -type d -print0 | {xargs} rm -f --', "-", path)
+    rmdirs = f'find "$1" -depth -type d -print0 | {xargs} rmdir --ignore-fail-on-non-empty --'
+    for _ in range(64):
+        if not path.exists():
+            return
+        run("sh", "-c", rmdirs, "-", path)
+    msg = f"could not delete {path}"
+    raise SystemExit(msg)
 
 
 class S3Files(System):
-    """Amazon S3 Files; a branch is a copy of the base's objects in its bucket, then imported."""
+    """Amazon S3 Files; a branch is a copy of the base's files through the mount."""
 
     name = "Amazon S3 Files"
-    max_branches = 3  # each branch copies every object of the workspace
+    max_branches = 3  # each branch copies every file of the workspace
     mnt = WORK / "s3files-mnt"
 
     @override
