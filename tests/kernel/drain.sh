@@ -56,26 +56,26 @@ verify() {
 	if blockfio "$1" --verify_only >"$2" 2>&1; then echo verified; else echo "verify FAILED: $(fiofail "$2" || true)"; fi
 }
 
-# term <log>: sends SIGTERM and checks the daemon drained: status 75 and a "drained" line.
+# term <log>: sends SIGTERM and sets drained to the check that the daemon drained: status 75
+# and a "drained" line. It runs in this shell, as only the shell that started the daemon can
+# wait for its status.
 term() {
 	local log=$1 st
 	kill -TERM "$pid"
 	if ! exited "$pid" 120; then
-		echo "drain hung"
+		drained="drain hung"
 		return
 	fi
 	wait "$pid"
 	st=$?
 	pid=
 	if [[ $st != 75 ]]; then
-		echo "exit $st, want 75: $(tail -1 "$log" || true)"
-		return
+		drained="exit $st, want 75: $(tail -1 "$log" || true)"
+	elif ! grep -q "^drained " "$log"; then
+		drained="no drained line: $(tail -1 "$log" || true)"
+	else
+		drained=drained
 	fi
-	if ! grep -q "^drained " "$log"; then
-		echo "no drained line: $(tail -1 "$log" || true)"
-		return
-	fi
-	echo drained
 }
 
 # reopen <branch> <n>: attaches the branch on an empty cache as $B and prints the check of it.
@@ -121,7 +121,7 @@ one() {
 		wpid=$!
 		pause=$(rand_between 1 5)
 		sleep "$pause"
-		drained=$(term "$log")
+		term "$log"
 		attach_bg "$W/cache-$n" "$log" "$b" "${att[@]}" --recover=auto
 		if ! attached "$log" "$b" 2; then
 			live="recover FAILED: $(tail -1 "$log" || true)"
@@ -137,13 +137,13 @@ one() {
 		;;
 	quiet)
 		if blockfio "$A" >"$W/$n.fio" 2>&1; then live=written; else live="fio FAILED: $(fiofail "$W/$n.fio" || true)"; fi
-		drained=$(term "$log")
+		term "$log"
 		grep -q "the store holds every write" "$log" || drained="$drained, not published: $(grep "^drained " "$log" | tail -1 || true)"
 		stopall
 		;;
 	reboot)
 		if blockfio "$A" >"$W/$n.fio" 2>&1; then live=written; else live="fio FAILED: $(fiofail "$W/$n.fio" || true)"; fi
-		drained=$(term "$log")
+		term "$log"
 		timeout 60 "$PANDO" detach --device "$A" --force >>"$log" 2>&1
 		attach_bg "$W/cache-$n" "$log" "$b" "${att[@]}" --recover=auto
 		if attached "$log" "$b" 2 && usable "$A"; then
