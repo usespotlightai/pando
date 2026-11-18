@@ -4,6 +4,7 @@
     python3 bench/harness fork [--systems a,b] [--branches N] [--rep R]
     python3 bench/harness cold|warm|replay [--systems a,b] [--reps N]
     python3 bench/harness fio|save|crash [--systems a,b] [--reps N]
+    python3 bench/harness crash-reboot start|check|clean [--rep R]
 
 Results go to /data/results/*.csv (see bench/README.md for the columns).
 """
@@ -44,6 +45,8 @@ def main() -> None:
         if unknown:
             p.error(f"unknown systems: {', '.join(unknown)}")
         fork.measure(names, a.branches, a.rep)
+    elif a.command == "crash-reboot":
+        crash.reboot(a.phase, a.rep)
     elif a.command in more:
         names = [s for s in a.systems.split(",") if s]
         unknown = [s for s in names if s not in systems[a.command]]

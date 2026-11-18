@@ -671,6 +671,14 @@ class Pando(Workspace):
 
     @override
     def setup(self) -> None:
+        self.connect()
+        self.teardown()
+        self.dir.mkdir(parents=True)
+        log(f"{self.name}: importing the workspace")
+        self._pando("import", "base", workspace.IMAGE, capture=True)
+
+    def connect(self) -> None:
+        """Take the bench bucket and Pando's store keys, keeping what is on the host and in the bucket."""
         self.bucket = env("S3_BUCKET")
         self.keys = dict(
             env_file(env("PANDO_ENV_FILE", "/etc/pando-bench.secrets")),
@@ -678,10 +686,6 @@ class Pando(Workspace):
             S3_REGION=env("S3_REGION"),
         )
         self.procs: dict[int, tuple[subprocess.Popen[str], TextIO]] = {}
-        self.teardown()
-        self.dir.mkdir(parents=True)
-        log(f"{self.name}: importing the workspace")
-        self._pando("import", "base", workspace.IMAGE, capture=True)
 
     def _args(self) -> list[str]:
         return ["pando", "--remote", f"s3://{self.prefix}", "--cache", str(self.dir / "cache")]

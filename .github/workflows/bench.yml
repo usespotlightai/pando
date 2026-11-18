@@ -13,9 +13,9 @@ on:
         options: [run, destroy]
         default: run
       measure:
-        description: "smoke: check the hosts only. Otherwise smoke, then that measure on host a; all: fork, cold, warm, replay, save, fio and crash."
+        description: "smoke: check the hosts only. Otherwise smoke, then those measures on host a; all: fork, cold, warm, replay, save, fio and crash."
         type: choice
-        options: [smoke, fork, cold, warm, replay, save, fio, crash, all]
+        options: [smoke, fork, cold, warm, replay, save, fio, crash, "save,fio,crash", all]
         default: smoke
       systems:
         description: "Comma-separated systems for the measure (see bench/README.md); empty for all"
@@ -149,7 +149,7 @@ jobs:
           SYSTEMS: ${{ inputs.systems }}
         run: |
           case $SYSTEMS in *[!a-z,]*) echo "systems: letters and commas only" >&2; exit 2 ;; esac
-          measures=$MEASURE
+          measures=${MEASURE//,/ }
           [ "$MEASURE" = all ] && measures="fork cold warm replay save fio crash"
           ip=$(awk '$1 == "a" {print $2}' "$RUNNER_TEMP/hosts")
           ssh -n "$ip" "cd /data/pando && sudo bench/run.sh workspace"
@@ -157,6 +157,31 @@ jobs:
           for m in $measures; do
             ssh -n "$ip" "cd /data/pando && sudo bench/run.sh $m ${SYSTEMS:+--systems $SYSTEMS}" || status=1
           done
+          case " $measures " in *" crash "*) ;; *) exit $status ;; esac
+          case ",${SYSTEMS:-pando}," in *,pando,*) ;; *) exit $status ;; esac
+          for rep in 1 2 3 4 5; do
+            boot=$(ssh -n "$ip" cat /proc/sys/kernel/random/boot_id)
+            rc=0
+            started="$RUNNER_TEMP/crash-reboot-$rep.log"
+            timeout 1800 ssh -n -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$ip" \
+              "cd /data/pando && sudo bench/run.sh crash-reboot start --rep $rep" >"$started" 2>&1 || rc=$?
+            cat "$started"
+            if [ "$rc" != 255 ] || ! grep -q ', rebooting$' "$started"; then
+              echo "crash-reboot start $rep exited with $rc before the reboot" >&2
+              status=1
+              break
+            fi
+            back=
+            for _ in $(seq 120); do
+              sleep 5
+              now=$(ssh -n -o ConnectTimeout=5 "$ip" cat /proc/sys/kernel/random/boot_id 2>/dev/null) || continue
+              if [ "$now" != "$boot" ]; then back=1; break; fi
+            done
+            if [ -z "$back" ]; then echo "host a did not come back from reboot $rep" >&2; status=1; break; fi
+            ssh -n "$ip" 'timeout 300 sh -c "until mountpoint -q /data; do sleep 2; done"' || status=1
+            ssh -n "$ip" "cd /data/pando && sudo bench/run.sh crash-reboot check --rep $rep" || status=1
+          done
+          ssh -n "$ip" "cd /data/pando && sudo bench/run.sh crash-reboot clean" || status=1
           exit $status
 
       - name: Collect the results
