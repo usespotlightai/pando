@@ -1,6 +1,6 @@
 # Pando
 
-[![Kernel nightly (xfstests)](https://img.shields.io/github/actions/workflow/status/usespotlightai/pando/kernel.yml?event=schedule&label=kernel%20nightly%20%28xfstests%29)](https://github.com/usespotlightai/pando/actions/workflows/kernel.yml?query=event%3Aschedule)
+[![xfstests](https://img.shields.io/github/actions/workflow/status/usespotlightai/pando/xfstests.yml?branch=main&label=xfstests)](https://github.com/usespotlightai/pando/actions/workflows/xfstests.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 
 Writable branches of a large workspace for AI agents, stored in S3.

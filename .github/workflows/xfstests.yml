@@ -1,0 +1,67 @@
+name: xfstests
+
+# xfstests (fstests), quick group, with ext4 on loop devices and then on pando volumes
+# (tests/kernel/xfstests.sh). A test fails here only when it fails on pando and not on loop.
+# Runs each night, since the quick group takes hours, and by hand from the Actions tab. It has a
+# workflow of its own so that its status, and the README badge, report xfstests alone; the other
+# kernel tests are in kernel.yml.
+
+on:
+  schedule:
+    - cron: "47 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: xfstests-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  xfstests:
+    name: xfstests
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Kernel modules
+        run: |
+          uname -r
+          modules=(ublk_drv dm_mod loop dm_log_writes dm_thin_pool)
+          if ! sudo modprobe -a "${modules[@]}"; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a "${modules[@]}"
+          fi
+          ls -l /dev/ublk-control
+          sudo dmsetup targets
+
+      - uses: ./.github/actions/tools
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build pando
+        run: tools/check.sh release
+
+      - name: Run xfstests
+        env:
+          PANDO: target/release/pando
+          RESULTS: ${{ runner.temp }}/xfstests-results
+          DATA: /mnt/pando-tests
+        run: |
+          sudo mkdir -p "$DATA"
+          tests/kernel/host.sh xfstests
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: xfstests-results-${{ github.run_id }}
+          path: ${{ runner.temp }}/xfstests-results
+          if-no-files-found: warn
