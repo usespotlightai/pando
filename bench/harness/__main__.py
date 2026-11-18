@@ -40,6 +40,9 @@ def main() -> None:
     if a.command == "workspace":
         workspace.prepare()
         return
+    if a.command == "crash-reboot":
+        crash.reboot(a.phase, a.rep)
+        return
 
     has = {"fork": fork.SYSTEMS, **systems}.get(a.command, start.SYSTEMS)
     known = set(fork.SYSTEMS) | set(start.SYSTEMS) | {k for v in systems.values() for k in v}
@@ -53,8 +56,6 @@ def main() -> None:
     names = [s for s in names if s in has]
     if a.command == "fork":
         fork.measure(names, a.branches, a.rep)
-    elif a.command == "crash-reboot":
-        crash.reboot(a.phase, a.rep)
     elif a.command in more:
         more[a.command].measure(names, a.reps)
     else:

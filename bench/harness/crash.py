@@ -7,12 +7,12 @@ each file and the directory, and logs each write as acknowledged or failed; afte
 retries the next file 50 ms later. Five seconds in, the daemon is killed and at once restarted
 as the system restarts it: Pando with `pando attach --recover` on the same device, JuiceFS by a
 fresh mount on the same mount point, ZeroFS by starting the server again (its NBD client runs
-with -persist and reconnects), S3 Files by the efs-utils watchdog, which restarts the efs-proxy
-process that carries the mount's NFS traffic. The writer runs 5 s more after its first write
-succeeds again. The branch is then closed as usual. A fresh host is a new cache and state
-directory on this host, sharing nothing with the first: there the file system is checked
-(e2fsck -fn for Pando and ZeroFS, `juicefs fsck` for JuiceFS; S3 Files has no checker) and every
-acknowledged file is read back.
+with -persist but does not reconnect to the new server), S3 Files by the efs-utils watchdog,
+which restarts the efs-proxy process that carries the mount's NFS traffic. The writer runs 5 s
+more after its first write succeeds again. The branch is then closed as usual. A fresh host is
+a new cache and state directory on this host, sharing nothing with the first: there the file
+system is checked (e2fsck -fn for Pando and ZeroFS, `juicefs fsck` for JuiceFS; S3 Files has no
+checker) and every acknowledged file is read back.
 
 Rows: crash.recovered (1 when a write was acknowledged within 120 s of the kill), crash.failed_writes
 (count), crash.stall (s: the longest gap between acknowledged writes, when recovered), crash.fsck
