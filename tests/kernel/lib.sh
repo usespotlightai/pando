@@ -56,9 +56,14 @@ exited() {
 	return 1
 }
 
-# kernel_errors <marker>: I/O errors the kernel logged since the marker line.
+# kernel_errors <marker>: I/O errors the kernel logged since the marker line. When there are
+# any, the kernel log since the marker goes to $R/$TEST.dmesg.
 kernel_errors() {
-	dmesg | sed -n "/$1/,\$p" | grep -ciE "I/O error|blk_update_request|buffer I/O" || true
+	local since n
+	since=$(dmesg | sed -n "/$1/,\$p")
+	n=$(grep -ciE "I/O error|blk_update_request|buffer I/O" <<<"$since" || true)
+	[[ $n = 0 ]] || printf '%s\n' "$since" >>"$R/$TEST.dmesg"
+	echo "$n"
 }
 
 mark() { echo "$1" >/dev/kmsg; }
