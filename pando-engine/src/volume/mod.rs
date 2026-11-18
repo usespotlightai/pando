@@ -1,8 +1,10 @@
 //! A volume: one writable branch, with write-back to the store.
 //!
 //! A flush commits locally: chunks and nodes go to the cache, one sync, then the local root is
-//! recorded. An uploader packs pending objects into segments, uploads them and moves the
-//! branch's ref with a conditional update. A lost host loses only what was not uploaded yet.
+//! recorded. A shipper then puts the flush's chunks in the branch's write log in the store,
+//! and an uploader packs pending objects into segments, uploads them and moves the branch's ref
+//! with a conditional update. A lost host loses only what neither has in the store yet; with
+//! [`LogMode::Strict`], a flush returns only once the log or an upload has it.
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,12 +30,15 @@ use crate::flight::bounded;
 use crate::gate::Gate;
 use crate::local::{Journal, Record, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
-use crate::ports::{Cpu, CpuClass, LocalFs, Version, on_cpu};
+use crate::ports::{Cpu, CpuClass, FileLock, LocalFs, Version, on_cpu};
 use crate::remote::Remote;
 use crate::tree::Tree;
 use crate::{Error, Ports, Result};
 
 mod image;
+mod log;
+
+pub use log::LogMode;
 
 const STRIPES: usize = 64;
 const CHUNK: u64 = u64_from(CHUNK_SIZE);
@@ -190,6 +195,7 @@ struct Inner {
     writer: Arc<Writer>,
     journal: Journal,
     state_path: PathBuf,
+    state_lock: Mutex<Option<Box<dyn FileLock>>>,
     opened: Entry,
     stripes: Vec<RwLock<()>>,
     mem: Mutex<Mem>,
@@ -207,6 +213,10 @@ struct Inner {
     gate: Arc<Gate>,
     /// The last flush an upload published.
     uploaded_seq: watch::Sender<u64>,
+    log: log::Log,
+    /// The generation the local state names: the ref's when the branch opened, this writer's
+    /// once it took the branch.
+    state_generation: AtomicU64,
 }
 
 /// One writable branch.
@@ -216,8 +226,9 @@ pub struct Volume {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// The local state of a branch. `size` is the size `root` belongs to; a state written before
-/// sizes could grow has none.
+/// The local state of a branch. `size` is the size `root` belongs to, and `generation` the
+/// writer that wrote it; states written before sizes could grow, or before the write log, have
+/// none.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct VolState {
     root: Entry,
@@ -225,13 +236,18 @@ struct VolState {
     publishing: Entry,
     jfloor: u64,
     size: Option<u64>,
+    generation: Option<u64>,
 }
 
 impl VolState {
     fn encode(&self) -> Bytes {
-        let size = self.size.map_or_else(String::new, |n| format!("{n}\n"));
+        let tail = match (self.size, self.generation) {
+            (Some(n), Some(g)) => format!("{n}\n{g}\n"),
+            (Some(n), None) => format!("{n}\n"),
+            (None, _) => String::new(),
+        };
         Bytes::from(format!(
-            "{}\n{}\n{}\n{}\n{size}",
+            "{}\n{}\n{}\n{}\n{tail}",
             self.root, self.published, self.publishing, self.jfloor
         ))
     }
@@ -239,9 +255,10 @@ impl VolState {
     fn decode(b: &[u8]) -> Option<VolState> {
         let s = std::str::from_utf8(b).ok()?;
         let lines: Vec<&str> = s.lines().collect();
-        let (root, published, publishing, jfloor, size) = match lines.as_slice() {
-            [r, p, q, j] => (r, p, q, j, None),
-            [r, p, q, j, n] => (r, p, q, j, Some(n.parse().ok()?)),
+        let (root, published, publishing, jfloor, size, generation) = match lines.as_slice() {
+            [r, p, q, j] => (r, p, q, j, None, None),
+            [r, p, q, j, n] => (r, p, q, j, Some(n.parse().ok()?), None),
+            [r, p, q, j, n, g] => (r, p, q, j, Some(n.parse().ok()?), Some(g.parse().ok()?)),
             _ => return None,
         };
         Some(VolState {
@@ -250,7 +267,16 @@ impl VolState {
             publishing: Entry::parse_text(publishing).ok()?,
             jfloor: jfloor.parse().ok()?,
             size,
+            generation,
         })
+    }
+
+    /// Whether a writer may resume this state over ref `r`: the ref holds the root this state
+    /// published or was publishing, and the last writer to take the branch is the one this
+    /// state names.
+    fn resumes(&self, r: &Ref) -> bool {
+        (self.published.hash == r.root.hash || self.publishing.hash == r.root.hash)
+            && self.generation.is_none_or(|g| g == r.generation)
     }
 }
 
@@ -262,6 +288,7 @@ impl Volume {
             root: Entry::EMPTY,
             generation: 0,
             from: None,
+            log: None,
         };
         Remote::new(Arc::clone(&ports.store))
             .create_ref(name, &r)
@@ -283,18 +310,32 @@ impl Volume {
     /// [`Self::open`] that returns before the writer generation is taken: reads need no
     /// generation, and uploads wait for it.
     pub async fn open_then(ports: &Ports, cache: Arc<Cache>, dir: &Path, name: &str) -> Result<Volume> {
+        Volume::open_logged(ports, cache, dir, name, LogMode::default()).await
+    }
+
+    /// [`Self::open_then`] that logs flushes as `mode` says. Writes in the log that the ref
+    /// does not hold are applied before it returns, unless this host resumes its own state.
+    pub async fn open_logged(
+        ports: &Ports,
+        cache: Arc<Cache>,
+        dir: &Path,
+        name: &str,
+        mode: LogMode,
+    ) -> Result<Volume> {
         let remote = cache.remote().clone();
         let (r, version) = remote
             .get_ref(name)
             .await?
             .ok_or_else(|| Error::Corrupt(format!("open {name}: no such branch")))?;
         let generation = r.generation + 1;
-        let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
         let state_path = dir.join("state").join(name);
-        let state = read_file(ports.fs.as_ref(), &state_path)
-            .await?
-            .and_then(|b| VolState::decode(&b));
-        let resume = state.filter(|s| s.published.hash == r.root.hash || s.publishing.hash == r.root.hash);
+        let (state_lock, state) = open_state(ports.fs.as_ref(), &state_path).await?;
+        let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
+        let resume = state.filter(|s| s.resumes(&r));
+        let scan = match resume {
+            Some(_) => log::Scan::resumed(&r),
+            None => log::scan(&remote, &ports.cpu, name, &r).await?,
+        };
         let size = resume.and_then(|s| s.size).map_or(r.size, |n| n.max(r.size));
         let tree = Arc::new(Tree::new(Arc::clone(&cache), size.div_ceil(CHUNK)));
         let root = resume.map_or(r.root, |s| s.root);
@@ -326,6 +367,7 @@ impl Volume {
             writer: Arc::new(Writer::new(WriterId::new(name, generation), ports.rng.next_u32())),
             journal,
             state_path,
+            state_lock: Mutex::new(Some(state_lock)),
             opened: mem.root,
             stripes: (0..STRIPES).map(|_| RwLock::new(())).collect(),
             mem: Mutex::new(mem),
@@ -356,19 +398,27 @@ impl Volume {
             prepared: Mutex::default(),
             gate: Arc::default(),
             uploaded_seq: watch::Sender::new(0),
+            log: log::Log::new(mode, scan.start),
+            state_generation: AtomicU64::new(r.generation),
         });
         inner.start_journal(resume).await?;
         let grown = size != r.size;
         let taker = tokio::spawn(Arc::clone(&inner).take_generation(r, version));
         let uploader = tokio::spawn(Arc::clone(&inner).uploader());
-        let uploaded = inner.up.lock().uploaded.hash;
-        if inner.root().hash != uploaded || grown {
-            inner.kick.notify_one();
-        }
-        Ok(Volume {
+        let shipper = tokio::spawn(Arc::clone(&inner).shipper());
+        let v = Volume {
             inner,
-            tasks: Mutex::new(vec![taker, uploader]),
-        })
+            tasks: Mutex::new(vec![taker, uploader, shipper]),
+        };
+        if let Err(e) = v.inner.replay_log(scan.writes).await {
+            v.close().await;
+            return Err(e);
+        }
+        let uploaded = v.inner.up.lock().uploaded.hash;
+        if v.inner.root().hash != uploaded || grown {
+            v.inner.kick.notify_one();
+        }
+        Ok(v)
     }
 
     /// The name of the branch.
@@ -603,14 +653,48 @@ impl Volume {
         self.inner.up.lock().last
     }
 
-    /// Stops the uploader after any upload in flight finishes.
+    /// How this volume logs its flushes.
+    pub fn log_mode(&self) -> LogMode {
+        self.inner.log.mode()
+    }
+
+    /// Records in the ref that this writer adds no more records to the log, so the next open
+    /// reads none. Call it after [`Self::checkpoint`], when no more writes come; without every
+    /// flush published it does nothing.
+    pub async fn close_log(&self) -> Result<()> {
+        self.inner.close_log().await
+    }
+
+    /// Stops the uploader after any upload in flight finishes, then releases the local state
+    /// for another open.
     pub async fn close(&self) {
         self.inner.stop.send_replace(true);
         let tasks = std::mem::take(&mut *self.tasks.lock());
         for t in tasks {
             let _ = t.await;
         }
+        drop(self.inner.state_lock.lock().take());
     }
+}
+
+/// Locks the local state at `state_path`, so one process at a time writes the branch from it
+/// and a writer that resumes the state knows the one before it is gone, then reads it.
+async fn open_state(fs: &dyn LocalFs, state_path: &Path) -> Result<(Box<dyn FileLock>, Option<VolState>)> {
+    if let Some(dir) = state_path.parent() {
+        fs.create_dir_all(dir).await?;
+    }
+    let mut lock_path = state_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock = fs.try_lock(Path::new(&lock_path)).await.map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("the branch state {} is in use: {e}", state_path.display()),
+        ))
+    })?;
+    let state = read_file(fs, state_path)
+        .await?
+        .and_then(|b| VolState::decode(&b));
+    Ok((lock, state))
 }
 
 /// The chunk pieces of `len` bytes at `off`: chunk, offset in it, offset in the buffer, length.
@@ -648,6 +732,7 @@ fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
         | Error::Corrupt(_)
         | Error::SegmentExists(_)
         | Error::RefExists(_)
+        | Error::CheckpointExists(_)
         | Error::Cancelled) => Arc::new(e),
     };
     up.error = Some(Arc::clone(&e));
@@ -764,12 +849,14 @@ impl Inner {
             publishing,
             jfloor,
             size: Some(size),
+            generation: Some(self.state_generation.load(Ordering::Acquire)),
         };
         Ok(write_durable(self.fs.as_ref(), &self.state_path, st.encode()).await?)
     }
 
     async fn take_generation(self: Arc<Self>, mut r: Ref, version: Version) {
         r.generation = self.generation;
+        r.log = Some(self.log.start);
         let mut res = self.remote.put_ref(&self.name, &r, &version).await;
         for _ in 1..GENERATION_TRIES {
             if !matches!(&res, Err(e) if is_transient(e)) {
@@ -778,6 +865,7 @@ impl Inner {
             tokio::time::sleep(RETRY_AFTER).await;
             res = self.remote.put_ref(&self.name, &r, &version).await;
         }
+        let taken = res.is_ok();
         {
             let mut up = self.up.lock();
             match res {
@@ -787,8 +875,12 @@ impl Inner {
                     fail_with(&mut up, e);
                 }
             }
-            up.gen_taken = true;
         }
+        if taken {
+            self.state_generation.store(self.generation, Ordering::Release);
+            let _ = self.persist().await;
+        }
+        self.up.lock().gen_taken = true;
         self.notify();
     }
 
@@ -962,6 +1054,15 @@ impl Inner {
     }
 
     async fn flush(&self) -> Result<()> {
+        let seq = self.commit_flush().await?;
+        if self.log.mode() == LogMode::Strict {
+            self.wait_logged(seq).await?;
+        }
+        Ok(())
+    }
+
+    /// Commits completed writes locally and durably; returns the number of the last flush.
+    async fn commit_flush(&self) -> Result<u64> {
         let _c = self.commit.lock().await;
         if self.up.lock().fenced {
             return Err(Error::Fenced {
@@ -972,8 +1073,11 @@ impl Inner {
         for s in &self.stripes {
             guards.push(s.write().await);
         }
-        if self.mem.lock().dirty.is_empty() {
-            return Ok(());
+        {
+            let m = self.mem.lock();
+            if m.dirty.is_empty() {
+                return Ok(m.flush_seq);
+            }
         }
         let generation = self.journal.rotate().await?;
         let (snapshot, refs, tree, root) = {
@@ -993,8 +1097,8 @@ impl Inner {
         };
         drop(guards);
         match self.commit_snapshot(&tree, &snapshot, &refs, &root).await {
-            Ok(new_root) => {
-                {
+            Ok((new_root, updates)) => {
+                let (seq, size) = {
                     let mut m = self.mem.lock();
                     m.root = new_root;
                     m.flushing = None;
@@ -1004,11 +1108,17 @@ impl Inner {
                     for r in refs.into_values() {
                         m.ref_seq.insert(r.path, seq);
                     }
-                }
+                    (seq, m.size)
+                };
                 self.persist().await?;
                 self.journal.drop_below(generation).await;
+                let chunks = updates
+                    .into_iter()
+                    .map(|(idx, e)| (idx, (!e.is_empty()).then(|| (e.hash, snapshot[&idx].clone()))))
+                    .collect();
+                self.queue_flush(log::Flushed { seq, size, chunks });
                 self.kick.notify_one();
-                Ok(())
+                Ok(seq)
             }
             Err(e) => {
                 let mut m = self.mem.lock();
@@ -1032,7 +1142,7 @@ impl Inner {
         snapshot: &BTreeMap<u64, Bytes>,
         refs: &BTreeMap<u64, ChunkRef>,
         root: &Entry,
-    ) -> Result<Entry> {
+    ) -> Result<(Entry, Vec<(u64, Entry)>)> {
         let mut futs = Vec::with_capacity(snapshot.len());
         for (idx, b) in snapshot {
             futs.push(self.store_chunk(*idx, b.clone(), refs.get(idx)));
@@ -1052,7 +1162,7 @@ impl Inner {
         updates.sort_by_key(|u| u.0);
         let new_root = tree.update(root, &updates).await?;
         self.cache.sync_local().await?;
-        Ok(new_root)
+        Ok((new_root, updates))
     }
 
     async fn store_chunk(&self, idx: u64, b: Bytes, r: Option<&ChunkRef>) -> Result<(u64, Entry)> {
@@ -1165,11 +1275,13 @@ impl Inner {
         let packed_at = Instant::now();
         self.up.lock().publishing = packed;
         self.persist().await?;
+        let pos = self.log_pos(seq);
         let r = Ref {
             size,
             root: packed,
             generation: self.generation,
             from: self.from.clone(),
+            log: Some(pos),
         };
         let new_version = match self.remote.put_ref(&self.name, &r, &version).await {
             Ok(v) => v,
@@ -1214,6 +1326,7 @@ impl Inner {
         if let Some(p) = &prepared {
             p.drop_through(seq);
         }
+        self.log_published(&pos);
         self.uploaded_seq.send_modify(|s| *s = (*s).max(seq));
         self.notify();
         let _ = self.persist().await;
@@ -1476,16 +1589,26 @@ mod tests {
     }
 
     #[test]
-    fn a_state_without_a_size_still_reads() {
+    fn a_state_without_a_size_or_generation_still_reads() {
         let s = VolState {
             root: Entry::EMPTY,
             published: Entry::EMPTY,
             publishing: Entry::EMPTY,
             jfloor: 7,
             size: Some(8 << 30),
+            generation: Some(4),
         };
         assert_eq!(VolState::decode(&s.encode()), Some(s));
-        let old = VolState { size: None, ..s };
+        let sized = VolState {
+            generation: None,
+            ..s
+        };
+        assert_eq!(VolState::decode(&sized.encode()), Some(sized));
+        let old = VolState {
+            size: None,
+            generation: None,
+            ..s
+        };
         let four = String::from_utf8(old.encode().to_vec()).unwrap();
         assert_eq!(four.lines().count(), 4);
         assert_eq!(VolState::decode(four.as_bytes()), Some(old));

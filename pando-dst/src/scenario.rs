@@ -1,12 +1,12 @@
-//! Seeded scenarios: random writes, flushes, checkpoints, daemon restarts, host crashes and
-//! store faults on one branch, checked against a model of what the volume must hold.
+//! Seeded scenarios: random writes, flushes, checkpoints, daemon restarts, host crashes, lost
+//! hosts and store faults on one branch, checked against a model of what the volume must hold.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use pando_engine::ports::Rng;
 use pando_engine::sim::{self, Fault, SimFs, SimRng, SimStore, StoreOp};
-use pando_engine::{Cache, Ports, Volume};
+use pando_engine::{Cache, LogMode, Ports, Volume};
 use pando_format::{u64_from, usize_from};
 
 const SIZE: usize = 4 << 20;
@@ -269,4 +269,72 @@ pub async fn writers_take_turns(seed: u64, turns: usize) -> Result<(), String> {
         v.close().await;
     }
     Ok(())
+}
+
+/// Writers on hosts lost one after another, each with a strict log and with store faults: each
+/// next host holds every flush a writer returned from, though no upload need have published it.
+pub async fn hosts_lost_with_a_strict_log(seed: u64, hosts: usize, steps: usize) -> Result<Report, String> {
+    let (ports, store, fs) = sim::ports(seed);
+    Volume::create(&ports, BRANCH, SIZE as u64)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut w = World {
+        ports,
+        store,
+        fs,
+        rng: SimRng::new(seed ^ 0x1057),
+        model: vec![0; SIZE],
+        flushed: vec![0; SIZE],
+        report: Report::default(),
+    };
+    for host in 0..=hosts {
+        let dir = format!("/host{host}");
+        let at = format!("seed {seed} host {host}");
+        let cache = Arc::new(
+            Cache::open(&w.ports, Path::new(&dir))
+                .await
+                .map_err(|e| format!("{at}: open cache: {e}"))?,
+        );
+        let v = Volume::open_logged(&w.ports, cache, Path::new(&dir), BRANCH, LogMode::Strict)
+            .await
+            .map_err(|e| format!("{at}: open: {e}"))?;
+        v.wait_generation()
+            .await
+            .map_err(|e| format!("{at}: generation: {e}"))?;
+        w.model.clone_from(&w.flushed);
+        for off in (0..SIZE).step_by(4 * CHUNK) {
+            w.check(&v, off, 4 * CHUNK, &format!("{at} opened")).await?;
+        }
+        if host == hosts {
+            v.close().await;
+            break;
+        }
+        for step in 0..steps {
+            let at = format!("{at} step {step}");
+            match w.below(100) {
+                0..50 => {
+                    let (off, len) = w.range();
+                    let b = w.bytes(len);
+                    v.write_at(&b, off as u64)
+                        .await
+                        .map_err(|e| format!("{at}: write: {e}"))?;
+                    w.model[off..off + len].copy_from_slice(&b);
+                    w.report.writes += 1;
+                }
+                50..70 => {
+                    v.flush().await.map_err(|e| format!("{at}: flush: {e}"))?;
+                    w.flushed.clone_from(&w.model);
+                    w.report.flushes += 1;
+                }
+                70..80 => w.fault(),
+                _ => {
+                    let (off, len) = w.range();
+                    w.check(&v, off, len, &at).await?;
+                }
+            }
+        }
+        v.close().await;
+        w.report.crashes += 1;
+    }
+    Ok(w.report)
 }

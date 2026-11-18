@@ -14,7 +14,7 @@ pando-engine.workspace = true
 pando-host.workspace = true
 pando-format.workspace = true
 pando-s3.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pando-linux.workspace = true

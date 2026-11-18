@@ -91,6 +91,7 @@ fn shared(e: Error) -> Arc<Error> {
         | Error::Corrupt(_)
         | Error::SegmentExists(_)
         | Error::RefExists(_)
+        | Error::CheckpointExists(_)
         | Error::Cancelled) => Arc::new(e),
     }
 }

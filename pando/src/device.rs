@@ -114,6 +114,29 @@ pub(crate) struct AttachArgs {
     /// writers wait at the cap (0: the kernel's limits).
     #[arg(long, default_value_t = 0)]
     pub(crate) dirty_limit: u64,
+    /// How flushes reach the store's write log: `behind` acknowledges a flush once it is
+    /// durable on this host and logs it moments later; `strict` acknowledges it only once the
+    /// log in the store has it (not with --images); `off` leaves it to the next upload.
+    #[arg(long, value_enum, default_value_t = Log::Behind)]
+    pub(crate) log: Log,
+}
+
+/// How `attach` logs flushes; see [`pando_engine::LogMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Log {
+    Off,
+    Behind,
+    Strict,
+}
+
+impl From<Log> for pando_engine::LogMode {
+    fn from(l: Log) -> Self {
+        match l {
+            Log::Off => pando_engine::LogMode::Off,
+            Log::Behind => pando_engine::LogMode::Behind,
+            Log::Strict => pando_engine::LogMode::Strict,
+        }
+    }
 }
 
 /// Which device `detach` stops.
@@ -146,7 +169,7 @@ pub(crate) struct ResizeArgs {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{attach, detach, resize};
+pub(crate) use linux::{attach, detach, notify, resize};
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) async fn attach(
@@ -154,6 +177,7 @@ pub(crate) async fn attach(
     _: std::sync::Arc<pando_engine::Cache>,
     _: AttachArgs,
     _: String,
+    _: &crate::Out,
 ) -> anyhow::Result<Ended> {
     anyhow::bail!("attach needs Linux")
 }
@@ -164,9 +188,14 @@ pub(crate) async fn detach(_: DetachArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) async fn resize(_: ResizeArgs) -> anyhow::Result<()> {
+pub(crate) async fn resize(_: ResizeArgs, _: &crate::Out) -> anyhow::Result<()> {
     anyhow::bail!("resize needs Linux")
 }
+
+/// Tells a service manager how the daemon stands; systemd's notify protocol exists only on
+/// Linux.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn notify(_: &str) {}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -186,8 +215,10 @@ mod linux {
     use tokio::runtime::Handle;
     use tokio::signal::unix::{Signal, SignalKind, signal};
     use tokio::sync::watch;
+    use tokio::task::JoinHandle;
 
     use super::{AttachArgs, DetachArgs, Ended, Recover, ResizeArgs};
+    use crate::Out;
 
     const CONTROL_DIR: &str = "/run/pando";
     /// How long a daemon waits for the request of a client that connected.
@@ -195,12 +226,14 @@ mod linux {
 
     /// Serves branch `a.name` until `detach` stops its device, then publishes it, or until a
     /// signal drains it. `store` names the store, so chunks learned from one store never serve
-    /// another.
+    /// another. Output goes to `out`; only an attach that runs as its own process tells
+    /// systemd how it stands.
     pub(crate) async fn attach(
         ports: &Ports,
         cache: Arc<Cache>,
         a: AttachArgs,
         store: String,
+        out: &Out,
     ) -> Result<Ended> {
         let id = pando_linux::device_id(&a.device)?;
         if a.images.is_some() && a.dm.is_none() {
@@ -220,8 +253,8 @@ mod linux {
         let mut fe = match Frontend::start(Handle::current(), Arc::clone(att.volume()), id, fopts).await {
             Ok(fe) => fe,
             Err(e) => {
-                if let Err(fe) = finish(att, &a.name).await {
-                    eprintln!("{fe:#}");
+                if let Err(fe) = finish(att, &a.name, out).await {
+                    out.err(format!("{fe:#}"));
                 }
                 return Err(e).with_context(|| format!("start {}", a.device.display()));
             }
@@ -230,15 +263,15 @@ mod linux {
             && let Err(e) = switch.create(dm, &a.device, att.volume().size()).await
         {
             if let Err(ae) = fe.abort().await {
-                eprintln!("stop {}: {ae}", a.device.display());
+                out.err(format!("stop {}: {ae}", a.device.display()));
             }
-            if let Err(fe) = finish(att, &a.name).await {
-                eprintln!("{fe:#}");
+            if let Err(fe) = finish(att, &a.name, out).await {
+                out.err(format!("{fe:#}"));
             }
             return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
         }
-        limit_dirty(&a).await;
-        println!(
+        limit_dirty(&a, out).await;
+        out.line(format!(
             "attached {} as {} in {:.1?}{}",
             a.name,
             a.device.display(),
@@ -248,29 +281,25 @@ mod linux {
             } else {
                 ""
             }
-        );
+        ));
         let mut signals = Signals::new()?;
-        notify("READY=1");
+        if out.is_stdio() {
+            notify("READY=1");
+        }
         let (stop, stopping) = watch::channel(false);
-        let control = match listen(id) {
-            Ok(l) => Some(tokio::spawn(serve(
-                l,
+        let control = control(&att, id, &a.name, stopping, out);
+        let background = (!att.rejoined()).then(|| {
+            tokio::spawn(warm(
                 Arc::clone(&att),
-                id,
                 a.name.clone(),
-                stopping,
-            ))),
-            Err(e) => {
-                eprintln!("{}: resize is off: {e}", control_path(id).display());
-                None
-            }
-        };
-        let background = (!att.rejoined())
-            .then(|| tokio::spawn(warm(Arc::clone(&att), a.name.clone(), a.images.is_some())));
+                a.images.is_some(),
+                out.clone(),
+            ))
+        });
         let drained = tokio::select! {
             r = fe.stopped() => {
                 if let Err(e) = r {
-                    eprintln!("{}: {e}", a.device.display());
+                    out.err(format!("{}: {e}", a.device.display()));
                 }
                 false
             }
@@ -286,17 +315,43 @@ mod linux {
             let _ = std::fs::remove_file(control_path(id));
         }
         if drained {
-            notify("STOPPING=1");
-            let drained = drain(&att, &a.name, a.drain_wait, &mut signals).await;
+            if out.is_stdio() {
+                notify("STOPPING=1");
+            }
+            let drained = drain(&att, &a.name, a.drain_wait, &mut signals, out).await;
             let held = super::Held { _frontend: fe };
             return Ok(match drained {
                 Ok(()) => Ended::Drained(held),
                 Err(e) => Ended::DrainFailed(e, held),
             });
         }
-        finish(att, &a.name).await?;
+        finish(att, &a.name, out).await?;
         drop(fe);
         Ok(Ended::Detached)
+    }
+
+    /// Serves the control socket of device `id` until `stopping`; `None` when it cannot listen.
+    fn control(
+        att: &Arc<Attachment>,
+        id: u32,
+        name: &str,
+        stopping: watch::Receiver<bool>,
+        out: &Out,
+    ) -> Option<JoinHandle<()>> {
+        match listen(id) {
+            Ok(l) => Some(tokio::spawn(serve(
+                l,
+                Arc::clone(att),
+                id,
+                name.to_owned(),
+                stopping,
+                out.clone(),
+            ))),
+            Err(e) => {
+                out.err(format!("{}: resize is off: {e}", control_path(id).display()));
+                None
+            }
+        }
     }
 
     /// Whether this attach takes over the device of a daemon that died; it fails while a
@@ -339,6 +394,7 @@ mod linux {
             metadata: a.metadata,
             hydrate: a.hydrate,
             rejoin,
+            log: a.log.into(),
         }
     }
 
@@ -366,14 +422,20 @@ mod linux {
 
     /// Publishes what the branch holds while the device serves, for at most `wait` or until a
     /// second signal, then makes every write acknowledged so far durable on this host.
-    async fn drain(att: &Attachment, name: &str, wait: Duration, signals: &mut Signals) -> Result<()> {
+    async fn drain(
+        att: &Attachment,
+        name: &str,
+        wait: Duration,
+        signals: &mut Signals,
+        out: &Out,
+    ) -> Result<()> {
         let t0 = Instant::now();
-        println!("draining {name}: publishing for at most {wait:.0?}");
+        out.line(format!("draining {name}: publishing for at most {wait:.0?}"));
         let published = tokio::select! {
             r = tokio::time::timeout(wait, att.drain()) => match r {
                 Ok(Ok(())) => true,
                 Ok(Err(e)) => {
-                    eprintln!("drain {name}: {e:#}");
+                    out.err(format!("drain {name}: {e:#}"));
                     false
                 }
                 Err(_) => false,
@@ -385,21 +447,21 @@ mod linux {
             .await
             .with_context(|| format!("drain {name}: commit the writes locally"))?;
         if published {
-            println!(
+            out.line(format!(
                 "drained {name} in {:.1?}: the store holds every write acknowledged before the signal",
                 t0.elapsed()
-            );
+            ));
         } else {
-            println!(
+            out.line(format!(
                 "drained {name} in {:.1?}: the writes are on this host; `attach --recover` publishes them",
                 t0.elapsed()
-            );
+            ));
         }
         Ok(())
     }
 
     /// Tells systemd, when it started this daemon with `Type=notify`, how the daemon stands.
-    fn notify(state: &str) {
+    pub(crate) fn notify(state: &str) {
         if let Some(to) = std::env::var_os("NOTIFY_SOCKET")
             && let Err(e) = notify_to(&to, state)
         {
@@ -422,7 +484,7 @@ mod linux {
 
     /// Caps the dirty page cache of the device `a` mounts at `a.dirty_limit` bytes, unless it
     /// is 0. A failure leaves the kernel's limits in force.
-    async fn limit_dirty(a: &AttachArgs) {
+    async fn limit_dirty(a: &AttachArgs, out: &Out) {
         if a.dirty_limit == 0 {
             return;
         }
@@ -430,20 +492,20 @@ mod linux {
             a.dm.as_deref()
                 .map_or_else(|| a.device.clone(), pando_linux::mapper_path);
         if let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await {
-            eprintln!("{}: the dirty limit is off: {e}", mounted.display());
+            out.err(format!("{}: the dirty limit is off: {e}", mounted.display()));
         }
     }
 
     /// Warms `att`, then, with `hand_off`, moves its device to a local image.
-    async fn warm(att: Arc<Attachment>, name: String, hand_off: bool) {
+    async fn warm(att: Arc<Attachment>, name: String, hand_off: bool, out: Out) {
         match att.warm().await {
-            Ok(w) => println!("warmed {name}: {w:?}"),
-            Err(e) => return eprintln!("warm {name}: {e}"),
+            Ok(w) => out.line(format!("warmed {name}: {w:?}")),
+            Err(e) => return out.err(format!("warm {name}: {e}")),
         }
         if hand_off {
             match att.hand_off().await {
-                Ok(h) => println!("handed {name} off: {h:?}"),
-                Err(e) => eprintln!("handoff {name}: {e}"),
+                Ok(h) => out.line(format!("handed {name} off: {h:?}")),
+                Err(e) => out.err(format!("handoff {name}: {e}")),
             }
         }
     }
@@ -475,6 +537,7 @@ mod linux {
         id: u32,
         name: String,
         mut stop: watch::Receiver<bool>,
+        out: Out,
     ) {
         loop {
             let conn = tokio::select! {
@@ -483,19 +546,19 @@ mod linux {
             };
             match conn {
                 Ok((c, _)) => {
-                    if let Err(e) = answer(c, &att, id, &name).await {
-                        eprintln!("resize {name}: {e:#}");
+                    if let Err(e) = answer(c, &att, id, &name, &out).await {
+                        out.err(format!("resize {name}: {e:#}"));
                     }
                 }
                 Err(e) => {
-                    eprintln!("{}: {e}; resize is off", control_path(id).display());
+                    out.err(format!("{}: {e}; resize is off", control_path(id).display()));
                     return;
                 }
             }
         }
     }
 
-    async fn answer(conn: UnixStream, att: &Attachment, id: u32, name: &str) -> Result<()> {
+    async fn answer(conn: UnixStream, att: &Attachment, id: u32, name: &str, out: &Out) -> Result<()> {
         let (r, mut w) = conn.into_split();
         let mut line = String::new();
         tokio::time::timeout(REQUEST_WAIT, BufReader::new(r).read_line(&mut line))
@@ -504,7 +567,7 @@ mod linux {
         let reply = match parse_request(&line) {
             Ok(size) => match att.grow(size, pando_linux::resize(id, size)).await {
                 Ok(()) => {
-                    println!("grew {name} to {size} bytes");
+                    out.line(format!("grew {name} to {size} bytes"));
                     format!("ok {size}\n")
                 }
                 Err(e) => format!("error {}\n", one_line(&e.to_string())),
@@ -527,7 +590,7 @@ mod linux {
     }
 
     /// Asks the daemon that serves `r.device` to grow its branch and the devices over it.
-    pub(crate) async fn resize(r: ResizeArgs) -> Result<()> {
+    pub(crate) async fn resize(r: ResizeArgs, out: &Out) -> Result<()> {
         let id = pando_linux::device_id(&r.device)?;
         let p = control_path(id);
         let conn = UnixStream::connect(&p).await.with_context(|| {
@@ -544,11 +607,11 @@ mod linux {
         BufReader::new(rd).read_line(&mut line).await?;
         match line.trim_end().split_once(' ') {
             Some(("ok", _)) => {
-                println!(
+                out.line(format!(
                     "{} is {} bytes; grow the file system on it to use them (resize2fs for ext4)",
                     r.device.display(),
                     r.size
-                );
+                ));
                 Ok(())
             }
             Some(("error", why)) => bail!("resize {}: {why}", r.device.display()),
@@ -579,21 +642,26 @@ mod linux {
     }
 
     /// Publishes the branch and frees it; the device no longer writes to its image.
-    async fn finish(att: Arc<Attachment>, name: &str) -> Result<()> {
+    async fn finish(att: Arc<Attachment>, name: &str, out: &Out) -> Result<()> {
         let t0 = Instant::now();
         let att = Arc::into_inner(att).with_context(|| format!("{name}: the attachment is still in use"))?;
         if let Some(s) = att.snapshots() {
-            println!("snapshots of {name}: {s:?}");
+            out.line(format!("snapshots of {name}: {s:?}"));
         }
         let cache = Arc::clone(att.cache());
         let r = att.finish().await.with_context(|| format!("publish {name}"))?;
+        if let Some(e) = &r.log_open {
+            out.err(format!(
+                "{name}: the write log stays open, so the next open reads it: {e}"
+            ));
+        }
         let total = t0.elapsed();
-        println!("published {name} in {total:.1?}: {r:?}");
+        out.line(format!("published {name} in {total:.1?}: {r:?}"));
         let c = &r.checkpoint;
         let last = c.last.unwrap_or_default();
         let s = cache.stats();
         let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-        println!(
+        out.line(format!(
             "publish times {name}: total={:.4} absorb={:.4} flush={:.4} wait={:.4} pack={:.4} ref={:.4} \
              after={:.4} passes_before={} bytes_before={} passes={} bytes={} stalls={} stall={:.4} \
              fetched_bytes={}",
@@ -611,7 +679,7 @@ mod linux {
             load(&s.stalls),
             Duration::from_nanos(load(&s.stall_nanos)).as_secs_f64(),
             load(&s.bytes_fetched),
-        );
+        ));
         Ok(())
     }
 
