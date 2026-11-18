@@ -50,7 +50,7 @@ in the following order on a fresh branch:
 | `replay` | slowdown while the agent works | the 14 commands, total and per command, as a ratio to native ext4 on local NVMe |
 | `save` | time to durable | from the last write to the branch being readable on another host; also bytes uploaded after `npm ci` |
 | `fio` | raw I/O | 4 KiB random read QD1 and 4 x QD32, 4 KiB random write 4 x QD32, 1 MiB sequential read and write |
-| `crash` | crash survival | `kill -9` of the storage daemon mid-write: failed writes, fsck, file correctness on a fresh host |
+| `crash` | crash survival | `kill -9` of the storage daemon, and for Pando a host reboot without a sync, mid-write: failed writes, fsck, file correctness on a fresh host |
 
 Run a measure with `bench/run.sh <measure>` on the host, or pick it in the workflow's `measure`
 input (`all` runs every implemented one). For `fork`, each system loads the workspace once, then
@@ -132,9 +132,15 @@ base where it would in production, and every branch is opened on the bench host:
   as usual. A fresh host is then a new cache and state directory on the same VM, sharing nothing
   with the first: the file system is checked (`e2fsck -fn` for Pando, `juicefs fsck` for JuiceFS)
   and every acknowledged file is read back. The stall is the longest gap between acknowledged
-  writes.
+  writes. Pando also has a reboot case, `crash-reboot`: the same writer, with its log fsynced
+  after each acknowledged write, and five seconds in the host reboots through
+  `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would. Once the host
+  is back, `pando attach --recover=auto` serves the branch from the state the host kept, the
+  file system is mounted (ext4 replays its journal), unmounted and checked with `e2fsck -fn`,
+  every acknowledged file is read back, and the branch is closed and checked again on a fresh
+  host. The bench workflow runs it after `crash`.
 
-Repeat every run 5 times (3 for `replay`, `save`, `fio` and `crash`), dropping caches between
+Repeat every run 5 times (3 for `replay`), dropping caches between
 repetitions, and report the median and range.
 Write raw results to `bench/results/<measure>.csv` with the columns
 `system,workspace,measure,rep,value,unit,notes`. A plot script converts those results to
