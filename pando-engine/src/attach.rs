@@ -23,7 +23,7 @@ use crate::cache::{BaseKey, Cache};
 use crate::dedup::learned::{LearnedIndex, Learner};
 use crate::handoff::{self, Handoff, HandoffReport, HostEnv, SnapshotOptions, resize_table};
 use crate::ports::DeviceSwitch;
-use crate::{Ports, Result, Volume, ext4, recording};
+use crate::{Error, LogMode, Ports, Result, Volume, ext4, recording};
 
 const BUILD_PARALLEL: usize = 16;
 
@@ -60,6 +60,9 @@ pub struct AttachOptions {
     pub hydrate: usize,
     /// Take over a device whose writer died while the kernel served it from an image.
     pub rejoin: bool,
+    /// How the branch logs its flushes to the store. [`LogMode::Strict`] cannot hand off: the
+    /// kernel flushes an image without the branch.
+    pub log: LogMode,
 }
 
 /// What [`Attachment::warm`] did.
@@ -131,7 +134,12 @@ impl Attachment {
         name: &str,
         opts: AttachOptions,
     ) -> Result<Attachment> {
-        let v = Arc::new(Volume::open_then(ports, Arc::clone(&cache), dir, name).await?);
+        if opts.log == LogMode::Strict && opts.images.is_some() {
+            return Err(Error::Corrupt(
+                "a strict log needs every flush, so the branch cannot hand off to an image".into(),
+            ));
+        }
+        let v = Arc::new(Volume::open_logged(ports, Arc::clone(&cache), dir, name, opts.log).await?);
         let bases = opts
             .images
             .as_ref()
@@ -290,7 +298,7 @@ impl Attachment {
     /// Once [`Self::warm`] is done, moves the device to a local image of the branch.
     pub async fn hand_off(&self) -> Result<HandoffReport> {
         let (Some(images), Some(dm)) = (self.opts.images.clone(), self.opts.device.clone()) else {
-            return Err(crate::Error::Corrupt(
+            return Err(Error::Corrupt(
                 "a handoff needs an image directory and a device".into(),
             ));
         };
@@ -377,6 +385,9 @@ impl Attachment {
         }
         if done.is_ok() {
             done = v.checkpoint().await;
+        }
+        if done.is_ok() {
+            let _ = v.close_log().await;
         }
         let learner = self.learner.lock().take();
         if let Some(l) = learner {

@@ -20,25 +20,32 @@ sharing one root system.
 - **Chunks and branch refs.** The device is split into 64 KiB chunks named by their hash. A
   persistent radix tree maps each chunk index to a chunk. Each branch is one root entry in a
   small ref object, and forking copies that ref. Branches share every chunk they have not changed.
+  A checkpoint freezes a branch's root under a name that never changes, so a host that has read it
+  once forks from it with a single request to the store.
 - **Segment storage.** Chunks and tree nodes are packed into ~8 MiB segments containing zstd
   frames of up to 1 MiB. A single range GET fetches neighbouring chunks, and uploads take a few
   PUTs rather than one per write. Where possible, changed chunks are stored as 4 KiB block
   references to the base, reducing the data uploaded by `npm ci` by about 13x.
-- **Write-back with fencing.** A flush is immediately durable locally and uploads in the
-  background. A conditional PUT updates the ref. Opening a branch takes a new writer generation
-  that fences any older writer.
+- **Write-back with fencing.** A flush is immediately durable locally, reaches a write log in
+  the store moments later, and uploads in the background. A conditional PUT updates the ref.
+  Opening a branch takes a new writer generation that fences any older writer, and applies what
+  the log has beyond the ref, so a lost host loses at most the last moments of writes. With
+  `attach --log strict`, a flush returns only once the log in the store has it.
 - **Fast starts.** Each host keeps a base image per root and clones it with reflink. A later
   branch of the same root therefore starts in about 250 ms. The first run records the frames it
   touched, and the next run on another host prefetches them. Once the branch is local, Pando
   hands the device to the kernel through device-mapper over a loop device and leaves the I/O path.
 - **Crash safety.** ublk user recovery and a local journal preserve acknowledged writes through
   a daemon crash. After restarting, the daemon resumes serving the device where it left off.
+- **Host daemon.** `pando serve --socket PATH` keeps the store's connections, the cache and the
+  checkpoints it has read. `pando --socket PATH <command>` runs the command there, so a branch or
+  attach skips process start-up, credential loading and cold connections.
 
 ## Crates
 
 | Crate | Contents |
 |---|---|
-| `pando-format` | the store format: hashes, entries, refs, tree nodes, frames, segment indexes, recipes, change lists, object keys. No I/O. |
+| `pando-format` | the store format: hashes, entries, refs, checkpoints, tree nodes, frames, segment indexes, recipes, change lists, write log records, object keys. No I/O. |
 | `pando-engine` | the volume engine: the block map tree, the cache, fetch and its scheduler, the uploader and writer fencing, dedup, base builds, seeding and the handoff steps. It reaches the outside world only through ports. |
 | `pando-s3` | the object-store port over any S3-compatible store with conditional writes (AWS S3, Cloudflare R2, MinIO) |
 | `pando-host` | the host ports on a real machine: files, base images, clock, randomness, CPU pool. Linux gets reflinks, extent hints and hole punching; other systems get plain fallbacks. |

@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{ArgAction, Args};
+use clap::{ArgAction, Args, ValueEnum};
 
 /// How `attach` serves a branch.
 #[derive(Args, Debug)]
@@ -65,6 +65,29 @@ pub(crate) struct AttachArgs {
     /// Hardware queues of a new device, one thread each.
     #[arg(long, default_value_t = 2)]
     pub(crate) queues: u16,
+    /// How flushes reach the store's write log: `behind` acknowledges a flush once it is
+    /// durable on this host and logs it moments later; `strict` acknowledges it only once the
+    /// log in the store has it (not with --images); `off` leaves it to the next upload.
+    #[arg(long, value_enum, default_value_t = Log::Behind)]
+    pub(crate) log: Log,
+}
+
+/// How `attach` logs flushes; see [`pando_engine::LogMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Log {
+    Off,
+    Behind,
+    Strict,
+}
+
+impl From<Log> for pando_engine::LogMode {
+    fn from(l: Log) -> Self {
+        match l {
+            Log::Off => pando_engine::LogMode::Off,
+            Log::Behind => pando_engine::LogMode::Behind,
+            Log::Strict => pando_engine::LogMode::Strict,
+        }
+    }
 }
 
 /// Which device `detach` stops.
@@ -105,6 +128,7 @@ pub(crate) async fn attach(
     _: std::sync::Arc<pando_engine::Cache>,
     _: AttachArgs,
     _: String,
+    _: &crate::Out,
 ) -> anyhow::Result<()> {
     anyhow::bail!("attach needs Linux")
 }
@@ -115,7 +139,7 @@ pub(crate) async fn detach(_: DetachArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) async fn resize(_: ResizeArgs) -> anyhow::Result<()> {
+pub(crate) async fn resize(_: ResizeArgs, _: &crate::Out) -> anyhow::Result<()> {
     anyhow::bail!("resize needs Linux")
 }
 
@@ -138,6 +162,7 @@ mod linux {
     use tokio::sync::watch;
 
     use super::{AttachArgs, DetachArgs, ResizeArgs};
+    use crate::Out;
 
     const CONTROL_DIR: &str = "/run/pando";
     /// How long a daemon waits for the request of a client that connected.
@@ -145,7 +170,13 @@ mod linux {
 
     /// Serves branch `a.name` until `detach` stops its device, then publishes it. `store` names
     /// the store, so chunks learned from one store never serve another.
-    pub(crate) async fn attach(ports: &Ports, cache: Arc<Cache>, a: AttachArgs, store: String) -> Result<()> {
+    pub(crate) async fn attach(
+        ports: &Ports,
+        cache: Arc<Cache>,
+        a: AttachArgs,
+        store: String,
+        out: &Out,
+    ) -> Result<()> {
         let id = pando_linux::device_id(&a.device)?;
         if a.images.is_some() && a.dm.is_none() {
             bail!("--images needs --dm");
@@ -155,12 +186,93 @@ mod linux {
         }
         let t0 = Instant::now();
         let switch: Arc<dyn DeviceSwitch> = Arc::new(DmSwitch::new());
+        let opts = options(&a, &store);
+        let att = Arc::new(
+            Attachment::open(ports, Some(Arc::clone(&switch)), cache, &a.state, &a.name, opts).await?,
+        );
+        let fopts = FrontendOptions {
+            queues: a.queues,
+            recover: a.recover,
+        };
+        let mut fe = match Frontend::start(Handle::current(), Arc::clone(att.volume()), id, fopts).await {
+            Ok(fe) => fe,
+            Err(e) => {
+                if let Err(fe) = finish(att, &a.name, out).await {
+                    out.err(format!("{fe:#}"));
+                }
+                return Err(e).with_context(|| format!("start {}", a.device.display()));
+            }
+        };
+        if let Some(dm) = a.dm.as_deref().filter(|_| !a.recover)
+            && let Err(e) = switch.create(dm, &a.device, att.volume().size()).await
+        {
+            if let Err(ae) = fe.abort().await {
+                out.err(format!("stop {}: {ae}", a.device.display()));
+            }
+            if let Err(fe) = finish(att, &a.name, out).await {
+                out.err(format!("{fe:#}"));
+            }
+            return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
+        }
+        out.line(format!(
+            "attached {} as {} in {:.1?}{}",
+            a.name,
+            a.device.display(),
+            t0.elapsed(),
+            if att.rejoined() {
+                ", rejoined its image"
+            } else {
+                ""
+            }
+        ));
+        let (stop, stopping) = watch::channel(false);
+        let control = match listen(id) {
+            Ok(l) => Some(tokio::spawn(serve(
+                l,
+                Arc::clone(&att),
+                id,
+                a.name.clone(),
+                stopping,
+                out.clone(),
+            ))),
+            Err(e) => {
+                out.err(format!("{}: resize is off: {e}", control_path(id).display()));
+                None
+            }
+        };
+        let background = (!att.rejoined()).then(|| {
+            tokio::spawn(warm(
+                Arc::clone(&att),
+                a.name.clone(),
+                a.images.is_some(),
+                out.clone(),
+            ))
+        });
+        if let Err(e) = fe.stopped().await {
+            out.err(format!("{}: {e}", a.device.display()));
+        }
+        stop.send_replace(true);
+        if let Some(b) = background {
+            b.abort();
+            let _ = b.await;
+        }
+        if let Some(c) = control {
+            let _ = c.await;
+            let _ = std::fs::remove_file(control_path(id));
+        }
+        let published = finish(att, &a.name, out).await;
+        drop(fe);
+        published
+    }
+
+    /// The engine options `a` asks for, for a branch of store `store`.
+    fn options(a: &AttachArgs, store: &str) -> AttachOptions {
         let learned = a
             .images
             .as_ref()
             .filter(|_| a.learn)
             .map(|d| d.join("learned").join(Hash::of(store.as_bytes()).short()));
-        let opts = AttachOptions {
+        AttachOptions {
             images: a.images.clone(),
             device: a.dm.clone(),
             share_bases: a.share_bases,
@@ -173,88 +285,20 @@ mod linux {
             metadata: a.metadata,
             hydrate: a.hydrate,
             rejoin: a.recover,
-        };
-        let att = Arc::new(
-            Attachment::open(ports, Some(Arc::clone(&switch)), cache, &a.state, &a.name, opts).await?,
-        );
-        let fopts = FrontendOptions {
-            queues: a.queues,
-            recover: a.recover,
-        };
-        let mut fe = match Frontend::start(Handle::current(), Arc::clone(att.volume()), id, fopts).await {
-            Ok(fe) => fe,
-            Err(e) => {
-                if let Err(fe) = finish(att, &a.name).await {
-                    eprintln!("{fe:#}");
-                }
-                return Err(e).with_context(|| format!("start {}", a.device.display()));
-            }
-        };
-        if let Some(dm) = a.dm.as_deref().filter(|_| !a.recover)
-            && let Err(e) = switch.create(dm, &a.device, att.volume().size()).await
-        {
-            if let Err(ae) = fe.abort().await {
-                eprintln!("stop {}: {ae}", a.device.display());
-            }
-            if let Err(fe) = finish(att, &a.name).await {
-                eprintln!("{fe:#}");
-            }
-            return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
+            log: a.log.into(),
         }
-        println!(
-            "attached {} as {} in {:.1?}{}",
-            a.name,
-            a.device.display(),
-            t0.elapsed(),
-            if att.rejoined() {
-                ", rejoined its image"
-            } else {
-                ""
-            }
-        );
-        let (stop, stopping) = watch::channel(false);
-        let control = match listen(id) {
-            Ok(l) => Some(tokio::spawn(serve(
-                l,
-                Arc::clone(&att),
-                id,
-                a.name.clone(),
-                stopping,
-            ))),
-            Err(e) => {
-                eprintln!("{}: resize is off: {e}", control_path(id).display());
-                None
-            }
-        };
-        let background = (!att.rejoined())
-            .then(|| tokio::spawn(warm(Arc::clone(&att), a.name.clone(), a.images.is_some())));
-        if let Err(e) = fe.stopped().await {
-            eprintln!("{}: {e}", a.device.display());
-        }
-        stop.send_replace(true);
-        if let Some(b) = background {
-            b.abort();
-            let _ = b.await;
-        }
-        if let Some(c) = control {
-            let _ = c.await;
-            let _ = std::fs::remove_file(control_path(id));
-        }
-        let published = finish(att, &a.name).await;
-        drop(fe);
-        published
     }
 
     /// Warms `att`, then, with `hand_off`, moves its device to a local image.
-    async fn warm(att: Arc<Attachment>, name: String, hand_off: bool) {
+    async fn warm(att: Arc<Attachment>, name: String, hand_off: bool, out: Out) {
         match att.warm().await {
-            Ok(w) => println!("warmed {name}: {w:?}"),
-            Err(e) => return eprintln!("warm {name}: {e}"),
+            Ok(w) => out.line(format!("warmed {name}: {w:?}")),
+            Err(e) => return out.err(format!("warm {name}: {e}")),
         }
         if hand_off {
             match att.hand_off().await {
-                Ok(h) => println!("handed {name} off: {h:?}"),
-                Err(e) => eprintln!("handoff {name}: {e}"),
+                Ok(h) => out.line(format!("handed {name} off: {h:?}")),
+                Err(e) => out.err(format!("handoff {name}: {e}")),
             }
         }
     }
@@ -286,6 +330,7 @@ mod linux {
         id: u32,
         name: String,
         mut stop: watch::Receiver<bool>,
+        out: Out,
     ) {
         loop {
             let conn = tokio::select! {
@@ -294,19 +339,19 @@ mod linux {
             };
             match conn {
                 Ok((c, _)) => {
-                    if let Err(e) = answer(c, &att, id, &name).await {
-                        eprintln!("resize {name}: {e:#}");
+                    if let Err(e) = answer(c, &att, id, &name, &out).await {
+                        out.err(format!("resize {name}: {e:#}"));
                     }
                 }
                 Err(e) => {
-                    eprintln!("{}: {e}; resize is off", control_path(id).display());
+                    out.err(format!("{}: {e}; resize is off", control_path(id).display()));
                     return;
                 }
             }
         }
     }
 
-    async fn answer(conn: UnixStream, att: &Attachment, id: u32, name: &str) -> Result<()> {
+    async fn answer(conn: UnixStream, att: &Attachment, id: u32, name: &str, out: &Out) -> Result<()> {
         let (r, mut w) = conn.into_split();
         let mut line = String::new();
         tokio::time::timeout(REQUEST_WAIT, BufReader::new(r).read_line(&mut line))
@@ -315,7 +360,7 @@ mod linux {
         let reply = match parse_request(&line) {
             Ok(size) => match att.grow(size, pando_linux::resize(id, size)).await {
                 Ok(()) => {
-                    println!("grew {name} to {size} bytes");
+                    out.line(format!("grew {name} to {size} bytes"));
                     format!("ok {size}\n")
                 }
                 Err(e) => format!("error {}\n", one_line(&e.to_string())),
@@ -338,7 +383,7 @@ mod linux {
     }
 
     /// Asks the daemon that serves `r.device` to grow its branch and the devices over it.
-    pub(crate) async fn resize(r: ResizeArgs) -> Result<()> {
+    pub(crate) async fn resize(r: ResizeArgs, out: &Out) -> Result<()> {
         let id = pando_linux::device_id(&r.device)?;
         let p = control_path(id);
         let conn = UnixStream::connect(&p).await.with_context(|| {
@@ -355,11 +400,11 @@ mod linux {
         BufReader::new(rd).read_line(&mut line).await?;
         match line.trim_end().split_once(' ') {
             Some(("ok", _)) => {
-                println!(
+                out.line(format!(
                     "{} is {} bytes; grow the file system on it to use them (resize2fs for ext4)",
                     r.device.display(),
                     r.size
-                );
+                ));
                 Ok(())
             }
             Some(("error", why)) => bail!("resize {}: {why}", r.device.display()),
@@ -390,14 +435,14 @@ mod linux {
     }
 
     /// Publishes the branch and frees it; the device no longer writes to its image.
-    async fn finish(att: Arc<Attachment>, name: &str) -> Result<()> {
+    async fn finish(att: Arc<Attachment>, name: &str, out: &Out) -> Result<()> {
         let t0 = Instant::now();
         let att = Arc::into_inner(att).with_context(|| format!("{name}: the attachment is still in use"))?;
         if let Some(s) = att.snapshots() {
-            println!("snapshots of {name}: {s:?}");
+            out.line(format!("snapshots of {name}: {s:?}"));
         }
         let r = att.finish().await.with_context(|| format!("publish {name}"))?;
-        println!("published {name} in {:.1?}: {r:?}", t0.elapsed());
+        out.line(format!("published {name} in {:.1?}: {r:?}", t0.elapsed()));
         Ok(())
     }
 

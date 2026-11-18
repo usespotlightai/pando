@@ -35,3 +35,34 @@ Every object from the store is checked against its content hash once, when a fra
 A chunk rebuilt from a recipe or built from local blocks is checked against its hash. The
 `Verified` type is the only way such bytes enter the engine. Detach waits until the upload is
 durable in the store.
+
+## Durability
+
+A flush commits locally first: the chunks go to the cache log, one sync, then the new root is
+recorded. Two background tasks then take it to the store:
+
+- The **shipper** merges the flushes that wait into one record of the branch's write log and
+  creates it at `log/<hash of the branch name>/<writer generation>/<n>`. Records are numbered
+  from 0 without gaps, and a create fails when the number is taken.
+- The **uploader** packs pending chunks and tree nodes into segments and moves the ref. The ref's
+  `log` line says which records its root covers; the shipper then deletes them.
+
+An open that does not resume this host's own state reads the records the ref does not cover, from
+the ref's log position through the last writer's log, and applies them as writes. It seals each
+log it read by creating a seal record at its first free number, so a writer that is still running
+fails its next append and stops. A record that would leave a gap is not applied, nor anything
+after it: an open always sees a prefix of the flushes. A detach marks the ref's log as closed, and
+the next open then reads no records.
+
+With `--log behind`, the default, a flush returns once it is durable on the host, and the shipper
+creates its record within about 50 ms. With `--log strict`, a flush returns once its record is
+created or an upload published it; a strict branch cannot hand off to an image, since the kernel
+then flushes the image without Pando. With `--log off`, only uploads reach the store.
+
+## Host daemon
+
+`pando serve` runs every command a client sends it in one process, on one cache. A request is the
+client's arguments; the answer streams the command's output and ends with its exit code. Store
+settings and credentials stay in the daemon, which refuses a request for another store or cache.
+A client that disconnects cancels its command, except `attach`, whose device keeps serving until
+`detach`. Devices stop with the daemon; `attach --recover` takes them over.

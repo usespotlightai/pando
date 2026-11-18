@@ -50,6 +50,9 @@ pub enum Error {
     /// A branch creation found the branch's ref taken.
     #[error("ref {0} already exists")]
     RefExists(String),
+    /// A checkpoint creation found the name taken.
+    #[error("checkpoint {0} already exists")]
+    CheckpointExists(String),
     /// The caller that led a fetch others waited for gave up.
     #[error("the fetch was cancelled")]
     Cancelled,
@@ -73,6 +76,7 @@ impl Error {
             | Error::Corrupt(_)
             | Error::SegmentExists(_)
             | Error::RefExists(_)
+            | Error::CheckpointExists(_)
             | Error::Cancelled) => e,
         }
     }
