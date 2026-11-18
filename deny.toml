@@ -41,6 +41,10 @@ skip = [
     { crate = "crypto-common@0.1.7", reason = "digest 0.10, for crc-fast in object_store" },
     { crate = "digest@0.10.7", reason = "crc-fast in object_store is still on digest 0.10" },
     { crate = "getrandom@0.2.17", reason = "ring 0.17 is still on getrandom 0.2" },
+    { crate = "lock_api@0.4.14", reason = "object_store is still on parking_lot 0.12" },
+    { crate = "parking_lot@0.12.5", reason = "object_store is still on parking_lot 0.12" },
+    { crate = "parking_lot_core@0.9.12", reason = "object_store is still on parking_lot 0.12" },
+    { crate = "redox_syscall@0.5.18", reason = "object_store is still on parking_lot 0.12" },
     { crate = "syn@2.0.119", reason = "the jni, tracing and windows proc macros are still on syn 2" },
     { crate = "windows-sys@0.52.0", reason = "ring 0.17 is still on windows-sys 0.52" },
 ]
