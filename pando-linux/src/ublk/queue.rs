@@ -86,16 +86,16 @@ impl TagBuf {
 /// Serves a request on the engine runtime.
 async fn handle(vol: &Volume, r: Request, buf: Option<&mut [u8]>) -> i32 {
     let done = match (r.op(), buf) {
-        (OP_READ, Some(b)) => vol.read_at(b, r.off).await,
+        (OP_READ, Some(b)) => return result(vol.read_at(b, r.off).await, done_len(r), false),
         (OP_WRITE, Some(b)) => match vol.write_at(b, r.off).await {
             Ok(()) if r.op_flags & IO_F_FUA != 0 => vol.flush().await,
             done => done,
         },
-        (OP_FLUSH, _) => return result(vol.flush().await, 0),
+        (OP_FLUSH, _) => return result(vol.flush().await, 0, true),
         (OP_DISCARD | OP_WRITE_ZEROES, _) => vol.zero(r.off, r.len as u64).await,
         _ => return -libc::EINVAL,
     };
-    result(done, done_len(r))
+    result(done, done_len(r), true)
 }
 
 /// The result that completes `r`: its length. The queue fails a request that does not
@@ -104,9 +104,13 @@ fn done_len(r: Request) -> i32 {
     i32::try_from(r.len).unwrap_or(-libc::EINVAL)
 }
 
-fn result(done: pando_engine::Result<()>, ok: i32) -> i32 {
+/// A write, discard or flush that failed for want of room on the cache's disk ends with ENOSPC,
+/// which the daemon reports once rather than per request; any other failure is logged and ends
+/// with EIO.
+fn result(done: pando_engine::Result<()>, ok: i32, writes: bool) -> i32 {
     match done {
         Ok(()) => ok,
+        Err(e) if writes && e.is_no_room() => -libc::ENOSPC,
         Err(e) => {
             log(format_args!("ublk io: {e}"));
             -libc::EIO
@@ -130,7 +134,7 @@ fn try_read(vol: &Volume, r: Request, buf: &mut [u8]) -> Option<i32> {
     match vol.try_read_at(buf, r.off) {
         Ok(true) => Some(done_len(r)),
         Ok(false) => None,
-        Err(e) => Some(result(Err(e), 0)),
+        Err(e) => Some(result(Err(e), 0, false)),
     }
 }
 

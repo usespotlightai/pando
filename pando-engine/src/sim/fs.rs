@@ -28,6 +28,9 @@ struct Data {
     /// covers to new places; a clone shares the places of its source.
     blocks: BTreeMap<u64, u64>,
     durable_blocks: BTreeMap<u64, u64>,
+    /// The length [`LocalFile::allocate`] gave the file beyond `current`: space it holds,
+    /// reading as zeros.
+    reserved: u64,
 }
 
 impl Data {
@@ -44,6 +47,10 @@ impl Data {
     fn truncate(&mut self, len: u64) {
         self.blocks.retain(|b, _| b * BLOCK < len);
     }
+
+    fn len(&self) -> u64 {
+        u64_from(self.current.len()).max(self.reserved)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +62,29 @@ struct State {
     locks: BTreeMap<PathBuf, u64>,
     next_lock: u64,
     next_place: u64,
+    capacity: Option<u64>,
+}
+
+impl State {
+    /// The bytes still free for files to grow into.
+    fn free(&self) -> u64 {
+        let Some(cap) = self.capacity else {
+            return u64::MAX;
+        };
+        let used: u64 = self
+            .names
+            .values()
+            .filter_map(|n| match n {
+                Node::File(i) => self.data.get(i).map(Data::len),
+                Node::Dir => None,
+            })
+            .sum();
+        cap.saturating_sub(used)
+    }
+}
+
+fn full() -> io::Error {
+    io::Error::new(io::ErrorKind::StorageFull, "no space left on the simulated disk")
 }
 
 /// A file system in memory that keeps what a crash would keep apart from what it would lose:
@@ -72,6 +102,12 @@ fn not_found(p: &Path) -> io::Error {
 impl SimFs {
     fn lock_state(&self) -> MutexGuard<'_, State> {
         self.state.lock()
+    }
+
+    /// Limits the bytes the files may hold in all, or lifts the limit with `None`. A write
+    /// past it writes what fits and fails with `StorageFull`, as a full disk does.
+    pub fn set_capacity(&self, bytes: Option<u64>) {
+        self.lock_state().capacity = bytes;
     }
 
     /// Loses everything not yet durable, as a power cut would, and drops every lock.
@@ -176,7 +212,7 @@ impl LocalFs for SimFs {
                 Some(DirEntry {
                     name: p.file_name()?.to_string_lossy().into_owned(),
                     len: match n {
-                        Node::File(i) => u64_from(s.data[i].current.len()),
+                        Node::File(i) => s.data[i].len(),
                         Node::Dir => 0,
                     },
                     modified: SystemTime::UNIX_EPOCH,
@@ -240,6 +276,10 @@ impl LocalFs for SimFs {
 
     async fn try_lock(&self, path: &Path) -> io::Result<Box<dyn FileLock>> {
         self.lock(path).await
+    }
+
+    async fn available(&self, _dir: &Path) -> io::Result<u64> {
+        Ok(self.lock_state().free())
     }
 }
 
@@ -370,24 +410,34 @@ impl SimFile {
     }
 
     fn with_places<T>(&self, f: impl FnOnce(&mut Data, &mut u64) -> T) -> T {
-        let mut s = self.fs.lock_state();
-        let s = &mut *s;
-        f(s.data.entry(self.inode).or_default(), &mut s.next_place)
+        self.with_free(|d, next, _| f(d, next))
     }
 
-    fn write_bufs(&self, bufs: &[Bytes], offset: u64) -> usize {
-        self.with_places(|d, next| {
-            let start = usize_from(offset);
-            let mut at = start;
+    fn with_free<T>(&self, f: impl FnOnce(&mut Data, &mut u64, u64) -> T) -> T {
+        let mut s = self.fs.lock_state();
+        let free = s.free();
+        let s = &mut *s;
+        f(s.data.entry(self.inode).or_default(), &mut s.next_place, free)
+    }
+
+    /// Writes `bufs` from `offset` as far as the free space lets the file grow.
+    fn write_bufs(&self, bufs: &[Bytes], offset: u64) -> io::Result<()> {
+        self.with_free(|d, next, free| {
+            let limit = usize_from(d.len().saturating_add(free).min(u64_from(usize::MAX)));
+            let mut at = usize_from(offset);
             for b in bufs {
-                if d.current.len() < at + b.len() {
-                    d.current.resize(at + b.len(), 0);
+                let n = b.len().min(limit.saturating_sub(at));
+                if d.current.len() < at + n {
+                    d.current.resize(at + n, 0);
                 }
-                d.current[at..at + b.len()].copy_from_slice(b);
-                d.write(u64_from(at), u64_from(b.len()), next);
-                at += b.len();
+                d.current[at..at + n].copy_from_slice(&b[..n]);
+                d.write(u64_from(at), u64_from(n), next);
+                if n < b.len() {
+                    return Err(full());
+                }
+                at += n;
             }
-            at - start
+            Ok(())
         })
     }
 }
@@ -412,13 +462,11 @@ impl LocalFile for SimFile {
     }
 
     async fn write_at(&self, bufs: Vec<Bytes>, offset: u64) -> io::Result<()> {
-        self.write_bufs(&bufs, offset);
-        Ok(())
+        self.write_bufs(&bufs, offset)
     }
 
     fn write_at_now(&self, b: &[u8], offset: u64) -> io::Result<()> {
-        self.write_bufs(&[Bytes::copy_from_slice(b)], offset);
-        Ok(())
+        self.write_bufs(&[Bytes::copy_from_slice(b)], offset)
     }
 
     async fn sync_data(&self) -> io::Result<()> {
@@ -430,15 +478,31 @@ impl LocalFile for SimFile {
     }
 
     async fn set_len(&self, len: u64) -> io::Result<()> {
-        self.with(|d| {
+        self.with_free(|d, _, free| {
+            if len > d.len() && len - d.len() > free {
+                return Err(full());
+            }
             d.current.resize(usize_from(len), 0);
+            d.reserved = d.reserved.min(len);
             d.truncate(len);
-        });
-        Ok(())
+            Ok(())
+        })
+    }
+
+    async fn allocate(&self, len: u64) -> io::Result<()> {
+        self.with_free(|d, _, free| {
+            if len > d.len() {
+                if len - d.len() > free {
+                    return Err(full());
+                }
+                d.reserved = len;
+            }
+            Ok(())
+        })
     }
 
     async fn size(&self) -> io::Result<u64> {
-        Ok(self.with(|d| u64_from(d.current.len())))
+        Ok(self.with(|d| d.len()))
     }
 
     async fn start_writeback(&self) {}

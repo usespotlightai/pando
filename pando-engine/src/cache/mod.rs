@@ -28,7 +28,7 @@ pub(crate) use partial::{BaseKey, PartialBase};
 pub(crate) use sched::{FetchOpts, Sink};
 
 use crate::flight::Flights;
-use crate::local::{ObjectLog, WritebackHold};
+use crate::local::{ObjectLog, Space, WritebackHold};
 use crate::ports::{Cpu, CpuClass, LocalFs};
 use crate::remote::Remote;
 use crate::{Error, Result};
@@ -56,6 +56,10 @@ pub struct CacheStats {
     pub base_hits: AtomicU64,
 }
 
+/// The bytes the cache directory keeps free for commits: twice the most a volume buffers
+/// before it commits, with room for the tree nodes and state a commit writes beside them.
+pub(crate) const RESERVE: u64 = 128 << 20;
+
 /// A frame: its segment and its number there.
 pub(crate) type FrameKey = (SegId, u32);
 
@@ -66,6 +70,7 @@ pub struct Cache {
     remote: Remote,
     cpu: Arc<dyn Cpu>,
     log: ObjectLog,
+    space: Space,
     indexes: Mutex<HashMap<SegId, Arc<SegmentIndex>>>,
     index_flights: Flights<SegId>,
     frame_flights: Flights<FrameKey>,
@@ -130,11 +135,13 @@ impl Cache {
         remote: Remote,
         dir: &Path,
     ) -> Result<Cache> {
-        let log = ObjectLog::open(fs, &dir.join("objects")).await?;
+        let log = ObjectLog::open(Arc::clone(&fs), &dir.join("objects")).await?;
+        let space = Space::open(fs, dir, "reserve", RESERVE).await?;
         Ok(Cache {
             remote,
             cpu,
             log,
+            space,
             indexes: Mutex::default(),
             index_flights: Flights::default(),
             frame_flights: Flights::default(),
@@ -151,6 +158,11 @@ impl Cache {
     /// The counters of this cache.
     pub fn stats(&self) -> &CacheStats {
         &self.stats
+    }
+
+    /// The headroom of the cache directory's disk.
+    pub(crate) fn space(&self) -> &Space {
+        &self.space
     }
 
     pub(crate) fn remote(&self) -> &Remote {

@@ -87,6 +87,12 @@ impl Error {
             | Error::Cancelled) => e,
         }
     }
+
+    /// Whether a local disk, or a quota on it, had no room for a write: what a block device
+    /// reports as ENOSPC.
+    pub fn is_no_room(&self) -> bool {
+        matches!(self.kind(), Error::Io(e) if crate::local::no_room(e))
+    }
 }
 
 /// A result whose error is the engine's [`Error`].

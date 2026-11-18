@@ -102,6 +102,15 @@ pub(crate) fn punch_hole(f: &File, offset: u64, len: u64) -> io::Result<()> {
     )?)
 }
 
+/// Allocates the first `len` bytes of `f`; `Ok(false)` when the file system has no `fallocate`.
+pub(crate) fn allocate(f: &File, len: u64) -> io::Result<bool> {
+    match fallocate(f, FallocateFlags::empty(), 0, len) {
+        Ok(()) => Ok(true),
+        Err(Errno::OPNOTSUPP) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `struct fsxattr` of linux/fs.h.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

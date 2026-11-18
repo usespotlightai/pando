@@ -119,6 +119,28 @@ impl LocalFs for HostFs {
         .await?;
         Ok(Box::new(HostLock { _file: file }))
     }
+
+    async fn available(&self, dir: &Path) -> io::Result<u64> {
+        let dir = dir.to_path_buf();
+        blocking(move || {
+            let st = rustix::fs::statvfs(&dir)?;
+            Ok(st.f_bavail.saturating_mul(st.f_frsize))
+        })
+        .await
+    }
+}
+
+/// Writes zeros from the end of `f` up to `len` bytes, so they have their space on the disk.
+fn fill_zeros(f: &File, len: u64) -> io::Result<()> {
+    const STEP: u64 = 1 << 20;
+    let zeros = vec![0; 1 << 20];
+    let mut at = f.metadata()?.len();
+    while at < len {
+        let n = STEP.min(len - at);
+        f.write_all_at(&zeros[..usize::try_from(n).map_err(io::Error::other)?], at)?;
+        at += n;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -189,6 +211,18 @@ impl LocalFile for HostFile {
     async fn set_len(&self, len: u64) -> io::Result<()> {
         let f = Arc::clone(&self.file);
         blocking(move || f.set_len(len)).await
+    }
+
+    async fn allocate(&self, len: u64) -> io::Result<()> {
+        let f = Arc::clone(&self.file);
+        blocking(move || {
+            #[cfg(target_os = "linux")]
+            if crate::linux::allocate(&f, len)? {
+                return Ok(());
+            }
+            fill_zeros(&f, len)
+        })
+        .await
     }
 
     async fn size(&self) -> io::Result<u64> {
@@ -344,6 +378,15 @@ impl LocalImage for HostFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_file_over_an_existing_one_is_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        HostFs.open(&a, Open::CreateNew).await.unwrap();
+        let err = HostFs.open(&a, Open::CreateNew).await.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn files_write_read_clone_and_punch() {
