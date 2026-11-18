@@ -1,0 +1,5 @@
+failure-threshold: style
+ignored:
+  # Debian removes superseded package versions from its archive, so pinned apt versions stop
+  # resolving; the base images are pinned by digest instead.
+  - DL3008

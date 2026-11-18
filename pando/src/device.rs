@@ -9,12 +9,20 @@ use clap::{ArgAction, Args};
 
 /// How `attach` serves a branch.
 #[derive(Args, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent command-line flag"
+)]
 pub(crate) struct AttachArgs {
     pub(crate) name: String,
     /// The ublk device to serve the branch as, /dev/ublkbN.
     #[arg(long)]
     pub(crate) device: PathBuf,
     /// Mount through this device-mapper device, /dev/mapper/<NAME>, over the ublk device.
+    #[expect(
+        rustdoc::invalid_html_tags,
+        reason = "the comment is the help text, where <...> marks a placeholder"
+    )]
     #[arg(long)]
     pub(crate) dm: Option<String>,
     /// Once the branch is local, copy it to an image in this directory and switch the
@@ -171,17 +179,17 @@ mod linux {
             hydrate: a.hydrate,
             rejoin: a.recover,
         };
-        let stats = cache.clone();
-        let att =
-            Arc::new(Attachment::open(ports, Some(switch.clone()), cache, &a.state, &a.name, opts).await?);
+        let att = Arc::new(
+            Attachment::open(ports, Some(Arc::clone(&switch)), cache, &a.state, &a.name, opts).await?,
+        );
         let fopts = FrontendOptions {
             queues: a.queues,
             recover: a.recover,
         };
-        let mut fe = match Frontend::start(Handle::current(), att.volume().clone(), id, fopts).await {
+        let mut fe = match Frontend::start(Handle::current(), Arc::clone(att.volume()), id, fopts).await {
             Ok(fe) => fe,
             Err(e) => {
-                if let Err(fe) = finish(att, &a.name, &stats).await {
+                if let Err(fe) = finish(att, &a.name).await {
                     eprintln!("{fe:#}");
                 }
                 return Err(e).with_context(|| format!("start {}", a.device.display()));
@@ -193,19 +201,12 @@ mod linux {
             if let Err(ae) = fe.abort().await {
                 eprintln!("stop {}: {ae}", a.device.display());
             }
-            if let Err(fe) = finish(att, &a.name, &stats).await {
+            if let Err(fe) = finish(att, &a.name).await {
                 eprintln!("{fe:#}");
             }
             return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
         }
-        let mounted =
-            a.dm.as_deref()
-                .map_or_else(|| a.device.clone(), pando_linux::mapper_path);
-        if a.dirty_limit > 0
-            && let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await
-        {
-            eprintln!("{}: the dirty limit is off: {e}", mounted.display());
-        }
+        limit_dirty(&a).await;
         println!(
             "attached {} as {} in {:.1?}{}",
             a.name,
@@ -219,28 +220,23 @@ mod linux {
         );
         let (stop, stopping) = watch::channel(false);
         let control = match listen(id) {
-            Ok(l) => Some(tokio::spawn(serve(l, att.clone(), id, a.name.clone(), stopping))),
+            Ok(l) => Some(tokio::spawn(serve(
+                l,
+                Arc::clone(&att),
+                id,
+                a.name.clone(),
+                stopping,
+            ))),
             Err(e) => {
                 eprintln!("{}: resize is off: {e}", control_path(id).display());
                 None
             }
         };
-        let background = (!att.rejoined()).then(|| {
-            let (att, name, hand_off) = (att.clone(), a.name.clone(), a.images.is_some());
-            tokio::spawn(async move {
-                match att.warm().await {
-                    Ok(w) => println!("warmed {name}: {w:?}"),
-                    Err(e) => return eprintln!("warm {name}: {e}"),
-                }
-                if hand_off {
-                    match att.hand_off().await {
-                        Ok(h) => println!("handed {name} off: {h:?}"),
-                        Err(e) => eprintln!("handoff {name}: {e}"),
-                    }
-                }
-            })
-        });
-        fe.stopped().await;
+        let background = (!att.rejoined())
+            .then(|| tokio::spawn(warm(Arc::clone(&att), a.name.clone(), a.images.is_some())));
+        if let Err(e) = fe.stopped().await {
+            eprintln!("{}: {e}", a.device.display());
+        }
         stop.send_replace(true);
         if let Some(b) = background {
             b.abort();
@@ -250,9 +246,37 @@ mod linux {
             let _ = c.await;
             let _ = std::fs::remove_file(control_path(id));
         }
-        let published = finish(att, &a.name, &stats).await;
+        let published = finish(att, &a.name).await;
         drop(fe);
         published
+    }
+
+    /// Caps the dirty page cache of the device `a` mounts at `a.dirty_limit` bytes, unless it
+    /// is 0. A failure leaves the kernel's limits in force.
+    async fn limit_dirty(a: &AttachArgs) {
+        if a.dirty_limit == 0 {
+            return;
+        }
+        let mounted =
+            a.dm.as_deref()
+                .map_or_else(|| a.device.clone(), pando_linux::mapper_path);
+        if let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await {
+            eprintln!("{}: the dirty limit is off: {e}", mounted.display());
+        }
+    }
+
+    /// Warms `att`, then, with `hand_off`, moves its device to a local image.
+    async fn warm(att: Arc<Attachment>, name: String, hand_off: bool) {
+        match att.warm().await {
+            Ok(w) => println!("warmed {name}: {w:?}"),
+            Err(e) => return eprintln!("warm {name}: {e}"),
+        }
+        if hand_off {
+            match att.hand_off().await {
+                Ok(h) => println!("handed {name} off: {h:?}"),
+                Err(e) => eprintln!("handoff {name}: {e}"),
+            }
+        }
     }
 
     /// The control socket of the daemon that serves ublk device `id`.
@@ -369,7 +393,7 @@ mod linux {
 
     /// Waits until the kernel holds the I/O of device `id` for a new daemon. A live daemon
     /// still writes the branch, so recovery must not take it over.
-    async fn dead_daemon(id: u32, device: &std::path::Path) -> Result<()> {
+    async fn dead_daemon(id: u32, device: &Path) -> Result<()> {
         for _ in 0..100 {
             if pando_linux::daemon_dead(id)
                 .await
@@ -377,7 +401,7 @@ mod linux {
             {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         bail!(
             "the daemon of {} is alive; recover only a device whose daemon died",
@@ -386,12 +410,13 @@ mod linux {
     }
 
     /// Publishes the branch and frees it; the device no longer writes to its image.
-    async fn finish(att: Arc<Attachment>, name: &str, cache: &Cache) -> Result<()> {
+    async fn finish(att: Arc<Attachment>, name: &str) -> Result<()> {
         let t0 = Instant::now();
         let att = Arc::into_inner(att).with_context(|| format!("{name}: the attachment is still in use"))?;
         if let Some(s) = att.snapshots() {
             println!("snapshots of {name}: {s:?}");
         }
+        let cache = Arc::clone(att.cache());
         let r = att.finish().await.with_context(|| format!("publish {name}"))?;
         let total = t0.elapsed();
         println!("published {name} in {total:.1?}: {r:?}");
@@ -415,7 +440,7 @@ mod linux {
             c.passes,
             c.bytes,
             load(&s.stalls),
-            load(&s.stall_nanos) as f64 / 1e9,
+            Duration::from_nanos(load(&s.stall_nanos)).as_secs_f64(),
             load(&s.bytes_fetched),
         );
         Ok(())

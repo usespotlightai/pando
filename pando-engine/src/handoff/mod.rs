@@ -19,9 +19,10 @@ pub(crate) mod adopt;
 mod extents;
 mod owner;
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pando_format::Hash;
@@ -72,11 +73,13 @@ pub(crate) struct SnapshotOptions {
 pub struct HandoffReport {
     /// The image started as a clone of the base image.
     pub shared: bool,
+    /// Chunks copied to the image while the device still served from the frontend.
     pub copied: usize,
     /// Rounds of copying what was written during the copy.
     pub rounds: usize,
     /// Chunks copied while the device was suspended.
     pub last: usize,
+    /// How long the device was suspended for the switch.
     pub paused: Duration,
     /// Bytes reads took from the base image before the switch.
     pub from_base: u64,
@@ -138,14 +141,13 @@ fn base36(mut n: u128) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut out = Vec::new();
     loop {
-        out.push(DIGITS[(n % 36) as usize]);
+        out.push(char::from(DIGITS[(n % 36) as usize]));
         n /= 36;
         if n == 0 {
             break;
         }
     }
-    out.reverse();
-    String::from_utf8(out).expect("ascii digits")
+    out.iter().rev().collect()
 }
 
 /// A new image name for branch `name` in `dir`. Each attach gets its own, from the time and a
@@ -252,7 +254,7 @@ impl Handoff {
 
     fn retire_prev(&self, s: &mut Snaps) {
         if let Some(p) = s.prev_path.take() {
-            self.retired.lock().expect("retired lock").push(p);
+            self.retired.lock().push(p);
         }
     }
 
@@ -285,7 +287,7 @@ impl Handoff {
     /// Removes the retired clones that no unpublished flush refers to.
     pub(crate) async fn remove_retired(&self, v: &Volume) {
         let gone: Vec<PathBuf> = {
-            let mut r = self.retired.lock().expect("retired lock");
+            let mut r = self.retired.lock();
             let (keep, gone) = std::mem::take(&mut *r).into_iter().partition(|p| v.referenced(p));
             *r = keep;
             gone
@@ -299,15 +301,15 @@ impl Handoff {
     /// Retires clones an earlier writer left: they go once the flushes so far are published.
     pub(crate) fn retire_unpublished(&self, v: &Volume, paths: Vec<PathBuf>) {
         v.reference_until_published(&paths);
-        self.retired.lock().expect("retired lock").extend(paths);
+        self.retired.lock().extend(paths);
     }
 
     fn start_snapshots(self: &Arc<Self>, v: &Arc<Volume>) {
         if self.opts.every.is_zero() {
             return;
         }
-        let (h, v) = (self.clone(), v.clone());
-        *self.task.lock().expect("task lock") = Some(tokio::spawn(async move { h.snapshot_loop(v).await }));
+        let (h, v) = (Arc::clone(self), Arc::clone(v));
+        *self.task.lock() = Some(tokio::spawn(async move { h.snapshot_loop(v).await }));
     }
 
     fn stopped(&self) -> bool {
@@ -315,7 +317,7 @@ impl Handoff {
     }
 
     async fn written(&self) -> Option<u64> {
-        let dev = self.loop_dev.lock().expect("loop lock").clone()?;
+        let dev = self.loop_dev.lock().clone()?;
         self.env.devices.bytes_written(&dev).await.ok()
     }
 
@@ -349,7 +351,7 @@ impl Handoff {
             }
             if let Err(e) = self.snapshot_once(&v).await {
                 self.stats.failed.fetch_add(1, Ordering::Relaxed);
-                *self.stats.last_error.lock().expect("stats lock") = Some(e.to_string());
+                *self.stats.last_error.lock() = Some(e.to_string());
             }
             last = Instant::now();
             base = now;
@@ -361,7 +363,7 @@ impl Handoff {
     /// must no longer write to the image.
     pub(crate) async fn absorb_final(&self, v: &Volume) -> Result<usize> {
         self.stop.send_replace(true);
-        let task = self.task.lock().expect("task lock").take();
+        let task = self.task.lock().take();
         if let Some(t) = task {
             let _ = t.await;
         }
@@ -396,7 +398,6 @@ impl Handoff {
         let lp = self
             .loop_dev
             .lock()
-            .expect("loop lock")
             .clone()
             .ok_or_else(|| crate::Error::Corrupt(format!("{}: no loop device", self.image.display())))?;
         let devices = self.env.devices.as_ref();
@@ -466,7 +467,7 @@ pub(crate) async fn hand_off(
     let size = v.size();
     let mut shared = None;
     if let Some(bases) = env.bases.as_ref().filter(|_| !opened.is_empty()) {
-        let cache = v.tree().cache().clone();
+        let cache = Arc::clone(v.tree().cache());
         let built = build(
             bases,
             &cache,
@@ -484,21 +485,18 @@ pub(crate) async fn hand_off(
             shared = Some(bases);
         }
     }
-    let file = match shared {
-        Some(_) => {
-            let f = fs.open(&image, Open::ReadWrite).await?;
-            if f.size().await? != size {
-                f.set_len(size).await?;
-            }
-            f
-        }
-        None => {
-            let _ = fs.remove(&image).await;
-            let f = fs.open(&image, Open::Create).await?;
-            let _ = env.ports.image.prepare(&image, None).await;
+    let file = if shared.is_some() {
+        let f = fs.open(&image, Open::ReadWrite).await?;
+        if f.size().await? != size {
             f.set_len(size).await?;
-            f
         }
+        f
+    } else {
+        let _ = fs.remove(&image).await;
+        let f = fs.open(&image, Open::Create).await?;
+        let _ = env.ports.image.prepare(&image, None).await;
+        f.set_len(size).await?;
+        f
     };
     let h = Arc::new(Handoff::new(
         env,
@@ -545,7 +543,7 @@ async fn copy_and_switch(h: &Arc<Handoff>, v: &Arc<Volume>, shared: Option<&Base
     h.owner(v, false).await?;
     let devices = h.env.devices.as_ref();
     let lp = devices.attach_loop(&h.image).await?;
-    *h.loop_dev.lock().expect("loop lock") = Some(lp.clone());
+    *h.loop_dev.lock() = Some(lp.clone());
     devices.load(&h.dm, &lp, v.size()).await?;
     let t0 = Instant::now();
     if let Err(e) = devices.suspend(&h.dm).await {
@@ -588,5 +586,6 @@ async fn under_suspend(h: &Handoff, v: &Volume) -> Result<(usize, Option<PathBuf
     Ok((n, h.clone_image().await.ok()))
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests;

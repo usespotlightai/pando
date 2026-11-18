@@ -163,7 +163,7 @@ pub(crate) async fn rejoin(
     let file = fs.open(&image, Open::ReadWrite).await?;
     let h = Arc::new(Handoff::new(env, dm, image.clone(), file, o.base, opts));
     h.switched.store(true, Ordering::Release);
-    *h.loop_dev.lock().expect("loop lock") = Some(lp);
+    *h.loop_dev.lock() = Some(lp);
     h.owner(v, true).await?;
     {
         let mut s = h.snaps.lock().await;

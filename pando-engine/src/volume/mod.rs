@@ -4,15 +4,17 @@
 //! recorded. An uploader packs pending objects into segments, uploads them and moves the
 //! branch's ref with a conditional update. A lost host loses only what was not uploaded yet.
 
-use std::collections::{HashMap, HashSet};
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use pando_format::{
-    BLOCK_SIZE, BlockKeys, CHUNK_SIZE, Entry, Hash, Loc, Ref, Writer, WriterId, depth_for, is_zero,
+    BLOCK_SIZE, BlockKeys, CHUNK_SIZE, Entry, Hash, Loc, Ref, Writer, WriterId, depth_for, is_zero, u64_from,
+    usize_from,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, watch};
 use tokio::task::JoinHandle;
@@ -24,7 +26,7 @@ use crate::dedup::learned::Learner;
 use crate::dedup::{Dedup, PreparedChunks};
 use crate::flight::bounded;
 use crate::gate::Gate;
-use crate::local::{Journal, read_file, write_durable};
+use crate::local::{Journal, Record, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
 use crate::ports::{Cpu, CpuClass, LocalFs, Version, on_cpu};
 use crate::remote::Remote;
@@ -34,7 +36,9 @@ use crate::{Error, Ports, Result};
 mod image;
 
 const STRIPES: usize = 64;
-const CHUNK: u64 = CHUNK_SIZE as u64;
+const CHUNK: u64 = u64_from(CHUNK_SIZE);
+const CHUNK_LEN: u32 = 64 << 10;
+const _: () = assert!(CHUNK_LEN as usize == CHUNK_SIZE);
 /// The uploader looks for new commits at least this often.
 const UPLOAD_EVERY: Duration = Duration::from_secs(2);
 /// After a failed upload the uploader waits this long before the next try.
@@ -45,6 +49,39 @@ const GENERATION_TRIES: usize = 10;
 const STORE_PARALLEL: usize = 16;
 /// Segments a change list walk fetches nodes from at once.
 const LIST_PARALLEL: usize = 16;
+static ZEROS: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
+
+/// A chunk written since the last flush.
+#[derive(Debug)]
+enum Dirty {
+    Bytes(Vec<u8>),
+    /// All zeros, held without a buffer, so clearing a large range costs no memory.
+    Zero,
+}
+
+impl Dirty {
+    fn of(b: &[u8]) -> Dirty {
+        if is_zero(b) {
+            Dirty::Zero
+        } else {
+            Dirty::Bytes(b.to_vec())
+        }
+    }
+
+    fn bytes(self) -> Bytes {
+        match self {
+            Dirty::Bytes(v) => Bytes::from(v),
+            Dirty::Zero => Bytes::from_static(&ZEROS),
+        }
+    }
+
+    fn copy_to(&self, at: usize, dst: &mut [u8]) {
+        match self {
+            Dirty::Bytes(d) => dst.copy_from_slice(&d[at..at + dst.len()]),
+            Dirty::Zero => dst.fill(0),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Mem {
@@ -54,19 +91,30 @@ struct Mem {
     size: u64,
     /// The root the branch opened at, as a root of `tree`.
     opened_now: Entry,
-    dirty: HashMap<u64, Vec<u8>>,
+    dirty: BTreeMap<u64, Dirty>,
     /// Every chunk written since the branch opened, so not the base image's any more.
     touched: HashSet<u64>,
-    flushing: Option<Arc<HashMap<u64, Bytes>>>,
+    flushing: Option<Arc<BTreeMap<u64, Bytes>>>,
     jfloor: u64,
     /// Dirty chunks whose bytes are also in a file that stays until they are published.
-    dirty_ref: HashMap<u64, ChunkRef>,
+    dirty_ref: BTreeMap<u64, ChunkRef>,
     /// The chunks written since tracking started, while a handoff copies the branch.
     track: Option<HashSet<u64>>,
     /// Flushes committed so far.
     flush_seq: u64,
     /// Per file, the last flush that recorded a chunk as a reference into it.
     ref_seq: HashMap<PathBuf, u64>,
+}
+
+impl Mem {
+    /// Records that chunk `idx` is dirty now: not the base image's, and not a reference.
+    fn written(&mut self, idx: u64) {
+        self.touched.insert(idx);
+        self.dirty_ref.remove(&idx);
+        if let Some(t) = &mut self.track {
+            t.insert(idx);
+        }
+    }
 }
 
 /// A chunk whose bytes are `CHUNK_SIZE` bytes at `offset` of the file at `path`.
@@ -109,15 +157,17 @@ pub struct PassTimes {
 /// What [`Volume::checkpoint_report`] did.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CheckpointReport {
+    /// Committing the completed writes on this host.
     pub flush: Duration,
     /// From the end of the flush until the store had everything.
     pub wait: Duration,
-    /// Upload passes that moved the ref before the checkpoint started, and the segment bytes
-    /// they put.
+    /// Upload passes that moved the ref before the checkpoint started.
     pub passes_before: u64,
+    /// The segment bytes those passes put.
     pub bytes_before: u64,
-    /// The same for the passes that moved it during the checkpoint.
+    /// Upload passes that moved the ref during the checkpoint.
     pub passes: u64,
+    /// The segment bytes those passes put.
     pub bytes: u64,
     /// The last of those passes; `None` when there was none.
     pub last: Option<PassTimes>,
@@ -179,19 +229,16 @@ struct VolState {
 
 impl VolState {
     fn encode(&self) -> Bytes {
-        let mut s = format!(
-            "{}\n{}\n{}\n{}\n",
+        let size = self.size.map_or_else(String::new, |n| format!("{n}\n"));
+        Bytes::from(format!(
+            "{}\n{}\n{}\n{}\n{size}",
             self.root, self.published, self.publishing, self.jfloor
-        );
-        if let Some(n) = self.size {
-            s += &format!("{n}\n");
-        }
-        Bytes::from(s)
+        ))
     }
 
     fn decode(b: &[u8]) -> Option<VolState> {
         let s = std::str::from_utf8(b).ok()?;
-        let lines: Vec<&str> = s.trim().split('\n').collect();
+        let lines: Vec<&str> = s.lines().collect();
         let (root, published, publishing, jfloor, size) = match lines.as_slice() {
             [r, p, q, j] => (r, p, q, j, None),
             [r, p, q, j, n] => (r, p, q, j, Some(n.parse().ok()?)),
@@ -216,7 +263,7 @@ impl Volume {
             generation: 0,
             from: None,
         };
-        Remote::new(ports.store.clone())
+        Remote::new(Arc::clone(&ports.store))
             .create_ref(name, &r)
             .await
             .map(drop)
@@ -242,25 +289,25 @@ impl Volume {
             .await?
             .ok_or_else(|| Error::Corrupt(format!("open {name}: no such branch")))?;
         let generation = r.generation + 1;
-        let journal = Journal::open(ports.fs.clone(), &dir.join("journal").join(name)).await?;
+        let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
         let state_path = dir.join("state").join(name);
         let state = read_file(ports.fs.as_ref(), &state_path)
             .await?
             .and_then(|b| VolState::decode(&b));
         let resume = state.filter(|s| s.published.hash == r.root.hash || s.publishing.hash == r.root.hash);
         let size = resume.and_then(|s| s.size).map_or(r.size, |n| n.max(r.size));
-        let tree = Arc::new(Tree::new(cache.clone(), size.div_ceil(CHUNK)));
+        let tree = Arc::new(Tree::new(Arc::clone(&cache), size.div_ceil(CHUNK)));
         let root = resume.map_or(r.root, |s| s.root);
         let mem = Mem {
             root,
-            tree: tree.clone(),
+            tree: Arc::clone(&tree),
             size,
             opened_now: root,
-            dirty: HashMap::new(),
+            dirty: BTreeMap::new(),
             touched: HashSet::new(),
             flushing: None,
             jfloor: resume.map_or(0, |s| s.jfloor),
-            dirty_ref: HashMap::new(),
+            dirty_ref: BTreeMap::new(),
             track: None,
             flush_seq: 0,
             ref_seq: HashMap::new(),
@@ -274,8 +321,8 @@ impl Volume {
             opened_tree: tree,
             opened_size: size,
             cache,
-            fs: ports.fs.clone(),
-            cpu: ports.cpu.clone(),
+            fs: Arc::clone(&ports.fs),
+            cpu: Arc::clone(&ports.cpu),
             writer: Arc::new(Writer::new(WriterId::new(name, generation), ports.rng.next_u32())),
             journal,
             state_path,
@@ -310,29 +357,11 @@ impl Volume {
             gate: Arc::default(),
             uploaded_seq: watch::Sender::new(0),
         });
-        if let Some(s) = resume {
-            let mut writes = Vec::new();
-            inner
-                .journal
-                .replay(s.jfloor, |idx, at, data| {
-                    writes.push((idx, at, data));
-                    Ok(())
-                })
-                .await?;
-            for (idx, at, data) in writes {
-                inner.write_chunk(idx, at, &data, false).await?;
-            }
-            let next = inner.journal.last().await?.max(s.jfloor) + 1;
-            inner.journal.start(next).await?;
-        } else {
-            inner.journal.reset().await?;
-            inner.journal.start(0).await?;
-            inner.persist().await?;
-        }
+        inner.start_journal(resume).await?;
         let grown = size != r.size;
-        let taker = tokio::spawn(inner.clone().take_generation(r, version));
-        let uploader = tokio::spawn(inner.clone().uploader());
-        let uploaded = inner.up.lock().expect("up lock").uploaded.hash;
+        let taker = tokio::spawn(Arc::clone(&inner).take_generation(r, version));
+        let uploader = tokio::spawn(Arc::clone(&inner).uploader());
+        let uploaded = inner.up.lock().uploaded.hash;
         if inner.root().hash != uploaded || grown {
             inner.kick.notify_one();
         }
@@ -342,6 +371,7 @@ impl Volume {
         })
     }
 
+    /// The name of the branch.
     pub fn name(&self) -> &str {
         &self.inner.name
     }
@@ -353,13 +383,13 @@ impl Volume {
 
     /// The tree of the current root; a grow past its depth replaces it.
     pub(crate) fn tree(&self) -> Arc<Tree> {
-        self.inner.mem.lock().expect("mem lock").tree.clone()
+        Arc::clone(&self.inner.mem.lock().tree)
     }
 
     /// The current root and the tree it is a root of.
     pub(crate) fn tree_and_root(&self) -> (Arc<Tree>, Entry) {
-        let m = self.inner.mem.lock().expect("mem lock");
-        (m.tree.clone(), m.root)
+        let m = self.inner.mem.lock();
+        (Arc::clone(&m.tree), m.root)
     }
 
     /// The root the branch opened at.
@@ -379,16 +409,16 @@ impl Volume {
 
     /// Lets later uploads send recipes of the blocks `dedup` finds.
     pub(crate) fn set_dedup(&self, dedup: Option<Arc<Dedup>>) {
-        *self.inner.dedup.lock().expect("dedup lock") = dedup;
+        *self.inner.dedup.lock() = dedup;
     }
 
     pub(crate) fn dedup(&self) -> Option<Arc<Dedup>> {
-        self.inner.dedup.lock().expect("dedup lock").clone()
+        self.inner.dedup.lock().clone()
     }
 
     /// Keeps what later uploads send as themselves for later runs on this host.
     pub(crate) fn set_learner(&self, learner: Option<Arc<Learner>>) {
-        *self.inner.learner.lock().expect("learner lock") = learner;
+        *self.inner.learner.lock() = learner;
     }
 
     /// Reads unchanged chunks from the base image of the root the branch opened at, when this
@@ -399,20 +429,16 @@ impl Volume {
             return Ok(false);
         }
         let view = BaseView::open(self.inner.fs.as_ref(), &bases.path(&opened)).await?;
-        *self.inner.base.lock().expect("base lock") = Some(Arc::new(view));
+        *self.inner.base.lock() = Some(Arc::new(view));
         Ok(true)
     }
 
     /// Stops reading from the base image; returns the bytes reads took from it.
     pub(crate) fn drop_base(&self) -> u64 {
-        self.inner
-            .base
-            .lock()
-            .expect("base lock")
-            .take()
-            .map_or(0, |b| b.served())
+        self.inner.base.lock().take().map_or(0, |b| b.served())
     }
 
+    /// The size of the branch in bytes; reads and writes must end at or below it.
     pub fn size(&self) -> u64 {
         self.inner.size()
     }
@@ -431,7 +457,7 @@ impl Volume {
 
     /// The root the store has for this branch, as this writer last published it.
     pub fn published(&self) -> Entry {
-        self.inner.up.lock().expect("up lock").published
+        self.inner.up.lock().published
     }
 
     /// Waits until the writer generation is taken; an error when another writer took it.
@@ -439,10 +465,10 @@ impl Volume {
         let mut rx = self.inner.changed.subscribe();
         loop {
             {
-                let up = self.inner.up.lock().expect("up lock");
+                let up = self.inner.up.lock();
                 if up.gen_taken {
                     return match (&up.error, up.fenced) {
-                        (Some(e), true) => Err(Error::Shared(e.clone())),
+                        (Some(e), true) => Err(Error::Shared(Arc::clone(e))),
                         _ => Ok(()),
                     };
                 }
@@ -453,8 +479,9 @@ impl Volume {
         }
     }
 
+    /// Fills `p` with the bytes at `off`: what was written, and zeros elsewhere.
     pub async fn read_at(&self, p: &mut [u8], off: u64) -> Result<()> {
-        if off + p.len() as u64 > self.inner.size() {
+        if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
         let mut misses = Vec::new();
@@ -478,7 +505,7 @@ impl Volume {
 
     /// Reads only from memory and the page cache, without waiting: `false` when it would wait.
     pub fn try_read_at(&self, p: &mut [u8], off: u64) -> Result<bool> {
-        if off + p.len() as u64 > self.inner.size() {
+        if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
         for (idx, at, pos, n) in parts(off, p.len()) {
@@ -489,8 +516,10 @@ impl Volume {
         Ok(true)
     }
 
+    /// Writes `p` at `off`; reads see it once this returns. [`Self::flush`] makes it durable
+    /// on this host.
     pub async fn write_at(&self, p: &[u8], off: u64) -> Result<()> {
-        if off + p.len() as u64 > self.inner.size() {
+        if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
         let writes = parts(off, p.len())
@@ -501,20 +530,19 @@ impl Volume {
 
     /// Clears a range. Whole chunks that hold no data stay sparse.
     pub async fn zero(&self, off: u64, len: u64) -> Result<()> {
-        if off + len > self.inner.size() {
+        if beyond(off, len, self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
-        let zeros = vec![0; CHUNK_SIZE];
         let mut pos = off;
         while pos < off + len {
-            let (idx, at) = (pos / CHUNK, (pos % CHUNK) as usize);
-            let n = (CHUNK_SIZE - at).min((off + len - pos) as usize);
-            if n == CHUNK_SIZE && self.inner.is_sparse(idx).await? {
-                pos += n as u64;
-                continue;
+            let (idx, at) = (pos / CHUNK, usize_from(pos % CHUNK));
+            let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
+            if n < CHUNK_SIZE {
+                self.inner.write_chunk(idx, at, &ZEROS[..n], true).await?;
+            } else if !self.inner.is_sparse(idx).await? {
+                self.inner.zero_chunk(idx, true).await?;
             }
-            self.inner.write_chunk(idx, at, &zeros[..n], true).await?;
-            pos += n as u64;
+            pos += u64_from(n);
         }
         Ok(())
     }
@@ -534,20 +562,20 @@ impl Volume {
         let _hurry = self.inner.gate.hurry();
         let t0 = Instant::now();
         let (passes_before, bytes_before) = {
-            let up = self.inner.up.lock().expect("up lock");
+            let up = self.inner.up.lock();
             (up.passes, up.put_bytes)
         };
         self.inner.flush().await?;
         let flushed = Instant::now();
         let (target, size) = {
-            let m = self.inner.mem.lock().expect("mem lock");
+            let m = self.inner.mem.lock();
             (m.root.hash, m.size)
         };
         let mut rx = self.inner.changed.subscribe();
         self.inner.kick.notify_one();
         loop {
             {
-                let up = self.inner.up.lock().expect("up lock");
+                let up = self.inner.up.lock();
                 if (up.last_from == target || up.uploaded.hash == target) && up.published_size >= size {
                     let passes = up.passes - passes_before;
                     return Ok(CheckpointReport {
@@ -561,7 +589,7 @@ impl Volume {
                     });
                 }
                 if let Some(e) = &up.error {
-                    return Err(Error::Shared(e.clone()));
+                    return Err(Error::Shared(Arc::clone(e)));
                 }
             }
             if rx.changed().await.is_err() {
@@ -572,13 +600,13 @@ impl Volume {
 
     /// What the last upload packed.
     pub fn last_upload(&self) -> Option<PackStats> {
-        self.inner.up.lock().expect("up lock").last
+        self.inner.up.lock().last
     }
 
     /// Stops the uploader after any upload in flight finishes.
     pub async fn close(&self) {
         self.inner.stop.send_replace(true);
-        let tasks = std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
+        let tasks = std::mem::take(&mut *self.tasks.lock());
         for t in tasks {
             let _ = t.await;
         }
@@ -590,13 +618,17 @@ fn parts(off: u64, len: usize) -> Vec<(u64, usize, usize, usize)> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos < len {
-        let at = off + pos as u64;
-        let (idx, inner) = (at / CHUNK, (at % CHUNK) as usize);
+        let at = off + u64_from(pos);
+        let (idx, inner) = (at / CHUNK, usize_from(at % CHUNK));
         let n = (CHUNK_SIZE - inner).min(len - pos);
         out.push((idx, inner, pos, n));
         pos += n;
     }
     out
+}
+
+fn beyond(off: u64, len: u64, size: u64) -> bool {
+    off.checked_add(len).is_none_or(|end| end > size)
 }
 
 fn is_transient(e: &Error) -> bool {
@@ -606,15 +638,49 @@ fn is_transient(e: &Error) -> bool {
 fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
     let e = match e {
         Error::Shared(e) => e,
-        e => Arc::new(e),
+        e @ (Error::Fenced { .. }
+        | Error::ChunkLost { .. }
+        | Error::Store(_)
+        | Error::Format(_)
+        | Error::Io(_)
+        | Error::BeyondEnd
+        | Error::Shrink { .. }
+        | Error::Corrupt(_)
+        | Error::SegmentExists(_)
+        | Error::RefExists(_)
+        | Error::Cancelled) => Arc::new(e),
     };
-    up.error = Some(e.clone());
+    up.error = Some(Arc::clone(&e));
     e
 }
 
 impl Inner {
+    /// Replays the journal above the floor of `resume`, or starts an empty one without it.
+    async fn start_journal(&self, resume: Option<VolState>) -> Result<()> {
+        let Some(s) = resume else {
+            self.journal.reset().await?;
+            self.journal.start(0).await?;
+            return self.persist().await;
+        };
+        let mut writes = Vec::new();
+        self.journal
+            .replay(s.jfloor, |idx, r| {
+                writes.push((idx, r));
+                Ok(())
+            })
+            .await?;
+        for (idx, r) in writes {
+            match r {
+                Record::Data(at, data) => self.write_chunk(idx, at, &data, false).await?,
+                Record::ZeroChunk => self.zero_chunk(idx, false).await?,
+            }
+        }
+        let next = self.journal.last().await?.max(s.jfloor) + 1;
+        self.journal.start(next).await
+    }
+
     fn root(&self) -> Entry {
-        self.mem.lock().expect("mem lock").root
+        self.mem.lock().root
     }
 
     fn size(&self) -> u64 {
@@ -624,8 +690,8 @@ impl Inner {
     async fn grow(&self, size: u64) -> Result<()> {
         let _c = self.commit.lock().await;
         let (old, from) = {
-            let m = self.mem.lock().expect("mem lock");
-            (m.size, m.tree.clone())
+            let m = self.mem.lock();
+            (m.size, Arc::clone(&m.tree))
         };
         if size == old {
             if self.size() < old {
@@ -645,13 +711,13 @@ impl Inner {
         }
         let depth = depth_for(size.div_ceil(CHUNK));
         let to = if depth == from.depth() {
-            from.clone()
+            Arc::clone(&from)
         } else {
             Arc::new(from.at_depth(depth))
         };
         loop {
             let (root, opened) = {
-                let m = self.mem.lock().expect("mem lock");
+                let m = self.mem.lock();
                 (m.root, m.opened_now)
             };
             let lifted = to.lift(&root, from.depth()).await?;
@@ -659,13 +725,13 @@ impl Inner {
             if depth != from.depth() {
                 self.cache.sync_local().await?;
             }
-            let mut m = self.mem.lock().expect("mem lock");
+            let mut m = self.mem.lock();
             if m.root.hash != root.hash {
                 continue;
             }
             m.root = lifted;
             m.opened_now = opened;
-            m.tree = to.clone();
+            m.tree = Arc::clone(&to);
             m.size = size;
             break;
         }
@@ -676,7 +742,7 @@ impl Inner {
     }
 
     fn stripe(&self, idx: u64) -> &RwLock<()> {
-        &self.stripes[(idx % STRIPES as u64) as usize]
+        &self.stripes[usize_from(idx % u64_from(STRIPES))]
     }
 
     fn notify(&self) {
@@ -685,11 +751,11 @@ impl Inner {
 
     async fn persist(&self) -> Result<()> {
         let (root, jfloor, size) = {
-            let m = self.mem.lock().expect("mem lock");
+            let m = self.mem.lock();
             (m.root, m.jfloor, m.size)
         };
         let (published, publishing) = {
-            let u = self.up.lock().expect("up lock");
+            let u = self.up.lock();
             (u.published, u.publishing)
         };
         let st = VolState {
@@ -713,7 +779,7 @@ impl Inner {
             res = self.remote.put_ref(&self.name, &r, &version).await;
         }
         {
-            let mut up = self.up.lock().expect("up lock");
+            let mut up = self.up.lock();
             match res {
                 Ok(v) => up.version = v,
                 Err(e) => {
@@ -744,14 +810,16 @@ impl Inner {
     async fn read_chunk(&self, idx: u64, at: usize, n: usize) -> Result<Bytes> {
         let _g = self.stripe(idx).read().await;
         let (tree, root) = {
-            let m = self.mem.lock().expect("mem lock");
-            if let Some(d) = m.dirty.get(&idx) {
-                return Ok(Bytes::copy_from_slice(&d[at..at + n]));
+            let m = self.mem.lock();
+            match m.dirty.get(&idx) {
+                Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
+                Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
+                None => {}
             }
             if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
                 return Ok(f.slice(at..at + n));
             }
-            (m.tree.clone(), m.root)
+            (Arc::clone(&m.tree), m.root)
         };
         if let Some(b) = self.read_base(idx, at, n).await {
             return Ok(b);
@@ -761,10 +829,10 @@ impl Inner {
 
     /// The base image's bytes of chunk `idx`, when no write since open changed it.
     fn base_of(&self, idx: u64) -> Option<Arc<BaseView>> {
-        if self.mem.lock().expect("mem lock").touched.contains(&idx) {
+        if self.mem.lock().touched.contains(&idx) {
             return None;
         }
-        self.base.lock().expect("base lock").clone()
+        self.base.lock().clone()
     }
 
     async fn read_base(&self, idx: u64, at: usize, n: usize) -> Option<Bytes> {
@@ -776,16 +844,16 @@ impl Inner {
             return Ok(false);
         };
         let (tree, root) = {
-            let m = self.mem.lock().expect("mem lock");
+            let m = self.mem.lock();
             if let Some(d) = m.dirty.get(&idx) {
-                dst.copy_from_slice(&d[at..at + dst.len()]);
+                d.copy_to(at, dst);
                 return Ok(true);
             }
             if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
                 dst.copy_from_slice(&f[at..at + dst.len()]);
                 return Ok(true);
             }
-            (m.tree.clone(), m.root)
+            (Arc::clone(&m.tree), m.root)
         };
         self.try_read_stored(&tree, idx, &root, at, dst)
     }
@@ -816,11 +884,14 @@ impl Inner {
 
     async fn is_sparse(&self, idx: u64) -> Result<bool> {
         let (tree, root) = {
-            let m = self.mem.lock().expect("mem lock");
-            if m.dirty.contains_key(&idx) || m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
+            let m = self.mem.lock();
+            if let Some(d) = m.dirty.get(&idx) {
+                return Ok(matches!(d, Dirty::Zero));
+            }
+            if m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
                 return Ok(false);
             }
-            (m.tree.clone(), m.root)
+            (Arc::clone(&m.tree), m.root)
         };
         Ok(tree.lookup(&root, idx, false).await?.is_empty())
     }
@@ -831,16 +902,19 @@ impl Inner {
     async fn write_chunk(&self, idx: u64, at: usize, data: &[u8], journaled: bool) -> Result<()> {
         let _g = self.stripe(idx).write().await;
         let (dirty, flushing, tree, root, size) = {
-            let m = self.mem.lock().expect("mem lock");
+            let m = self.mem.lock();
             let f = m.flushing.as_ref().and_then(|f| f.get(&idx)).cloned();
-            (m.dirty.contains_key(&idx), f, m.tree.clone(), m.root, m.size)
+            let zero = m.dirty.get(&idx).map(|d| matches!(d, Dirty::Zero));
+            (zero, f, Arc::clone(&m.tree), m.root, m.size)
         };
-        let fresh = if dirty {
+        let fresh = if dirty == Some(false) {
             None
+        } else if dirty == Some(true) {
+            Some(vec![0; CHUNK_SIZE])
         } else if let Some(f) = flushing {
             Some(f.to_vec())
         } else if data.len() < CHUNK_SIZE {
-            let n = CHUNK.min(size - idx * CHUNK) as usize;
+            let n = usize_from(CHUNK.min(size - idx * CHUNK));
             let mut v = vec![0; CHUNK_SIZE];
             if !self.try_read_stored(&tree, idx, &root, 0, &mut v[..n])? {
                 let b = match self.read_base(idx, 0, n).await {
@@ -856,26 +930,40 @@ impl Inner {
         if journaled {
             self.journal.append(idx, at, Bytes::copy_from_slice(data)).await?;
         }
-        let mut m = self.mem.lock().expect("mem lock");
-        m.touched.insert(idx);
-        m.dirty_ref.remove(&idx);
-        if let Some(t) = &mut m.track {
-            t.insert(idx);
-        }
+        let mut m = self.mem.lock();
+        m.written(idx);
         match fresh {
-            None => m.dirty.get_mut(&idx).expect("dirty under the stripe lock")[at..at + data.len()]
-                .copy_from_slice(data),
+            None => {
+                let Some(Dirty::Bytes(d)) = m.dirty.get_mut(&idx) else {
+                    return Err(Error::Corrupt(format!(
+                        "chunk {idx} left the dirty set under its stripe lock"
+                    )));
+                };
+                d[at..at + data.len()].copy_from_slice(data);
+            }
             Some(mut buf) => {
                 buf[at..at + data.len()].copy_from_slice(data);
-                m.dirty.insert(idx, buf);
+                m.dirty.insert(idx, Dirty::Bytes(buf));
             }
         }
         Ok(())
     }
 
+    /// Makes chunk `idx` all zeros, as [`Self::write_chunk`] would with a chunk of zeros.
+    async fn zero_chunk(&self, idx: u64, journaled: bool) -> Result<()> {
+        let _g = self.stripe(idx).write().await;
+        if journaled {
+            self.journal.append_zero_chunk(idx).await?;
+        }
+        let mut m = self.mem.lock();
+        m.written(idx);
+        m.dirty.insert(idx, Dirty::Zero);
+        Ok(())
+    }
+
     async fn flush(&self) -> Result<()> {
         let _c = self.commit.lock().await;
-        if self.up.lock().expect("up lock").fenced {
+        if self.up.lock().fenced {
             return Err(Error::Fenced {
                 branch: self.name.clone(),
             });
@@ -884,25 +972,30 @@ impl Inner {
         for s in &self.stripes {
             guards.push(s.write().await);
         }
-        if self.mem.lock().expect("mem lock").dirty.is_empty() {
+        if self.mem.lock().dirty.is_empty() {
             return Ok(());
         }
         let generation = self.journal.rotate().await?;
         let (snapshot, refs, tree, root) = {
-            let mut m = self.mem.lock().expect("mem lock");
-            let snap: HashMap<u64, Bytes> = std::mem::take(&mut m.dirty)
+            let mut m = self.mem.lock();
+            let snap: BTreeMap<u64, Bytes> = std::mem::take(&mut m.dirty)
                 .into_iter()
-                .map(|(i, b)| (i, Bytes::from(b)))
+                .map(|(i, d)| (i, d.bytes()))
                 .collect();
             let snap = Arc::new(snap);
-            m.flushing = Some(snap.clone());
-            (snap, std::mem::take(&mut m.dirty_ref), m.tree.clone(), m.root)
+            m.flushing = Some(Arc::clone(&snap));
+            (
+                snap,
+                std::mem::take(&mut m.dirty_ref),
+                Arc::clone(&m.tree),
+                m.root,
+            )
         };
         drop(guards);
         match self.commit_snapshot(&tree, &snapshot, &refs, &root).await {
             Ok(new_root) => {
                 {
-                    let mut m = self.mem.lock().expect("mem lock");
+                    let mut m = self.mem.lock();
                     m.root = new_root;
                     m.flushing = None;
                     m.jfloor = generation;
@@ -918,11 +1011,11 @@ impl Inner {
                 Ok(())
             }
             Err(e) => {
-                let mut m = self.mem.lock().expect("mem lock");
+                let mut m = self.mem.lock();
                 m.flushing = None;
                 for (idx, b) in snapshot.iter() {
                     if !m.dirty.contains_key(idx) {
-                        m.dirty.insert(*idx, b.to_vec());
+                        m.dirty.insert(*idx, Dirty::of(b));
                         if let Some(r) = refs.get(idx) {
                             m.dirty_ref.insert(*idx, r.clone());
                         }
@@ -936,8 +1029,8 @@ impl Inner {
     async fn commit_snapshot(
         &self,
         tree: &Tree,
-        snapshot: &HashMap<u64, Bytes>,
-        refs: &HashMap<u64, ChunkRef>,
+        snapshot: &BTreeMap<u64, Bytes>,
+        refs: &BTreeMap<u64, ChunkRef>,
         root: &Entry,
     ) -> Result<Entry> {
         let mut futs = Vec::with_capacity(snapshot.len());
@@ -949,7 +1042,7 @@ impl Inner {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         {
-            let up = self.up.lock().expect("up lock");
+            let up = self.up.lock();
             for (_, e) in &mut updates {
                 if let Some(l) = up.known.get(&e.hash) {
                     e.loc = *l;
@@ -964,9 +1057,7 @@ impl Inner {
 
     async fn store_chunk(&self, idx: u64, b: Bytes, r: Option<&ChunkRef>) -> Result<(u64, Entry)> {
         if let Some(r) = r {
-            self.cache
-                .put_ref(r.hash, &r.path, r.offset, CHUNK_SIZE as u32)
-                .await?;
+            self.cache.put_ref(r.hash, &r.path, r.offset, CHUNK_LEN).await?;
             return Ok((
                 idx,
                 Entry {
@@ -998,7 +1089,7 @@ impl Inner {
         let mut changed = self.changed.subscribe();
         loop {
             let (taken, fenced) = {
-                let up = self.up.lock().expect("up lock");
+                let up = self.up.lock();
                 (up.gen_taken, up.fenced)
             };
             if fenced {
@@ -1033,35 +1124,35 @@ impl Inner {
     /// Packs everything pending under the current local root and publishes it.
     async fn upload(&self) -> Result<()> {
         let (root, seq, tree, size) = {
-            let m = self.mem.lock().expect("mem lock");
-            (m.root, m.flush_seq, m.tree.clone(), m.size)
+            let m = self.mem.lock();
+            (m.root, m.flush_seq, Arc::clone(&m.tree), m.size)
         };
         let (known, version) = {
-            let up = self.up.lock().expect("up lock");
+            let up = self.up.lock();
             if (root.hash == up.uploaded.hash && size == up.published_size) || up.fenced {
                 return Ok(());
             }
-            (up.known.clone(), up.version.clone())
+            (Arc::clone(&up.known), up.version.clone())
         };
         let t0 = Instant::now();
-        let dedup = self.dedup.lock().expect("dedup lock").clone();
-        let learner = self.learner.lock().expect("learner lock").clone();
-        let prepared = self.prepared.lock().expect("prepared lock").clone();
+        let dedup = self.dedup.lock().clone();
+        let learner = self.learner.lock().clone();
+        let prepared = self.prepared.lock().clone();
         let mut p = Packer::new(
             self.remote.clone(),
-            self.cpu.clone(),
-            self.writer.clone(),
+            Arc::clone(&self.cpu),
+            Arc::clone(&self.writer),
             SEG_MAX,
             known,
         )
         .with_dedup(dedup.clone(), prepared.clone())
-        .with_gate(self.gate.clone())
+        .with_gate(Arc::clone(&self.gate))
         .with_learner(learner.clone());
         let packed = match tree.pack(&root, &mut p).await {
             Ok(e) => e,
             Err(e) => {
                 if matches!(e.kind(), Error::ChunkLost { .. }) {
-                    let e = fail_with(&mut self.up.lock().expect("up lock"), e);
+                    let e = fail_with(&mut self.up.lock(), e);
                     self.notify();
                     return Err(Error::Shared(e));
                 }
@@ -1069,10 +1160,10 @@ impl Inner {
             }
         };
         let keys = p.keys().clone();
-        let (done, _) = futures::join!(p.finish(), self.put_change_list(&tree, size, &packed, &keys));
+        let (done, ()) = futures::join!(p.finish(), self.put_change_list(&tree, size, &packed, &keys));
         done?;
         let packed_at = Instant::now();
-        self.up.lock().expect("up lock").publishing = packed;
+        self.up.lock().publishing = packed;
         self.persist().await?;
         let r = Ref {
             size,
@@ -1084,7 +1175,7 @@ impl Inner {
             Ok(v) => v,
             Err(e) => {
                 if matches!(e.kind(), Error::Fenced { .. }) {
-                    let mut up = self.up.lock().expect("up lock");
+                    let mut up = self.up.lock();
                     up.fenced = true;
                     let e = fail_with(&mut up, e);
                     drop(up);
@@ -1096,18 +1187,10 @@ impl Inner {
         };
         let stats = p.stats();
         let added = p.added().clone();
-        if let Some(learned) = dedup.as_ref().and_then(|d| d.learned.as_ref()) {
-            learned.mark_used(p.used_learned());
-            if let Some(l) = &learner {
-                l.published(p.learned());
-                learned.add_published(l, p.learned()).await;
-            }
-        } else if let Some(l) = &learner {
-            l.published(p.learned());
-        }
+        record_learned(dedup.as_ref(), learner.as_ref(), &p).await;
         drop(p);
         {
-            let mut up = self.up.lock().expect("up lock");
+            let mut up = self.up.lock();
             Arc::make_mut(&mut up.known).extend(added);
             up.version = new_version;
             up.published = packed;
@@ -1122,7 +1205,7 @@ impl Inner {
                 pack: packed_at - t0,
                 publish: packed_at.elapsed(),
             });
-            let mut m = self.mem.lock().expect("mem lock");
+            let mut m = self.mem.lock();
             if m.root.hash == root.hash {
                 m.root = packed;
                 up.uploaded = packed;
@@ -1140,18 +1223,12 @@ impl Inner {
     /// Puts the change list of `root`, a root of `tree` for a branch of `size` bytes, from the
     /// root the branch opened at, while the segments upload. Only a branch of the size it
     /// opened at has one. Best effort: without it, another host walks the tree.
-    async fn put_change_list(
-        &self,
-        tree: &Tree,
-        size: u64,
-        root: &Entry,
-        keys: &HashMap<Hash, pando_format::BlockKeys>,
-    ) {
+    async fn put_change_list(&self, tree: &Tree, size: u64, root: &Entry, keys: &HashMap<Hash, BlockKeys>) {
         let from = self.opened;
         if from.is_empty() || from.loc.is_pending() || from.hash == root.hash || size != self.opened_size {
             return;
         }
-        let earlier = self.chunk_keys.lock().expect("keys lock").clone();
+        let earlier = self.chunk_keys.lock().clone();
         let key_of = |h: &Hash| keys.get(h).or_else(|| earlier.get(h)).copied();
         let Ok(cl) = tree.change_list(&from, root, LIST_PARALLEL, key_of).await else {
             return;
@@ -1161,7 +1238,7 @@ impl Inner {
             .iter()
             .filter_map(|c| Some((c.entry.hash, key_of(&c.entry.hash)?)))
             .collect();
-        *self.chunk_keys.lock().expect("keys lock") = kept;
+        *self.chunk_keys.lock() = kept;
         let _ = self
             .remote
             .put_change_list(root.hash, from.hash, Bytes::from(cl.encode()))
@@ -1169,7 +1246,20 @@ impl Inner {
     }
 }
 
-#[cfg(all(test, feature = "sim"))]
+async fn record_learned(dedup: Option<&Arc<Dedup>>, learner: Option<&Arc<Learner>>, p: &Packer) {
+    if let Some(learned) = dedup.and_then(|d| d.learned.as_ref()) {
+        learned.mark_used(p.used_learned());
+        if let Some(l) = learner {
+            l.published(p.learned());
+            learned.add_published(l, p.learned()).await;
+        }
+    } else if let Some(l) = learner {
+        l.published(p.learned());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use super::*;
     use crate::ports::Open;
@@ -1186,8 +1276,10 @@ mod tests {
     }
 
     fn data(seed: u8, n: usize) -> Vec<u8> {
-        (0..n)
-            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        (0..=u8::MAX)
+            .cycle()
+            .take(n)
+            .map(|i| i.wrapping_mul(31).wrapping_add(seed))
             .collect()
     }
 
@@ -1300,6 +1392,51 @@ mod tests {
         );
         after.checkpoint().await.unwrap();
         after.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cleared_range_reads_as_zeros_without_a_buffer_per_chunk() {
+        let (ports, _, _) = sim::ports(5);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let w = data(4, 4 * CHUNK_SIZE);
+        v.write_at(&w, 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+
+        v.zero(1000, 3 * CHUNK - 1000).await.unwrap();
+        {
+            let m = v.inner.mem.lock();
+            assert!(matches!(m.dirty.get(&0), Some(Dirty::Bytes(_))));
+            assert!(matches!(m.dirty.get(&1), Some(Dirty::Zero)));
+            assert!(matches!(m.dirty.get(&2), Some(Dirty::Zero)));
+            assert!(!m.dirty.contains_key(&3));
+        }
+        v.write_at(&data(7, 10), CHUNK + 50).await.unwrap();
+        let mut want = w.clone();
+        want[1000..3 * CHUNK_SIZE].fill(0);
+        want[CHUNK_SIZE + 50..][..10].copy_from_slice(&data(7, 10));
+        assert_eq!(read(&v, 0, want.len()).await, want);
+        v.close().await;
+        drop(v);
+
+        let again = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&again, 0, want.len()).await,
+            want,
+            "the restart replays the cleared chunks"
+        );
+        again.checkpoint().await.unwrap();
+        again.close().await;
+
+        let other = Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "main")
+            .await
+            .unwrap();
+        assert_eq!(read(&other, 0, want.len()).await, want);
+        other.close().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1464,7 +1601,7 @@ mod tests {
         v.close().await;
         drop(v);
         crash(&fs);
-        let (r, _) = Remote::new(ports.store.clone())
+        let (r, _) = Remote::new(Arc::clone(&ports.store))
             .get_ref("main")
             .await
             .unwrap()

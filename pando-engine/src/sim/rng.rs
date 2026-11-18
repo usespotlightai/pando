@@ -2,13 +2,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ports::Rng;
 
-/// SplitMix64: small, seeded, and good enough for ids and jitter in tests.
+/// `SplitMix64`: small, seeded, and good enough for ids and jitter in tests.
 #[derive(Debug)]
 pub struct SimRng {
     state: AtomicU64,
 }
 
 impl SimRng {
+    /// A generator whose sequence depends only on `seed`.
     pub fn new(seed: u64) -> SimRng {
         SimRng {
             state: AtomicU64::new(seed),

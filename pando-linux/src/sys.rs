@@ -9,7 +9,12 @@ use std::ptr::NonNull;
 
 /// An ioctl number: direction (1 write, 2 read, 3 both), type, number and argument size.
 pub(crate) const fn ioc(dir: u32, kind: u8, nr: u32, size: u32) -> libc::c_ulong {
-    (dir << 30 | size << 16 | (kind as u32) << 8 | nr) as libc::c_ulong
+    ioc32(dir, kind, nr, size) as libc::c_ulong
+}
+
+/// [`ioc`] as the 32-bit command number `io_uring` commands carry.
+pub(crate) const fn ioc32(dir: u32, kind: u8, nr: u32, size: u32) -> u32 {
+    dir << 30 | size << 16 | (kind as u32) << 8 | nr
 }
 
 fn check(r: libc::c_int) -> io::Result<libc::c_int> {
@@ -24,13 +29,13 @@ fn check(r: libc::c_int) -> io::Result<libc::c_int> {
 pub(crate) fn ioctl_buf(fd: RawFd, op: libc::c_ulong, b: &mut [u8]) -> io::Result<libc::c_int> {
     // SAFETY: every ioctl this crate sends with a buffer reads and writes at most the size
     // encoded in `op` or, for device-mapper, the data size in the header, which is `b.len()`.
-    check(unsafe { libc::ioctl(fd, op as _, b.as_mut_ptr()) })
+    check(unsafe { libc::ioctl(fd, op, b.as_mut_ptr()) })
 }
 
 /// An ioctl that takes no argument and returns a number.
 pub(crate) fn ioctl_int(fd: RawFd, op: libc::c_ulong) -> io::Result<libc::c_int> {
     // SAFETY: the ioctls sent this way take no pointer.
-    check(unsafe { libc::ioctl(fd, op as _) })
+    check(unsafe { libc::ioctl(fd, op) })
 }
 
 /// Makes block device node `path` for device number `dev`, as encoded by device-mapper.
@@ -46,7 +51,7 @@ pub(crate) fn mknod_block(path: &Path, dev: u64) -> io::Result<()> {
 pub(crate) fn split_dev(dev: u64) -> (u32, u32) {
     (
         ((dev >> 8) & 0xfff) as u32,
-        ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u32,
+        (dev & 0xff) as u32 | ((dev >> 12) & 0xfff00) as u32,
     )
 }
 
@@ -71,17 +76,17 @@ pub(crate) fn pin_to_cpu(cpu: usize) -> io::Result<()> {
     // SAFETY: CPU_SET writes inside `set`; cpu is checked against its size.
     unsafe { libc::CPU_SET(cpu % (8 * size_of::<libc::cpu_set_t>()), &mut set) };
     // SAFETY: `set` is valid for the size passed.
-    check(unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) }).map(drop)
+    check(unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &raw const set) }).map(drop)
 }
 
 pub(crate) fn cpu_count() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get())
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
 /// A shared read-only mapping of a device's memory.
 #[derive(Debug)]
 pub(crate) struct Mapping {
-    ptr: NonNull<u8>,
+    ptr: NonNull<u64>,
     len: usize,
 }
 
@@ -90,6 +95,8 @@ unsafe impl Send for Mapping {}
 
 impl Mapping {
     pub(crate) fn device(fd: RawFd, offset: u64, len: usize) -> io::Result<Mapping> {
+        let offset =
+            libc::off_t::try_from(offset).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // SAFETY: a fresh mapping aliases no Rust memory; the result is checked.
         let p = unsafe {
             libc::mmap(
@@ -98,7 +105,7 @@ impl Mapping {
                 libc::PROT_READ,
                 libc::MAP_SHARED | libc::MAP_POPULATE,
                 fd,
-                offset as libc::off_t,
+                offset,
             )
         };
         if p == libc::MAP_FAILED {
@@ -113,8 +120,10 @@ impl Mapping {
     /// Reads 8 bytes at `at`, which the kernel may change at any time.
     pub(crate) fn read_u64(&self, at: usize) -> u64 {
         assert!(at + 8 <= self.len && at.is_multiple_of(8));
-        // SAFETY: in bounds and aligned, checked above; the mapping lives as long as self.
-        unsafe { std::ptr::read_volatile(self.ptr.as_ptr().add(at).cast::<u64>()) }
+        // SAFETY: `at / 8` words from the page-aligned start stay inside the mapping, checked above.
+        let word = unsafe { self.ptr.as_ptr().add(at / 8) };
+        // SAFETY: `word` is in bounds and aligned, and the mapping lives as long as self.
+        unsafe { std::ptr::read_volatile(word) }
     }
 }
 
@@ -128,7 +137,7 @@ impl Drop for Mapping {
 pub(crate) fn page_size() -> usize {
     // SAFETY: sysconf takes no pointer.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n > 0 { n as usize } else { 4096 }
+    usize::try_from(n).ok().filter(|&n| n > 0).unwrap_or(4096)
 }
 
 #[cfg(test)]

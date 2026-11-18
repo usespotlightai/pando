@@ -12,10 +12,13 @@ pub const RECIPE_SOURCES_MAX: usize = RUN_ZERO as usize;
 pub enum Pick {
     /// The block is stored in the recipe itself.
     Literal,
+    /// The block is all zeros and stored nowhere.
     Zero,
     /// Block `block` of source chunk `src`.
     Source {
+        /// The source's position in the recipe's source list.
         src: u8,
+        /// The block's number in the source chunk.
         block: u8,
     },
 }
@@ -24,9 +27,13 @@ pub enum Pick {
 /// block `src_block`, or literal or zero.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Run {
+    /// The first block of the run in the chunk.
     pub dst: u8,
+    /// The number of blocks; `dst + n` is at most [`BLOCKS_PER_CHUNK`].
     pub n: u8,
+    /// The source's position in the source list, or 0xff for a literal run and 0xfe for a zero run.
     pub src: u8,
+    /// The first block taken from the source; 0 for literal and zero runs.
     pub src_block: u8,
 }
 
@@ -38,24 +45,46 @@ pub struct Run {
 /// run, then the literal blocks in run order.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Recipe<'a> {
+    /// The chunks the runs read, numbered by their position.
     pub sources: Vec<Entry>,
+    /// The runs in chunk order. [`Recipe::parse`] checks every run against the chunk, the
+    /// sources and the literal blocks.
     pub runs: Vec<Run>,
     literals: &'a [u8],
 }
 
+/// Why [`Recipe::rebuild`] failed; `E` is the error of the source fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeError<E> {
+    /// A source is shorter than a run reads from it.
     #[error("recipe for {hash} is malformed: {why}")]
-    Malformed { hash: Hash, why: &'static str },
+    Malformed {
+        /// The chunk the recipe rebuilds.
+        hash: Hash,
+        /// What is wrong.
+        why: &'static str,
+    },
+    /// Fetching a source failed.
     #[error("recipe source {source_hash}: {error}")]
-    Source { source_hash: Hash, error: E },
+    Source {
+        /// The source that could not be fetched.
+        source_hash: Hash,
+        /// The fetch's error.
+        error: E,
+    },
+    /// The rebuilt chunk does not hash to the hash that names it.
     #[error("chunk {} rebuilt from its recipe does not match its hash", .0.expected)]
     Integrity(IntegrityError),
 }
 
 impl<'a> Recipe<'a> {
+    /// Parses and checks recipe `enc`: every run stays in the chunk and in its source, and the
+    /// literal blocks are exactly the ones the literal runs need. The error says what is wrong.
     pub fn parse(enc: &'a [u8]) -> Result<Recipe<'a>, &'static str> {
         let nsrc = usize::from(*enc.first().ok_or("empty")?);
+        if nsrc > RECIPE_SOURCES_MAX {
+            return Err("more sources than a run can name");
+        }
         let mut p = 1;
         let sources = (0..nsrc)
             .map(|i| Entry::read(enc, p + i * ENTRY_SIZE).ok_or("short source list"))
@@ -104,14 +133,16 @@ impl<'a> Recipe<'a> {
 
     /// The sources a recipe reads, or none when it is malformed.
     pub fn sources_of(enc: &[u8]) -> Vec<Entry> {
-        let Some(&n) = enc.first() else { return Vec::new() };
-        let n = usize::from(n);
-        if enc.len() < 1 + n * ENTRY_SIZE {
+        let Some((&n, rest)) = enc.split_first() else {
             return Vec::new();
-        }
-        (0..n)
-            .map(|i| Entry::read(enc, 1 + i * ENTRY_SIZE).expect("length checked"))
-            .collect()
+        };
+        rest.get(..usize::from(n) * ENTRY_SIZE).map_or_default(|s| {
+            s.as_chunks::<ENTRY_SIZE>()
+                .0
+                .iter()
+                .map(Entry::from_bytes)
+                .collect()
+        })
     }
 
     /// Encodes the recipe of `chunk` from one pick per block. Neighbouring picks merge into runs.
@@ -122,7 +153,7 @@ impl<'a> Recipe<'a> {
         assert_eq!(chunk.len(), CHUNK_SIZE);
         assert!(sources.len() <= RECIPE_SOURCES_MAX);
         let mut runs: Vec<Run> = Vec::new();
-        for (blk, pick) in picks.iter().enumerate() {
+        for (blk, pick) in (0u8..).zip(picks) {
             let (src, src_block) = match *pick {
                 Pick::Literal => (RUN_LITERAL, 0),
                 Pick::Zero => (RUN_ZERO, 0),
@@ -136,17 +167,22 @@ impl<'a> Recipe<'a> {
                 continue;
             }
             runs.push(Run {
-                dst: blk as u8,
+                dst: blk,
                 n: 1,
                 src,
                 src_block,
             });
         }
-        let mut enc = vec![sources.len() as u8];
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "at most RECIPE_SOURCES_MAX sources, asserted above, and at most one run per block"
+        )]
+        let (nsrc, nrun) = (sources.len() as u8, runs.len() as u8);
+        let mut enc = vec![nsrc];
         for s in sources {
             enc.extend_from_slice(&s.to_bytes());
         }
-        enc.push(runs.len() as u8);
+        enc.push(nrun);
         for r in &runs {
             enc.extend_from_slice(&[r.dst, r.n, r.src, r.src_block]);
         }
@@ -178,14 +214,16 @@ impl<'a> Recipe<'a> {
                 }
                 s => {
                     let s = usize::from(s);
-                    if got[s].is_none() {
-                        let e = &self.sources[s];
-                        got[s] = Some(get(e).map_err(|error| RecipeError::Source {
-                            source_hash: e.hash,
-                            error,
-                        })?);
-                    }
-                    let b = got[s].as_ref().expect("fetched above");
+                    let b = match &mut got[s] {
+                        Some(b) => b,
+                        none => {
+                            let e = &self.sources[s];
+                            none.insert(get(e).map_err(|error| RecipeError::Source {
+                                source_hash: e.hash,
+                                error,
+                            })?)
+                        }
+                    };
                     let from = usize::from(r.src_block) * BLOCK_SIZE;
                     let src = b.get(from..from + dst.len()).ok_or(RecipeError::Malformed {
                         hash,
@@ -206,19 +244,23 @@ mod tests {
     use super::*;
 
     fn chunks() -> (Vec<u8>, Vec<u8>, [Pick; BLOCKS_PER_CHUNK]) {
-        let src: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i * 7 + i / 4096) as u8).collect();
+        let src: Vec<u8> = (0..CHUNK_SIZE)
+            .map(|i| (i * 7 + i / 4096).to_le_bytes()[0])
+            .collect();
         let mut chunk = vec![0; CHUNK_SIZE];
         let mut picks = [Pick::Zero; BLOCKS_PER_CHUNK];
-        for (blk, pick) in picks.iter_mut().enumerate().take(8) {
-            chunk[blk * BLOCK_SIZE..(blk + 1) * BLOCK_SIZE]
-                .copy_from_slice(&src[(blk + 4) * BLOCK_SIZE..(blk + 5) * BLOCK_SIZE]);
+        for (blk, pick) in (0u8..).zip(&mut picks).take(8) {
+            let b = usize::from(blk);
+            chunk[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE]
+                .copy_from_slice(&src[(b + 4) * BLOCK_SIZE..(b + 5) * BLOCK_SIZE]);
             *pick = Pick::Source {
                 src: 0,
-                block: blk as u8 + 4,
+                block: blk + 4,
             };
         }
-        for (blk, pick) in picks.iter_mut().enumerate().skip(12) {
-            chunk[blk * BLOCK_SIZE..(blk + 1) * BLOCK_SIZE].fill(blk as u8);
+        for (blk, pick) in (0u8..).zip(&mut picks).skip(12) {
+            let b = usize::from(blk);
+            chunk[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE].fill(blk);
             *pick = Pick::Literal;
         }
         (src, chunk, picks)

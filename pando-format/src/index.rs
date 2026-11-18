@@ -6,14 +6,22 @@ use crate::{FormatError, SegId};
 /// Encoding: frame count (u32 LE), `[offset u32][length u32]` per frame, then 16-byte segment ids.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SegmentIndex {
+    /// The offset and compressed length in the segment of each frame, by frame number.
     pub frames: Vec<(u32, u32)>,
+    /// The segments that hold the sources of this segment's recipes.
     pub deps: Vec<SegId>,
 }
 
 impl SegmentIndex {
+    /// The encoding described on [`SegmentIndex`].
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(4 + 8 * self.frames.len() + 16 * self.deps.len());
-        b.extend_from_slice(&(self.frames.len() as u32).to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "frame offsets are u32 and each frame takes bytes, so a segment has fewer than u32::MAX frames"
+        )]
+        let count = self.frames.len() as u32;
+        b.extend_from_slice(&count.to_le_bytes());
         for (off, len) in &self.frames {
             b.extend_from_slice(&off.to_le_bytes());
             b.extend_from_slice(&len.to_le_bytes());
@@ -24,13 +32,10 @@ impl SegmentIndex {
         b
     }
 
+    /// Decodes an index; it fails when the frame table is cut or a segment id is partial.
     pub fn decode(b: &[u8]) -> Result<SegmentIndex, FormatError> {
         let bad = |why: &str| FormatError::malformed("segment index", why.to_string());
-        let u32_at = |at: usize| {
-            b.get(at..at + 4)
-                .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
-        };
-        let count = u32_at(0).ok_or_else(|| bad("short"))? as usize;
+        let count = u32::from_le_bytes(*b.first_chunk().ok_or_else(|| bad("short"))?) as usize;
         let deps_at = count
             .checked_mul(8)
             .and_then(|n| n.checked_add(4))
@@ -39,11 +44,14 @@ impl SegmentIndex {
         if !(b.len() - deps_at).is_multiple_of(16) {
             return Err(bad("partial segment id"));
         }
-        let frames = (0..count)
-            .map(|i| {
+        let frames = b[4..deps_at]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&[o0, o1, o2, o3, l0, l1, l2, l3]| {
                 (
-                    u32_at(4 + 8 * i).expect("in range"),
-                    u32_at(8 + 8 * i).expect("in range"),
+                    u32::from_le_bytes([o0, o1, o2, o3]),
+                    u32::from_le_bytes([l0, l1, l2, l3]),
                 )
             })
             .collect();

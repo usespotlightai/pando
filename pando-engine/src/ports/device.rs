@@ -11,14 +11,18 @@ use async_trait::async_trait;
 pub trait DeviceSwitch: Send + Sync + fmt::Debug {
     /// Creates device `name` that maps `size` bytes onto `target`.
     async fn create(&self, name: &str, target: &Path, size: u64) -> io::Result<()>;
+    /// Removes device `name`; it fails while something holds the device open.
     async fn remove(&self, name: &str) -> io::Result<()>;
     /// The target of the live table, or `None` when the device has no table.
     async fn live_target(&self, name: &str) -> io::Result<Option<PathBuf>>;
     /// Loads a table onto `target` as the inactive table; [`DeviceSwitch::resume`] swaps it in.
     async fn load(&self, name: &str, target: &Path, size: u64) -> io::Result<()>;
+    /// Drops a table [`DeviceSwitch::load`] loaded, so the next resume keeps the live table.
     async fn clear_inactive(&self, name: &str) -> io::Result<()>;
     /// Holds I/O on the device; writes in flight finish first.
     async fn suspend(&self, name: &str) -> io::Result<()>;
+    /// Swaps in the inactive table, if one is loaded, and releases the I/O
+    /// [`DeviceSwitch::suspend`] held.
     async fn resume(&self, name: &str) -> io::Result<()>;
     /// Binds a free loop device to `image` and returns the loop device.
     async fn attach_loop(&self, image: &Path) -> io::Result<PathBuf>;

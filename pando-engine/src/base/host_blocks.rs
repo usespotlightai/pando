@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use pando_format::{BLOCK_SIZE, BLOCKS_PER_CHUNK, BlockKey, BlockKeys, CHUNK_SIZE};
+use pando_format::{BLOCK_SIZE, BLOCKS_PER_CHUNK, BlockKey, BlockKeys, CHUNK_SIZE, u64_from};
 
 use crate::Result;
 use crate::dedup::BlockMap;
@@ -55,9 +55,9 @@ impl HostBlocks {
                 continue;
             }
             *src = self.bases.iter().enumerate().find_map(|(i, (_, m))| {
-                m.get(key).map(|at| BlockSource::At {
+                m.get(*key).map(|at| BlockSource::At {
                     base: i,
-                    off: at.chunk() * CHUNK_SIZE as u64 + (at.block() * BLOCK_SIZE) as u64,
+                    off: at.chunk() * u64_from(CHUNK_SIZE) + u64_from(at.block() * BLOCK_SIZE),
                 })
             })?;
         }
@@ -81,7 +81,7 @@ impl HostBlocks {
                         && p[j]
                             == (BlockSource::At {
                                 base,
-                                off: off + ((j - i) * BLOCK_SIZE) as u64,
+                                off: off + u64_from((j - i) * BLOCK_SIZE),
                             })
                     {
                         j += 1;

@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use pando_format::{BlockKeys, CHUNK_SIZE, FrameBuilder, Hash, Loc, SegId, SegmentIndex, Writer};
+use pando_format::{
+    BlockKeys, CHUNK_SIZE, FrameBuilder, Hash, Loc, SegId, SegmentIndex, Writer, u64_from, usize_from,
+};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 
@@ -21,16 +23,22 @@ pub(crate) const SEG_MAX: usize = 8 << 20;
 /// Segment PUTs in flight at once.
 const PUTS_IN_FLIGHT: usize = 8;
 
+/// What one upload appended and sent to the store.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PackStats {
+    /// Segments shipped.
     pub segments: usize,
+    /// The compressed bytes of the segments stored; it counts only once the upload finishes.
     pub bytes: u64,
+    /// The uncompressed bytes of the objects appended.
     pub raw_bytes: u64,
+    /// Objects appended, recipes included.
     pub objects: usize,
-    /// Chunks that went up as recipes, chunks that equal one in the store, and the chunk bytes
-    /// neither uploaded.
+    /// Chunks that went up as recipes.
     pub recipes: usize,
+    /// Chunks that equal one in the store and went up only as its location.
     pub reused: usize,
+    /// The chunk bytes that recipes and reused chunks kept from going up.
     pub recipe_saved: u64,
     /// Chunks an absorb had prepared.
     pub prepared: usize,
@@ -234,13 +242,13 @@ impl Packer {
             Prepared::Same(e) => {
                 self.added.insert(h, e.loc);
                 self.stats.reused += 1;
-                self.stats.recipe_saved += CHUNK_SIZE as u64;
+                self.stats.recipe_saved += u64_from(CHUNK_SIZE);
                 e.loc
             }
             Prepared::Recipe { enc, deps, keys } => {
                 self.deps.extend(deps);
                 self.stats.recipes += 1;
-                self.stats.recipe_saved += CHUNK_SIZE.saturating_sub(enc.len()) as u64;
+                self.stats.recipe_saved += u64_from(CHUNK_SIZE.saturating_sub(enc.len()));
                 self.keys.insert(h, keys);
                 self.append(h, &enc, true).await
             }
@@ -270,7 +278,7 @@ impl Packer {
         };
         self.added.insert(h, loc);
         self.stats.objects += 1;
-        self.stats.raw_bytes += b.len() as u64;
+        self.stats.raw_bytes += u64_from(b.len());
         loc
     }
 
@@ -283,14 +291,14 @@ impl Packer {
         let fb = std::mem::take(&mut self.frame);
         let raw = fb.payload_len();
         let (tx, rx) = oneshot::channel();
-        let (z_in, z_out) = (self.z_in.clone(), self.z_out.clone());
+        let (z_in, z_out) = (Arc::clone(&self.z_in), Arc::clone(&self.z_out));
         self.cpu.spawn(
             CpuClass::Background,
             Box::new(move || {
                 let z = fb.finish();
                 if let Ok(z) = &z {
-                    z_in.fetch_add(raw as u64, Ordering::Relaxed);
-                    z_out.fetch_add(z.len() as u64, Ordering::Relaxed);
+                    z_in.fetch_add(u64_from(raw), Ordering::Relaxed);
+                    z_out.fetch_add(u64_from(z.len()), Ordering::Relaxed);
                 }
                 let _ = tx.send(z);
             }),
@@ -310,9 +318,10 @@ impl Packer {
             self.z_in.load(Ordering::Relaxed),
             self.z_out.load(Ordering::Relaxed),
         );
-        (self.seg_raw as u64 * o)
+        u64_from(self.seg_raw)
+            .saturating_mul(o)
             .checked_div(i)
-            .map_or(self.seg_raw, |n| n as usize)
+            .map_or(self.seg_raw, usize_from)
     }
 
     async fn ship(&mut self) {
@@ -325,23 +334,21 @@ impl Packer {
         self.seg_raw = 0;
         self.frame_no = 0;
         self.stats.segments += 1;
-        let slot = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the packer never closes its semaphore");
+        let slot = Arc::clone(&self.slots).acquire_owned().await;
         let remote = self.remote.clone();
         self.puts.spawn(async move {
-            let _slot = slot;
+            let _slot = slot.map_err(|_| Error::Cancelled)?;
             let mut data = Vec::new();
             let mut index = Vec::with_capacity(frames.len());
             for f in frames {
                 let z = f.await.map_err(|_| Error::Cancelled)??;
-                index.push((data.len() as u32, z.len() as u32));
+                let too_big = || Error::Corrupt(format!("segment {id} passes 4 GiB"));
+                let off = u32::try_from(data.len()).map_err(|_| too_big())?;
+                let len = u32::try_from(z.len()).map_err(|_| too_big())?;
+                index.push((off, len));
                 data.extend_from_slice(&z);
             }
-            let n = data.len() as u64;
+            let n = u64_from(data.len());
             let idx = SegmentIndex { frames: index, deps }.encode();
             remote
                 .put_segment(id, Bytes::from(data), Bytes::from(idx))
@@ -371,7 +378,8 @@ impl Packer {
     }
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use std::path::Path;
 
@@ -385,9 +393,15 @@ mod tests {
     #[tokio::test]
     async fn packed_objects_read_back_from_another_host() {
         let (ports, store, _) = sim::ports(1);
-        let remote = Remote::new(ports.store.clone());
+        let remote = Remote::new(Arc::clone(&ports.store));
         let writer = Arc::new(Writer::new(WriterId::new("main", 1), 0));
-        let mut p = Packer::new(remote.clone(), ports.cpu.clone(), writer, 1 << 20, Arc::default());
+        let mut p = Packer::new(
+            remote.clone(),
+            Arc::clone(&ports.cpu),
+            writer,
+            1 << 20,
+            Arc::default(),
+        );
         let mut es = Vec::new();
         for i in 0..40u32 {
             let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -396,7 +410,7 @@ mod tests {
                     x ^= x << 13;
                     x ^= x >> 7;
                     x ^= x << 17;
-                    x as u8
+                    x.to_le_bytes()[0]
                 })
                 .collect();
             let h = Hash::of(&b);
@@ -411,9 +425,14 @@ mod tests {
         let listed = store.list("segments").await.unwrap();
         assert_eq!(listed.len(), 2 * st.segments);
 
-        let c = Cache::open_with(ports.fs.clone(), ports.cpu.clone(), remote, Path::new("/other"))
-            .await
-            .unwrap();
+        let c = Cache::open_with(
+            Arc::clone(&ports.fs),
+            Arc::clone(&ports.cpu),
+            remote,
+            Path::new("/other"),
+        )
+        .await
+        .unwrap();
         for (e, b) in &es {
             assert_eq!(c.get(e).await.unwrap(), Bytes::from(b.clone()));
         }
@@ -432,8 +451,8 @@ mod tests {
         let known = Arc::new(HashMap::from([(h, loc)]));
         let writer = Arc::new(Writer::new(WriterId::new("main", 1), 0));
         let mut p = Packer::new(
-            Remote::new(ports.store.clone()),
-            ports.cpu.clone(),
+            Remote::new(Arc::clone(&ports.store)),
+            Arc::clone(&ports.cpu),
             writer,
             SEG_MAX,
             known,

@@ -1,20 +1,30 @@
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use pando_format::{u64_from, usize_from};
+
 use crate::ports::{Clock, Object, ObjectInfo, Store, StoreError, Version};
 
+/// The calls a [`Fault`] can fail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StoreOp {
+    /// [`Store::get`], [`Store::get_range`] and [`Store::get_tail`].
     Get,
+    /// [`Store::put`].
     Put,
+    /// [`Store::create`].
     Create,
+    /// [`Store::update`].
     Update,
+    /// [`Store::list`].
     List,
+    /// [`Store::delete`].
     Delete,
 }
 
@@ -22,7 +32,9 @@ pub enum StoreOp {
 /// reports the failure, as a store does when the reply is lost.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fault {
+    /// The call that fails.
     pub op: StoreOp,
+    /// The write takes effect before the failure.
     pub applied: bool,
 }
 
@@ -52,6 +64,7 @@ pub struct SimStore {
 struct Injected;
 
 impl SimStore {
+    /// An empty store that stamps objects with `clock`'s wall time.
     pub fn new(clock: Arc<dyn Clock>) -> SimStore {
         SimStore {
             state: Mutex::default(),
@@ -59,13 +72,14 @@ impl SimStore {
         }
     }
 
+    /// Queues `fault`: the next call of its kind fails, once.
     pub fn inject(&self, fault: Fault) {
-        self.state.lock().expect("sim store lock").faults.push_back(fault);
+        self.state.lock().faults.push_back(fault);
     }
 
     /// Sets the modification time of `key`, for GC age tests.
     pub fn set_modified(&self, key: &str, at: SystemTime) {
-        if let Some(o) = self.state.lock().expect("sim store lock").objects.get_mut(key) {
+        if let Some(o) = self.state.lock().objects.get_mut(key) {
             o.modified = at;
         }
     }
@@ -83,7 +97,7 @@ impl SimStore {
     }
 
     fn read(&self, key: &str) -> Result<(Bytes, u64), StoreError> {
-        let mut s = self.state.lock().expect("sim store lock");
+        let mut s = self.state.lock();
         if Self::fault(&mut s, StoreOp::Get).is_some() {
             return Err(Self::transient(key));
         }
@@ -100,7 +114,7 @@ impl SimStore {
         body: Bytes,
         expected: Option<&Version>,
     ) -> Result<Version, StoreError> {
-        let mut s = self.state.lock().expect("sim store lock");
+        let mut s = self.state.lock();
         let fault = Self::fault(&mut s, op);
         if fault.is_some_and(|f| !f.applied) {
             return Err(Self::transient(key));
@@ -143,15 +157,15 @@ impl Store for SimStore {
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, StoreError> {
         let (body, _) = self.read(key)?;
-        let end = range.end.min(body.len() as u64) as usize;
-        let start = (range.start as usize).min(end);
+        let end = usize_from(range.end).min(body.len());
+        let start = usize_from(range.start).min(end);
         Ok(body.slice(start..end))
     }
 
     async fn get_tail(&self, key: &str, n: u64) -> Result<(Bytes, u64), StoreError> {
         let (body, _) = self.read(key)?;
-        let size = body.len() as u64;
-        Ok((body.slice((size - n.min(size)) as usize..), size))
+        let len = body.len();
+        Ok((body.slice(len - usize_from(n).min(len)..), u64_from(len)))
     }
 
     async fn put(&self, key: &str, body: Bytes) -> Result<Version, StoreError> {
@@ -167,7 +181,7 @@ impl Store for SimStore {
     }
 
     async fn list(&self, dir: &str) -> Result<Vec<ObjectInfo>, StoreError> {
-        let mut s = self.state.lock().expect("sim store lock");
+        let mut s = self.state.lock();
         if Self::fault(&mut s, StoreOp::List).is_some() {
             return Err(Self::transient(dir));
         }
@@ -177,14 +191,14 @@ impl Store for SimStore {
             .take_while(|(k, _)| k.starts_with(&prefix))
             .map(|(k, o)| ObjectInfo {
                 key: k.clone(),
-                size: o.body.len() as u64,
+                size: u64_from(o.body.len()),
                 modified: o.modified,
             })
             .collect())
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        let mut s = self.state.lock().expect("sim store lock");
+        let mut s = self.state.lock();
         let fault = Self::fault(&mut s, StoreOp::Delete);
         if fault.is_some_and(|f| !f.applied) {
             return Err(Self::transient(key));

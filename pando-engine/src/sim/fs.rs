@@ -1,11 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use parking_lot::{Mutex, MutexGuard};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use pando_format::{u64_from, usize_from};
 
 use crate::ports::{Advice, DirEntry, Extent, FileLock, LocalFile, LocalFs, LocalImage, Open};
 
@@ -45,7 +47,7 @@ impl Data {
 
 #[derive(Debug, Default)]
 struct State {
-    data: HashMap<u64, Data>,
+    data: BTreeMap<u64, Data>,
     names: BTreeMap<PathBuf, Node>,
     durable_names: BTreeMap<PathBuf, Node>,
     next_inode: u64,
@@ -68,7 +70,7 @@ fn not_found(p: &Path) -> io::Error {
 
 impl SimFs {
     fn lock_state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().expect("sim fs lock")
+        self.state.lock()
     }
 
     /// Loses everything not yet durable, as a power cut would, and drops every lock.
@@ -169,18 +171,16 @@ impl LocalFs for SimFs {
         Ok(s.names
             .iter()
             .filter(|(p, _)| p.parent() == Some(dir))
-            .map(|(p, n)| DirEntry {
-                name: p
-                    .file_name()
-                    .expect("a child has a name")
-                    .to_string_lossy()
-                    .into_owned(),
-                len: match n {
-                    Node::File(i) => s.data[i].current.len() as u64,
-                    Node::Dir => 0,
-                },
-                modified: SystemTime::UNIX_EPOCH,
-                is_dir: *n == Node::Dir,
+            .filter_map(|(p, n)| {
+                Some(DirEntry {
+                    name: p.file_name()?.to_string_lossy().into_owned(),
+                    len: match n {
+                        Node::File(i) => u64_from(s.data[i].current.len()),
+                        Node::Dir => 0,
+                    },
+                    modified: SystemTime::UNIX_EPOCH,
+                    is_dir: *n == Node::Dir,
+                })
             })
             .collect())
     }
@@ -261,7 +261,7 @@ impl LocalImage for SimFs {
         let s = self.lock_state();
         let i = Self::inode(&s, path)?;
         let d = &s.data[&i];
-        let len = d.current.len() as u64;
+        let len = u64_from(d.current.len());
         let mut out: Vec<Extent> = Vec::new();
         for (&b, &place) in &d.blocks {
             let (logical, physical) = (b * BLOCK, place * BLOCK);
@@ -282,11 +282,11 @@ impl LocalImage for SimFs {
     async fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
         let mut s = self.lock_state();
         let i = Self::inode(&s, path)?;
-        let d = s.data.get_mut(&i).expect("inode has data");
-        let end = (offset + len).min(d.current.len() as u64) as usize;
-        let start = (offset as usize).min(end);
+        let d = s.data.entry(i).or_default();
+        let end = usize_from(offset + len).min(d.current.len());
+        let start = usize_from(offset).min(end);
         d.current[start..end].fill(0);
-        let (first, last) = ((start as u64).div_ceil(BLOCK), end as u64 / BLOCK);
+        let (first, last) = (u64_from(start).div_ceil(BLOCK), u64_from(end) / BLOCK);
         d.blocks.retain(|b, _| *b < first || *b >= last);
         Ok(())
     }
@@ -317,24 +317,22 @@ impl SimFile {
     fn with_places<T>(&self, f: impl FnOnce(&mut Data, &mut u64) -> T) -> T {
         let mut s = self.fs.lock_state();
         let s = &mut *s;
-        f(
-            s.data.get_mut(&self.inode).expect("open file has data"),
-            &mut s.next_place,
-        )
+        f(s.data.entry(self.inode).or_default(), &mut s.next_place)
     }
 
     fn write_bufs(&self, bufs: &[Bytes], offset: u64) -> usize {
         self.with_places(|d, next| {
-            let mut at = offset as usize;
+            let start = usize_from(offset);
+            let mut at = start;
             for b in bufs {
                 if d.current.len() < at + b.len() {
                     d.current.resize(at + b.len(), 0);
                 }
                 d.current[at..at + b.len()].copy_from_slice(b);
-                d.write(at as u64, b.len() as u64, next);
+                d.write(u64_from(at), u64_from(b.len()), next);
                 at += b.len();
             }
-            at - offset as usize
+            at - start
         })
     }
 }
@@ -343,16 +341,16 @@ impl SimFile {
 impl LocalFile for SimFile {
     async fn read_at(&self, len: usize, offset: u64) -> io::Result<Bytes> {
         Ok(self.with(|d| {
-            let end = (offset as usize).saturating_add(len).min(d.current.len());
-            let start = (offset as usize).min(end);
+            let end = usize_from(offset).saturating_add(len).min(d.current.len());
+            let start = usize_from(offset).min(end);
             Bytes::copy_from_slice(&d.current[start..end])
         }))
     }
 
     fn read_at_nowait(&self, buf: &mut [u8], offset: u64) -> io::Result<Option<usize>> {
         Ok(Some(self.with(|d| {
-            let end = (offset as usize).saturating_add(buf.len()).min(d.current.len());
-            let start = (offset as usize).min(end);
+            let end = usize_from(offset).saturating_add(buf.len()).min(d.current.len());
+            let start = usize_from(offset).min(end);
             buf[..end - start].copy_from_slice(&d.current[start..end]);
             end - start
         })))
@@ -378,14 +376,14 @@ impl LocalFile for SimFile {
 
     async fn set_len(&self, len: u64) -> io::Result<()> {
         self.with(|d| {
-            d.current.resize(len as usize, 0);
+            d.current.resize(usize_from(len), 0);
             d.truncate(len);
         });
         Ok(())
     }
 
     async fn size(&self) -> io::Result<u64> {
-        Ok(self.with(|d| d.current.len() as u64))
+        Ok(self.with(|d| u64_from(d.current.len())))
     }
 
     async fn start_writeback(&self) {}

@@ -15,7 +15,8 @@ sharing one root system.
 
 - **Branches are block devices.** Pando serves each attached branch to the kernel over ublk, with
   a normal file system (ext4) on top. Agents see an ordinary disk, so `git`, `npm`
-  and compilers work without changes.
+  and compilers work without changes. The disk has 4 KiB sectors, a volatile write cache with
+  FUA, and discard: a discarded range reads as zeros, and its chunks no longer take space.
 - **Chunks and branch refs.** The device is split into 64 KiB chunks named by their hash. A
   persistent radix tree maps each chunk index to a chunk. Each branch is one root entry in a
   small ref object, and forking copies that ref. Branches share every chunk they have not changed.
@@ -56,6 +57,11 @@ Linux container and takes the same arguments.
 cargo test --workspace
 ```
 
+`tools/check.sh` runs the checks CI runs, in a container with every tool pinned
+(`tools/Dockerfile`, `tools/install.sh`): with no arguments it runs the lints, the supply-chain
+checks and the tests. It also takes `asan`, `fuzz [seconds]`, `coverage`, `mutants`, or any
+single check by name, such as `clippy` or `shellcheck`. The fuzz targets are in `fuzz/`.
+
 Fixtures in `pando-format/tests/fixtures` pin the byte encoding of every stored object.
 
 ## Alternatives
@@ -94,7 +100,7 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** Every chart has results; SOCI, Nydus, ZeroFS, Amazon S3 Files and Archil
+> **Partly measured.** Every chart has results; SOCI, Nydus, ZeroFS and Amazon S3 Files
 > are not set up yet and fill in as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
 > [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
 > `bench/results/`.
@@ -127,7 +133,6 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | EBS snapshot to volume | 2.6 s | 2.6 s to 2.6 s |
 | JuiceFS | 12.8 s | 12.8 s to 12.8 s |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 | XFS reflink (local) | 1 ms | 1 ms to 1 ms |
 
 | storage added per branch | median | range |
@@ -137,7 +142,6 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | EBS snapshot to volume | 16 GiB | 16 GiB to 16 GiB |
 | JuiceFS | 25.4 MiB | 25.4 MiB to 25.4 MiB |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 | XFS reflink (local) | 4.61 KiB | 4.61 KiB to 4.61 KiB |
 
 | storage added by a 5 MiB edit to a branch | median | range |
@@ -147,7 +151,6 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | EBS snapshot to volume | none: billed by volume size | |
 | JuiceFS | 5 MiB | 5 MiB to 5 MiB |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 | XFS reflink (local) | 5.75 MiB | 5.75 MiB to 5.75 MiB |
 
 </details>
@@ -181,7 +184,6 @@ reads it recorded in the bucket.
 | JuiceFS | 3.88 min | 3.8 min to 3.92 min |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
-| Archil | — | |
 | XFS reflink (local) | local only | |
 
 </details>
@@ -218,7 +220,6 @@ over ublk.
 | JuiceFS | 18.8 s | 18.4 s to 19.1 s |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
-| Archil | — | |
 | XFS reflink (local) | 563 ms | 410 ms to 613 ms |
 
 </details>
@@ -253,7 +254,6 @@ repetition one `vitest` run failed, and it passed in the other two.
 | JuiceFS | 9.96x | 9.90x to 12.07x |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
-| Archil | — | |
 
 </details>
 <!-- /bench:replay -->
@@ -285,7 +285,6 @@ snapshot. Three runs each.
 | EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
 | JuiceFS | 2.76 ms | 2.5 ms to 3.52 ms |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 
 | uploaded after npm ci | median | range |
 |---|---|---|
@@ -295,7 +294,6 @@ snapshot. Three runs each.
 | EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |
 | JuiceFS | 732 MiB | 665 MiB to 785 MiB |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 
 </details>
 <!-- /bench:save -->

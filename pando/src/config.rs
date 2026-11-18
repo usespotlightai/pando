@@ -10,6 +10,10 @@ use pando_s3::{S3Config, S3Store};
 #[derive(Args, Debug)]
 pub(crate) struct StoreArgs {
     /// The store: s3://<prefix>.
+    #[expect(
+        rustdoc::invalid_html_tags,
+        reason = "the comment is the help text, where <...> marks a placeholder"
+    )]
     #[arg(long, global = true, default_value = "s3://")]
     remote: String,
     #[arg(long, env = "S3_BUCKET", hide_env_values = true, global = true)]

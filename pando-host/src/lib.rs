@@ -10,8 +10,8 @@ mod linux;
 
 use std::sync::Arc;
 
-pub use clock::{SystemClock, SystemRng};
-pub use cpu::PoolCpu;
+use clock::{SystemClock, SystemRng};
+use cpu::PoolCpu;
 pub use fs::HostFs;
 use pando_engine::Ports;
 use pando_engine::ports::Store;
@@ -21,7 +21,7 @@ pub fn ports(store: Arc<dyn Store>, cpu_threads: usize) -> std::io::Result<Ports
     let fs = Arc::new(HostFs);
     Ok(Ports {
         store,
-        fs: fs.clone(),
+        fs: Arc::<HostFs>::clone(&fs),
         image: fs,
         clock: Arc::new(SystemClock),
         rng: Arc::new(SystemRng),

@@ -7,7 +7,10 @@
 //! queue's ring reads.
 
 #![cfg(target_os = "linux")]
-#![allow(unsafe_code)]
+#![expect(
+    unsafe_code,
+    reason = "the ublk frontend and the device switch talk to the kernel through ioctls, io_uring and shared mappings"
+)]
 
 mod bdi;
 mod dm;

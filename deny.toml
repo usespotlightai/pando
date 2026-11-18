@@ -3,6 +3,9 @@ all-features = true
 
 [advisories]
 version = 2
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
 ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono, unmaintained, only through object_store" },
     { id = "RUSTSEC-2026-0542", reason = "humantime, unmaintained, only through object_store" },
@@ -10,14 +13,64 @@ ignore = [
 
 [licenses]
 version = 2
-allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "CDLA-Permissive-2.0", "BSL-1.0"]
+confidence-threshold = 0.93
+unused-allowed-license = "deny"
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "BSL-1.0",
+]
 private = { ignore = true }
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    { crate = "openssl", reason = "TLS goes through rustls and ring" },
+    { crate = "openssl-sys", reason = "TLS goes through rustls and ring" },
+    { crate = "native-tls", reason = "TLS goes through rustls and ring" },
+]
+skip = [
+    { crate = "crypto-common@0.1.7", reason = "digest 0.10, for crc-fast in object_store" },
+    { crate = "digest@0.10.7", reason = "crc-fast in object_store is still on digest 0.10" },
+    { crate = "getrandom@0.2.17", reason = "ring 0.17 is still on getrandom 0.2" },
+    { crate = "syn@2.0.119", reason = "the jni, tracing and windows proc macros are still on syn 2" },
+    { crate = "windows-sys@0.52.0", reason = "ring 0.17 is still on windows-sys 0.52" },
+]
+
+[bans.build]
+executables = "deny"
+interpreted = "deny"
+include-dependencies = true
+
+[[bans.build.bypass]]
+crate = "aws-lc-rs@1.19.0"
+allow-globs = ["scripts/**", "util/**"]
+
+[[bans.build.bypass]]
+crate = "aws-lc-sys@0.47.0"
+allow-globs = ["aws-lc/**", "builder/**"]
+
+[[bans.build.bypass]]
+crate = "redox_syscall@0.5.18"
+allow-globs = ["**/*.sh"]
+
+[[bans.build.bypass]]
+crate = "ring@0.17.14"
+allow-globs = ["crypto/**", "third_party/**"]
+
+[[bans.build.bypass]]
+crate = "untrusted@0.9.0"
+allow-globs = ["mk/**"]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+unused-allowed-source = "deny"

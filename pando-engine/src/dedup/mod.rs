@@ -15,15 +15,16 @@ mod block_map;
 pub(crate) mod learned;
 mod prepared;
 
+use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub(crate) use block_map::{BlockAt, BlockMap};
 use bytes::Bytes;
 use pando_format::{
     BLOCK_SIZE, BLOCKS_PER_CHUNK, BlockKeys, CHUNK_SIZE, Entry, Hash, Pick, RECIPE_SOURCES_MAX, Recipe,
-    SegId, is_zero,
+    SegId, is_zero, u64_from,
 };
 pub(crate) use prepared::PreparedChunks;
 
@@ -100,20 +101,20 @@ impl BaseBlocks {
 
     /// The published entry of chunk `idx` of the root, when it has one.
     async fn source(&self, idx: u64) -> Option<Entry> {
-        if let Some(e) = self.sources.lock().expect("sources lock").get(&idx) {
+        if let Some(e) = self.sources.lock().get(&idx) {
             return (!e.is_empty()).then_some(*e);
         }
         let e = match self.tree.lookup(&self.root, idx, true).await {
             Ok(e) if !e.loc.is_pending() => e,
             _ => Entry::EMPTY,
         };
-        self.sources.lock().expect("sources lock").insert(idx, e);
+        self.sources.lock().insert(idx, e);
         (!e.is_empty()).then_some(e)
     }
 
     /// `n` blocks of chunk `idx` from block `blk` on; zeros past the end of the image.
     async fn read(&self, idx: u64, blk: usize, n: usize) -> Result<Bytes> {
-        let off = idx * CHUNK_SIZE as u64 + (blk * BLOCK_SIZE) as u64;
+        let off = idx * u64_from(CHUNK_SIZE) + u64_from(blk * BLOCK_SIZE);
         let b = self.image.read_at(n * BLOCK_SIZE, off).await?;
         if b.len() == n * BLOCK_SIZE {
             return Ok(b);
@@ -168,7 +169,7 @@ impl Dedup {
     }
 
     fn candidate(&self, keys: &BlockKeys, blk: usize) -> Option<Candidate> {
-        let k = &keys.0[blk];
+        let k = keys.0[blk];
         if let Some(at) = self.base.as_ref().and_then(|b| b.map.get(k)) {
             return Some(Candidate {
                 origin: Origin::Base,
@@ -194,7 +195,7 @@ impl Dedup {
             }
             Origin::Learned => {
                 let l = self.learned.as_ref()?;
-                let slot = c.at.chunk() as u32;
+                let slot = u32::try_from(c.at.chunk()).ok()?;
                 let e = l.source(slot).await?;
                 Some((e, l.read(slot, c.at.block(), n).await.ok()?))
             }
@@ -216,7 +217,8 @@ impl Dedup {
         let mut shared = 0;
         let mut blk = 0;
         while blk < BLOCKS_PER_CHUNK {
-            let Some(c) = cands[blk] else {
+            let cand = cands[blk];
+            let Some(c) = cand else {
                 blk += 1;
                 continue;
             };
@@ -241,20 +243,22 @@ impl Dedup {
                 if e.hash == h {
                     return Found::Same(e);
                 }
+                let Ok(block) = u8::try_from(c.at.block() + k) else {
+                    continue;
+                };
                 let src = match source_of.get(&e.hash) {
                     Some(&s) => s,
                     None if sources.len() == RECIPE_SOURCES_MAX => break,
                     None => {
-                        let s = sources.len() as u8;
+                        let Ok(s) = u8::try_from(sources.len()) else {
+                            break;
+                        };
                         source_of.insert(e.hash, s);
                         sources.push(e);
                         s
                     }
                 };
-                picks[run + k] = Pick::Source {
-                    src,
-                    block: (c.at.block() + k) as u8,
-                };
+                picks[run + k] = Pick::Source { src, block };
                 shared += 1;
             }
         }
@@ -284,5 +288,6 @@ pub(crate) async fn prepare(dedup: Option<&Dedup>, h: Hash, b: Bytes) -> Prepare
     }
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests;

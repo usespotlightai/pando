@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use pando_format::{CHUNK_SIZE, Entry};
+use pando_format::{CHUNK_SIZE, Entry, u64_from, usize_from};
 
 use crate::cache::Cache;
 use crate::tree::Tree;
@@ -27,12 +27,15 @@ const MAX_EXTENT_DEPTH: usize = 5;
 const EXTENT_INIT_MAX: u64 = 32768;
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
-    b.get(at..at + 2).map_or(0, |s| u16::from_le_bytes([s[0], s[1]]))
+    b.get(at..)
+        .and_then(<[u8]>::first_chunk)
+        .map_or(0, |s| u16::from_le_bytes(*s))
 }
 
 fn u32_at(b: &[u8], at: usize) -> u32 {
-    b.get(at..at + 4)
-        .map_or(0, |s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
+    b.get(at..)
+        .and_then(<[u8]>::first_chunk)
+        .map_or(0, |s| u32::from_le_bytes(*s))
 }
 
 /// A byte range of the image.
@@ -43,7 +46,7 @@ struct Span {
 }
 
 fn chunks(spans: &[Span]) -> Vec<u64> {
-    let c = CHUNK_SIZE as u64;
+    let c = u64_from(CHUNK_SIZE);
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for s in spans.iter().filter(|s| s.len > 0) {
@@ -64,42 +67,73 @@ pub(crate) trait Image {
     async fn wave(&mut self, idxs: Vec<u64>) -> Result<()>;
 }
 
+/// The superblock fields [`metadata`] reads.
+struct Super {
+    bs: u64,
+    first: u64,
+    groups: u64,
+    desc: u64,
+    inodes_per: u64,
+    inode_size: u64,
+    unused_valid: bool,
+}
+
+fn superblock(sb: &[u8]) -> Result<Super> {
+    let not = |why: &str| Error::Corrupt(format!("ext4 metadata: {why}"));
+    if u16_at(sb, 56) != SUPER_MAGIC {
+        return Err(not("not ext4"));
+    }
+    let (incompat, ro_compat) = (u32_at(sb, 96), u32_at(sb, 100));
+    if incompat & INCOMPAT_META_BG != 0 {
+        return Err(not("the meta_bg layout"));
+    }
+    let low_blocks = u64::from(u32_at(sb, 4));
+    let (blocks, desc) = if incompat & INCOMPAT_64BIT == 0 {
+        (low_blocks, 32)
+    } else {
+        (
+            low_blocks | u64::from(u32_at(sb, 0x150)) << 32,
+            u64::from(u16_at(sb, 0xFE)),
+        )
+    };
+    let (first, per_group) = (u64::from(u32_at(sb, 20)), u64::from(u32_at(sb, 32)));
+    let (inodes_per, inode_size) = (u64::from(u32_at(sb, 40)), u64::from(u16_at(sb, 88)));
+    if per_group == 0 || desc < 32 || inode_size < 128 || blocks <= first {
+        return Err(not("a bad superblock"));
+    }
+    Ok(Super {
+        bs: 1024u64 << u32_at(sb, 24).min(16),
+        first,
+        groups: (blocks - first).div_ceil(per_group),
+        desc,
+        inodes_per,
+        inode_size,
+        unused_valid: ro_compat & (RO_COMPAT_GDT_CSUM | RO_COMPAT_METADATA_CSUM) != 0,
+    })
+}
+
 /// Finds the chunks holding ext4 metadata in two waves: bitmaps and inode tables first, then
 /// the directory blocks found by scanning those inode tables. The first wave comes before the
 /// scan reads the tables, so it can fetch them in one batch.
 pub(crate) async fn metadata(img: &mut impl Image) -> Result<()> {
-    let not = |why: &str| Error::Corrupt(format!("ext4 metadata: {why}"));
-    let sb = img.read(1024, 1024).await?;
-    if u16_at(&sb, 56) != SUPER_MAGIC {
-        return Err(not("not ext4"));
-    }
-    let (incompat, ro_compat) = (u32_at(&sb, 96), u32_at(&sb, 100));
-    if incompat & INCOMPAT_META_BG != 0 {
-        return Err(not("the meta_bg layout"));
-    }
-    let bs = 1024u64 << u32_at(&sb, 24).min(16);
-    let mut blocks = u32_at(&sb, 4) as u64;
-    let mut desc = 32u64;
-    if incompat & INCOMPAT_64BIT != 0 {
-        blocks |= (u32_at(&sb, 0x150) as u64) << 32;
-        desc = u16_at(&sb, 0xFE) as u64;
-    }
-    let (first, per_group) = (u32_at(&sb, 20) as u64, u32_at(&sb, 32) as u64);
-    let (inodes_per, inode_size) = (u32_at(&sb, 40) as u64, u16_at(&sb, 88) as u64);
-    if per_group == 0 || desc < 32 || inode_size < 128 || blocks <= first {
-        return Err(not("a bad superblock"));
-    }
-    let unused_valid = ro_compat & (RO_COMPAT_GDT_CSUM | RO_COMPAT_METADATA_CSUM) != 0;
-    let groups = (blocks - first).div_ceil(per_group);
+    let Super {
+        bs,
+        first,
+        groups,
+        desc,
+        inodes_per,
+        inode_size,
+        unused_valid,
+    } = superblock(&img.read(1024, 1024).await?)?;
     let gdt = img.read((first + 1) * bs, groups * desc).await?;
     let mut meta = Vec::new();
     let mut tables = Vec::new();
-    for g in 0..groups as usize {
-        let d = &gdt[(g * desc as usize).min(gdt.len())..];
+    for g in 0..usize_from(groups) {
+        let d = &gdt[(g * usize_from(desc)).min(gdt.len())..];
         let lohi = |lo: usize, hi: usize| {
-            let x = u32_at(d, lo) as u64;
+            let x = u64::from(u32_at(d, lo));
             if desc >= 64 {
-                x | (u32_at(d, hi) as u64) << 32
+                x | u64::from(u32_at(d, hi)) << 32
             } else {
                 x
             }
@@ -117,9 +151,9 @@ pub(crate) async fn metadata(img: &mut impl Image) -> Result<()> {
         }
         let mut n = inodes_per;
         if unused_valid {
-            let mut unused = u16_at(d, 0x1C) as u64;
+            let mut unused = u64::from(u16_at(d, 0x1C));
             if desc >= 64 {
-                unused |= (u16_at(d, 0x32) as u64) << 16;
+                unused |= u64::from(u16_at(d, 0x32)) << 16;
             }
             n -= unused.min(n);
         }
@@ -136,7 +170,7 @@ pub(crate) async fn metadata(img: &mut impl Image) -> Result<()> {
     let mut dirs = Vec::new();
     for t in &tables {
         let table = img.read(t.off, t.len).await?;
-        for ino in table.chunks_exact(inode_size as usize) {
+        for ino in table.chunks_exact(usize_from(inode_size)) {
             if u16_at(ino, 0) & S_IFMT != S_IFDIR || u16_at(ino, 26) == 0 || u32_at(ino, 32) & EXTENTS_FL == 0
             {
                 continue;
@@ -146,20 +180,20 @@ pub(crate) async fn metadata(img: &mut impl Image) -> Result<()> {
                 if node.len() < 12 || u16_at(&node, 0) != EXTENT_MAGIC || depth > MAX_EXTENT_DEPTH {
                     continue;
                 }
-                let (entries, leaf) = (u16_at(&node, 2) as usize, u16_at(&node, 6) == 0);
+                let (entries, leaf) = (usize::from(u16_at(&node, 2)), u16_at(&node, 6) == 0);
                 for x in node[12..].as_chunks::<12>().0.iter().take(entries) {
                     if leaf {
-                        let mut len = u16_at(x, 4) as u64;
+                        let mut len = u64::from(u16_at(x, 4));
                         if len > EXTENT_INIT_MAX {
                             len -= EXTENT_INIT_MAX;
                         }
-                        let start = (u16_at(x, 6) as u64) << 32 | u32_at(x, 8) as u64;
+                        let start = u64::from(u16_at(x, 6)) << 32 | u64::from(u32_at(x, 8));
                         dirs.push(Span {
                             off: start * bs,
                             len: len * bs,
                         });
                     } else {
-                        let child = u32_at(x, 4) as u64 | (u16_at(x, 8) as u64) << 32;
+                        let child = u64::from(u32_at(x, 4)) | u64::from(u16_at(x, 8)) << 32;
                         stack.push((img.read(child * bs, bs).await?, depth + 1));
                     }
                 }
@@ -173,20 +207,20 @@ pub(crate) async fn metadata(img: &mut impl Image) -> Result<()> {
 /// Reads `len` bytes at `off` of the tree at `root` without recording the read as a first
 /// read, with holes as zeros.
 async fn read_tree(cache: &Cache, tree: &Tree, root: &Entry, off: u64, len: u64) -> Result<Vec<u8>> {
-    let c = CHUNK_SIZE as u64;
-    let mut out = vec![0u8; len as usize];
+    let c = u64_from(CHUNK_SIZE);
+    let mut out = vec![0u8; usize_from(len)];
     let mut pos = off;
     while pos < off + len {
-        let (idx, at) = (pos / c, (pos % c) as usize);
-        let n = (CHUNK_SIZE - at).min((off + len - pos) as usize);
+        let (idx, at) = (pos / c, usize_from(pos % c));
+        let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
         let e = tree.lookup(root, idx, true).await?;
         if !e.is_empty() {
             let b = cache.get_background(&e).await?;
-            let o = (pos - off) as usize;
+            let o = usize_from(pos - off);
             let have = b.len().saturating_sub(at).min(n);
             out[o..o + have].copy_from_slice(&b[at..at + have]);
         }
-        pos += n as u64;
+        pos += u64_from(n);
     }
     Ok(out)
 }
@@ -273,8 +307,8 @@ pub(crate) mod tests {
         put16(root, 42, 1);
         put16(root, 44, 4);
         put16(root, 52 + 4, 1);
-        put32(root, 52 + 8, DIR_BLOCK as u32);
-        img[DIR_BLOCK as usize * BS] = 2;
+        put32(root, 52 + 8, u32::try_from(DIR_BLOCK).unwrap());
+        img[usize_from(DIR_BLOCK) * BS] = 2;
         img
     }
 
@@ -284,13 +318,13 @@ pub(crate) mod tests {
     }
 
     impl Image for Bytes {
-        async fn read(&mut self, off: u64, len: u64) -> Result<Vec<u8>> {
-            Ok(self.img[off as usize..(off + len) as usize].to_vec())
+        fn read(&mut self, off: u64, len: u64) -> impl Future<Output = Result<Vec<u8>>> {
+            std::future::ready(Ok(self.img[usize_from(off)..usize_from(off + len)].to_vec()))
         }
 
-        async fn wave(&mut self, idxs: Vec<u64>) -> Result<()> {
+        fn wave(&mut self, idxs: Vec<u64>) -> impl Future<Output = Result<()>> {
             self.waves.push(idxs);
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 
@@ -303,7 +337,7 @@ pub(crate) mod tests {
         metadata(&mut b).await.unwrap();
         assert_eq!(
             b.waves,
-            vec![vec![0], vec![DIR_BLOCK * BS as u64 / CHUNK_SIZE as u64]]
+            vec![vec![0], vec![DIR_BLOCK * u64_from(BS) / u64_from(CHUNK_SIZE)]]
         );
     }
 

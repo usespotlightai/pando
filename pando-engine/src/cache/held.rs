@@ -1,18 +1,18 @@
 //! Held recipes: recipe chunks of fetched frames whose sources are not on this host, kept as
 //! their encodings until a read or a fetch asks for them.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet, hash_map};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use pando_format::{Entry, Hash, Recipe};
+use pando_format::{Entry, Hash, Recipe, u64_from};
 
 use super::sched::FetchOpts;
 use super::{Cache, FrameKey};
-use crate::Result;
 use crate::flight::{Flights, Joined, bounded};
+use crate::{Error, Result};
 
 /// Held encodings take at most this much memory; past it, frames rebuild recipes at once.
 const HELD_MAX: u64 = 256 << 20;
@@ -46,12 +46,13 @@ pub(super) struct Held {
 
 impl Held {
     fn get(&self, id: &HeldId) -> Option<Bytes> {
-        self.encodings.lock().expect("held lock").get(id).cloned()
+        self.encodings.lock().get(id).cloned()
     }
 
     fn remove(&self, id: &HeldId) {
-        if let Some(b) = self.encodings.lock().expect("held lock").remove(id) {
-            self.bytes.fetch_sub(b.len() as u64, Ordering::Relaxed);
+        let removed = self.encodings.lock().remove(id);
+        if let Some(b) = removed {
+            self.bytes.fetch_sub(u64_from(b.len()), Ordering::Relaxed);
         }
     }
 }
@@ -60,12 +61,12 @@ impl Cache {
     /// Keeps the encoding of recipe chunk `id` until it is asked for; `false` when the budget
     /// is spent.
     pub(super) fn hold(&self, id: HeldId, enc: &Bytes) -> bool {
-        let n = enc.len() as u64;
+        let n = u64_from(enc.len());
         if self.held.bytes.load(Ordering::Relaxed) + n > HELD_MAX {
             return false;
         }
-        let mut m = self.held.encodings.lock().expect("held lock");
-        if let std::collections::hash_map::Entry::Vacant(v) = m.entry(id) {
+        let mut m = self.held.encodings.lock();
+        if let hash_map::Entry::Vacant(v) = m.entry(id) {
             v.insert(Bytes::copy_from_slice(enc));
             self.held.bytes.fetch_add(n, Ordering::Relaxed);
         }
@@ -124,7 +125,7 @@ impl Cache {
                         claim.finish(Ok(()))?;
                         Ok(Some(b))
                     }
-                    Err(err) => Err(claim.finish(Err(err)).expect_err("finished with an error")),
+                    Err(err) => claim.finish(Err(err)).and(Err(Error::Cancelled)),
                 }
             }
         }

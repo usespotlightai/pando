@@ -15,6 +15,9 @@ pub async fn check(store: &dyn Store) {
 }
 
 /// Deletes what [`check`] left under `test/`.
+///
+/// # Panics
+/// When the store fails to list or delete.
 pub async fn clean_up(store: &dyn Store) {
     for o in store.list("test").await.unwrap() {
         store.delete(&o.key).await.unwrap();
