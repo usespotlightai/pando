@@ -103,7 +103,7 @@ pub(crate) struct SnapshotOptions {
 }
 
 /// What a handoff did before the device moved to the image.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HandoffReport {
     /// The image started as a clone of the base image.
     pub shared: bool,
@@ -119,6 +119,8 @@ pub struct HandoffReport {
     pub from_base: u64,
     /// An era device tracks the chunks the kernel writes, so snapshots clone only those.
     pub tracked: bool,
+    /// Why no era device tracks the writes, when none does.
+    pub untracked: Option<String>,
 }
 
 /// What the background snapshots did.
@@ -346,7 +348,7 @@ impl Handoff {
         devices.suspend(&self.dm).await?;
         let cloned = async {
             let now = match era {
-                Some(e) => Some(devices.era_written(e, u32::MAX).await?.now),
+                Some(e) => Some(devices.era_begin(e).await?),
                 None => None,
             };
             self.clone_to(path).await?;
@@ -355,6 +357,9 @@ impl Handoff {
         .await;
         let resumed = devices.resume(&self.dm).await;
         let paused = t0.elapsed();
+        if let (Some(e), Ok(Some(_))) = (era, &cloned) {
+            let _ = devices.era_listed(e, u32::MAX).await;
+        }
         if let Err(e) = resumed {
             let _ = self.env.ports.fs.remove(path).await;
             return Err(e.into());
@@ -392,9 +397,15 @@ impl Handoff {
 
     /// Takes one snapshot: clones what the kernel wrote to the image since the last one under
     /// suspend, takes those chunks as writes, then flushes them.
+    /// Takes a snapshot now. It does not give up while writes keep coming, so a flush after it
+    /// publishes the image as it was at one moment.
     pub(crate) async fn snapshot_once(&self, v: &Volume) -> Result<usize> {
+        self.snapshot(v, false).await
+    }
+
+    async fn snapshot(&self, v: &Volume, may_postpone: bool) -> Result<usize> {
         match self.era() {
-            Some(era) => self.snapshot_era(v, &era).await,
+            Some(era) => self.snapshot_era(v, &era, may_postpone).await,
             None => self.snapshot_extents(v).await,
         }
     }
@@ -421,7 +432,7 @@ impl Handoff {
     /// A snapshot of the chunks era device `era` saw written. With few enough, it reads them
     /// from the image, or gives up for now when writes keep coming; else it clones them. Most
     /// are listed before the suspend; the suspend lists the rest and clones or reads them.
-    async fn snapshot_era(&self, v: &Volume, era: &str) -> Result<usize> {
+    async fn snapshot_era(&self, v: &Volume, era: &str, may_postpone: bool) -> Result<usize> {
         let mut s = self.snaps.lock().await;
         let devices = self.env.devices.as_ref();
         let copy_max = self.opts.copy_max;
@@ -437,18 +448,20 @@ impl Handoff {
             return Ok(0);
         }
         if copy_max > 0 && count(&early.blocks) * CHUNK <= copy_max && s.postponed < POSTPONE_MAX {
-            let Some((n, now)) = self.copy_era(v, era, &early).await? else {
+            if let Some((n, now)) = self.copy_era(v, era, &early).await? {
+                self.retire_prev(&mut s);
+                s.since = now;
+                s.postponed = 0;
+                self.stats.taken.fetch_add(1, Ordering::Relaxed);
+                self.stats.copied.fetch_add(1, Ordering::Relaxed);
+                self.stats.chunks.fetch_add(n, Ordering::Relaxed);
+                return Ok(n);
+            }
+            if may_postpone {
                 s.postponed += 1;
                 self.stats.postponed.fetch_add(1, Ordering::Relaxed);
                 return Ok(0);
-            };
-            self.retire_prev(&mut s);
-            s.since = now;
-            s.postponed = 0;
-            self.stats.taken.fetch_add(1, Ordering::Relaxed);
-            self.stats.copied.fetch_add(1, Ordering::Relaxed);
-            self.stats.chunks.fetch_add(n, Ordering::Relaxed);
-            return Ok(n);
+            }
         }
         let path = s.next_path(&self.image);
         let taken = self.clone_era(era, &early, &path).await?;
@@ -484,7 +497,7 @@ impl Handoff {
             n += v.read_chunks(&self.file, &chunks(&list)).await?;
             let next = self.mark(era).await?;
             let written = devices.era_listed(era, from).await?;
-            if count(&written) * 2 > count(&list) {
+            if count(&written) > FREEZE_CHUNKS && count(&written) * 2 > count(&list) {
                 return Ok(None);
             }
             (list, from) = (written, next);
@@ -657,7 +670,7 @@ impl Handoff {
             if !snapshot_due(last.elapsed(), written, changed.elapsed(), &self.opts).0 || self.stopped() {
                 continue;
             }
-            if let Err(e) = self.snapshot_once(&v).await {
+            if let Err(e) = self.snapshot(&v, true).await {
                 self.stats.failed.fetch_add(1, Ordering::Relaxed);
                 *self.stats.last_error.lock() = Some(e.to_string());
             }
@@ -744,14 +757,14 @@ impl Handoff {
     }
 
     /// Puts era device `era_name(dm)` over loop device `lp` of the image, on a new records file,
-    /// and returns it; `None` when the host cannot track eras. An era device of that name is
+    /// and returns it; fails when the host cannot track eras. An era device of that name is
     /// left from an earlier run that no table maps any more, and goes first.
-    async fn start_era(&self, lp: &Path, size: u64) -> Option<PathBuf> {
+    async fn start_era(&self, lp: &Path, size: u64) -> Result<PathBuf> {
         let devices = self.env.devices.as_ref();
         let fs = self.env.ports.fs.as_ref();
         let name = era_name(&self.dm);
-        if devices.era(&name).await.ok()?.is_some() {
-            devices.remove(&name).await.ok()?;
+        if devices.era(&name).await?.is_some() {
+            devices.remove(&name).await?;
         }
         let records = era_records(&self.image);
         let _ = fs.remove(&records).await;
@@ -764,12 +777,15 @@ impl Handoff {
             devices.create_era(&name, &mlp, lp, size, CHUNK).await
         }
         .await;
-        if let Ok(path) = made {
-            *self.era.lock() = Some(name);
-            Some(path)
-        } else {
-            let _ = fs.remove(&records).await;
-            None
+        match made {
+            Ok(path) => {
+                *self.era.lock() = Some(name);
+                Ok(path)
+            }
+            Err(e) => {
+                let _ = fs.remove(&records).await;
+                Err(e.into())
+            }
         }
     }
 }
@@ -903,7 +919,13 @@ async fn copy_and_switch(h: &Arc<Handoff>, v: &Arc<Volume>, shared: Option<&Base
     let devices = h.env.devices.as_ref();
     let lp = devices.attach_loop(&h.image).await?;
     *h.loop_dev.lock() = Some(lp.clone());
-    let target = h.start_era(&lp, v.size()).await.unwrap_or_else(|| lp.clone());
+    let target = match h.start_era(&lp, v.size()).await {
+        Ok(p) => p,
+        Err(e) => {
+            report.untracked = Some(e.to_string());
+            lp.clone()
+        }
+    };
     report.tracked = h.tracked();
     devices.load(&h.dm, &target, v.size()).await?;
     let t0 = Instant::now();

@@ -409,6 +409,65 @@ async fn a_clone_snapshot_clones_again_what_was_written_while_it_cloned() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_copy_snapshot_freezes_once_few_were_written_while_it_read() {
+    let host = Host::new(18, true).await;
+    let v = host.open().await;
+    host.serve(&v).await;
+    let env = host.env(false);
+    let image = image_path(&host.ports, Path::new("/img"), "main");
+    let (h, _) = hand_off(&env, &v, DM, image, copying(5, 1 << 20)).await.unwrap();
+    for (off, b) in chunk_writes(0, FREEZE_CHUNKS + 1, 0x01) {
+        host.devices.write(DM, &b, off).await.unwrap();
+    }
+    host.devices.write_at_era_begins(
+        &era_name(DM),
+        vec![vec![], chunk_writes(0, FREEZE_CHUNKS - 1, 0x02)],
+    );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(h.stats.copied.load(Ordering::Relaxed), 1);
+    assert_eq!(h.stats.postponed.load(Ordering::Relaxed), 0);
+    host.devices.remove(DM).await.unwrap();
+    assert_eq!(h.absorb_final(&v).await.unwrap(), 0);
+    v.checkpoint().await.unwrap();
+    h.remove(&v).await;
+    v.close().await;
+    assert_eq!(
+        host.published().await,
+        chunks_filled(&[(0, FREEZE_CHUNKS - 1, 0x02), (FREEZE_CHUNKS - 1, 2, 0x01)])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_asked_for_clones_rather_than_give_up() {
+    let host = Host::new(19, true).await;
+    let v = host.open().await;
+    host.serve(&v).await;
+    let env = host.env(false);
+    let image = image_path(&host.ports, Path::new("/img"), "main");
+    let (h, _) = hand_off(&env, &v, DM, image, copying(0, 1 << 20)).await.unwrap();
+    for (off, b) in chunk_writes(0, 10, 0x01) {
+        host.devices.write(DM, &b, off).await.unwrap();
+    }
+    let batches = std::iter::once(vec![])
+        .chain((2..=7).map(|fill| chunk_writes(20, 10, fill)))
+        .collect();
+    host.devices.write_at_era_begins(&era_name(DM), batches);
+    h.snapshot_once(&v).await.unwrap();
+    assert_eq!(h.stats.postponed.load(Ordering::Relaxed), 0);
+    assert_eq!(h.stats.copied.load(Ordering::Relaxed), 0);
+    assert_eq!(host.clones().await.len(), 1);
+    v.checkpoint().await.unwrap();
+    host.devices.remove(DM).await.unwrap();
+    assert_eq!(h.absorb_final(&v).await.unwrap(), 0);
+    h.remove(&v).await;
+    v.close().await;
+    assert_eq!(
+        host.published().await,
+        chunks_filled(&[(0, 10, 0x01), (20, 10, 7)])
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn writes_that_do_not_let_up_postpone_copy_snapshots_until_one_clones() {
     let host = Host::new(16, true).await;
     let v = host.open().await;
