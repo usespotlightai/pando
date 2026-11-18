@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
+use std::ops::Range;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -222,6 +223,18 @@ impl LocalFile for HostFile {
     }
 }
 
+fn copy_range(src: &File, dst: &File, start: u64, end: u64) -> io::Result<()> {
+    let mut buf = vec![0u8; usize::try_from(end - start).map_or(1 << 20, |r| r.min(1 << 20))];
+    let mut at = start;
+    while at < end {
+        let n = usize::try_from(end - at).map_or(buf.len(), |r| r.min(buf.len()));
+        src.read_exact_at(&mut buf[..n], at)?;
+        dst.write_all_at(&buf[..n], at)?;
+        at += n as u64;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl LocalImage for HostFs {
     async fn clone_file(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -232,6 +245,40 @@ impl LocalImage for HostFs {
                 return Ok(());
             }
             std::fs::copy(&from, &to).map(|_| ())
+        })
+        .await
+    }
+
+    async fn clone_ranges(&self, from: &Path, to: &Path, ranges: &[Range<u64>]) -> io::Result<()> {
+        let (from, to, ranges) = (from.to_path_buf(), to.to_path_buf(), ranges.to_vec());
+        blocking(move || {
+            let src = File::open(&from)?;
+            let len = src.metadata()?.len();
+            let dst = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&to)?;
+            if dst.metadata()?.len() < len {
+                dst.set_len(len)?;
+            }
+            #[cfg(target_os = "linux")]
+            let mut share = true;
+            for r in ranges {
+                let end = r.end.min(len);
+                if end <= r.start {
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                if share {
+                    if crate::linux::reflink_range(&src, &dst, r.start, end - r.start)? {
+                        continue;
+                    }
+                    share = false;
+                }
+                copy_range(&src, &dst, r.start, end)?;
+            }
+            Ok(())
         })
         .await
     }
@@ -333,6 +380,65 @@ mod tests {
             .collect();
         assert_eq!(names, ["a", "b"]);
         let _held = fs.lock(&dir.path().join("lock")).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_range_clone_holds_only_its_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let mut want = vec![0u8; (3 << 16) + 100];
+        let src: Vec<u8> = (0..want.len())
+            .map(|i| u8::try_from(i % 251).unwrap() + 1)
+            .collect();
+        let f = HostFs.open(&a, Open::CreateNew).await.unwrap();
+        f.write_at(vec![Bytes::from(src.clone())], 0).await.unwrap();
+        f.sync_data().await.unwrap();
+        HostFs.open(&b, Open::CreateNew).await.unwrap();
+        let ranges = [0..1 << 16, 2 << 16..4 << 16];
+        HostFs.clone_ranges(&a, &b, &ranges).await.unwrap();
+        want[..1 << 16].copy_from_slice(&src[..1 << 16]);
+        want[2 << 16..].copy_from_slice(&src[2 << 16..]);
+        let got = HostFs
+            .open(&b, Open::Read)
+            .await
+            .unwrap()
+            .read_at(src.len() + 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(&got[..], &want[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_range_clone_into_a_file_keeps_its_other_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let f = HostFs.open(&a, Open::CreateNew).await.unwrap();
+        f.write_at(vec![Bytes::from(vec![1u8; 3 << 16])], 0)
+            .await
+            .unwrap();
+        HostFs
+            .clone_ranges(&a, &b, &[0..1 << 16, 1 << 16..3 << 16])
+            .await
+            .unwrap();
+        f.write_at(vec![Bytes::from(vec![2u8; 4 << 16])], 0)
+            .await
+            .unwrap();
+        f.sync_data().await.unwrap();
+        HostFs
+            .clone_ranges(&a, &b, &[1 << 16..2 << 16, 3 << 16..4 << 16])
+            .await
+            .unwrap();
+        let got = HostFs
+            .open(&b, Open::Read)
+            .await
+            .unwrap()
+            .read_at(5 << 16, 0)
+            .await
+            .unwrap();
+        let mut want = vec![1u8; 4 << 16];
+        want[1 << 16..2 << 16].fill(2);
+        want[3 << 16..].fill(2);
+        assert_eq!(&got[..], &want[..]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

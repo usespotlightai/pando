@@ -125,6 +125,13 @@ which drops the labels a remote snapshotter needs, so the image would be pulled 
   | ZeroFS (NBD) | unmount and `nbd-client -d`, which flush the device to ZeroFS and so to the bucket | growth of its bucket prefix |
   | Amazon S3 Files | `sync -f` of the branch; another host's mount then reads it, and the bucket has it about a minute later | object versions written to the bucket since before `npm ci`, once its exports have settled |
 
+  Pando's time is also split into the unmount, `pando detach` and the end of `pando attach`,
+  with the publish's own flush, upload wait, pack and ref times, the bytes the device took
+  during `npm ci` and during the unmount, the page cache's dirty bytes before the unmount, and
+  what the uploads put before and during the detach (`save.*` rows in `save.csv`).
+  `pando-capped` is Pando attached with `--dirty-limit` at 64 MiB, so the kernel writes the
+  branch back while `npm ci` runs.
+
 - **fio** opens a fresh branch on a warm host, lays out one 1 GiB file and runs each job for 20 s
   after a 2 s ramp with direct I/O, page cache dropped before each job. Pando (after handoff)
   waits until the device has switched to its local image. Local NVMe is the `/native` ext4 file

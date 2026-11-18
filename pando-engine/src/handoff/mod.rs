@@ -6,11 +6,22 @@
 //! at a loop device over the image and resumes. From then on the kernel serves every read and
 //! write from the image.
 //!
-//! While the run goes on, background snapshots clone the image during a short suspend, every
-//! interval or early after a burst of writes. The chunks whose extents differ from the previous
-//! clone changed; they are taken back as writes and uploaded. At detach the handoff takes what
-//! changed since the last snapshot the same way. A flush records each taken chunk as a
-//! reference into its clone, so a clone stays until an upload has published those chunks.
+//! While the run goes on, background snapshots take back what the kernel wrote, every interval
+//! or early after a burst of writes. Where the host has an era target, an era device between
+//! the device and the loop device records which chunks each write reached. A snapshot begins
+//! a new era during a short suspend, asks for the chunks written since the last one and clones
+//! only those ranges of the image while the device serves; it repeats that for the chunks
+//! written while it cloned until few are left, and a last short suspend clones those and the
+//! ones written since. With few enough chunks written, a snapshot clones nothing: it reads the
+//! chunks from the image in the same rounds. Each snapshot holds the image as it was at that
+//! last suspend. When the writes do not let up while it reads, the snapshot gives up for now;
+//! after a few in a row, the next one clones.
+//! Elsewhere a snapshot clones the whole image and takes the chunks whose extents moved since
+//! the previous clone. A clone shares its blocks with the image, so the next write to each
+//! costs a copy; cloning only what changed keeps that to the chunks written in consecutive
+//! intervals. At detach the handoff takes what changed since the last snapshot the same way.
+//! A flush records each chunk taken from a clone as a reference into it, so a clone stays
+//! until an upload has published those chunks; a chunk read from the image holds its bytes.
 //!
 //! With shared bases, the image starts as a clone of the base image of the root the branch
 //! opened at, and only the chunks that differ from it are copied.
@@ -20,12 +31,13 @@ mod extents;
 mod owner;
 
 use parking_lot::Mutex;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use pando_format::Hash;
+use pando_format::{CHUNK_SIZE, Hash};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -37,13 +49,29 @@ use crate::base::{Bases, BuildOptions, build};
 use crate::cache::BaseKey;
 use crate::dedup::Dedup;
 use crate::dedup::learned::LearnedIndex;
-use crate::ports::{DeviceSwitch, Extent, LocalFile, Open};
+use crate::ports::{DeviceSwitch, EraWritten, Extent, LocalFile, Open};
 use crate::{Ports, Result, Volume};
 
+const CHUNK: u64 = CHUNK_SIZE as u64;
 /// How often the snapshot loop checks the bytes written to the image.
 const SNAPSHOT_POLL: Duration = Duration::from_millis(100);
+/// The least size an image's era records may grow to, so a branch can grow to it.
+const ERA_ROOM: u64 = 1 << 40;
+/// Bytes of era records per chunk: the era of each, the bits of the eras not yet folded in,
+/// and their trees, with room to spare.
+const ERA_PER_CHUNK: u64 = 32;
+const ERA_FIXED: u64 = 64 << 20;
 /// Rounds of copying the chunks written during the copy before the suspend.
 const RECOPY_ROUNDS: usize = 4;
+/// Rounds a snapshot reads the chunks written while the last round read, before it gives up.
+const COPY_ROUNDS: usize = 4;
+/// The most chunks a snapshot reads while the device is suspended.
+#[cfg(not(test))]
+const FREEZE_CHUNKS: u64 = 128;
+#[cfg(test)]
+const FREEZE_CHUNKS: u64 = 4;
+/// Snapshots in a row that may give up before the next one clones instead.
+const POSTPONE_MAX: u32 = 3;
 /// A recopy round ends the copy once it has fewer chunks than this; the rest go under suspend.
 const RECOPY_FEW: usize = 64;
 const BUILD_PARALLEL: usize = 16;
@@ -66,10 +94,16 @@ pub(crate) struct SnapshotOptions {
     pub(crate) every: Duration,
     /// Take one early once this many bytes reached the image; zero never does.
     pub(crate) burst: u64,
+    /// Take one early once writes reached the image and none came for this long; zero never
+    /// does.
+    pub(crate) idle: Duration,
+    /// Read the written chunks from the image instead of cloning them when they hold at most
+    /// this many bytes; zero always clones.
+    pub(crate) copy_max: u64,
 }
 
 /// What a handoff did before the device moved to the image.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HandoffReport {
     /// The image started as a clone of the base image.
     pub shared: bool,
@@ -83,6 +117,10 @@ pub struct HandoffReport {
     pub paused: Duration,
     /// Bytes reads took from the base image before the switch.
     pub from_base: u64,
+    /// An era device tracks the chunks the kernel writes, so snapshots clone only those.
+    pub tracked: bool,
+    /// Why no era device tracks the writes, when none does.
+    pub untracked: Option<String>,
 }
 
 /// What the background snapshots did.
@@ -92,6 +130,35 @@ pub(crate) struct SnapshotStats {
     pub(crate) chunks: AtomicUsize,
     pub(crate) failed: AtomicUsize,
     pub(crate) last_error: Mutex<Option<String>>,
+    /// Snapshots that read the chunks from the image instead of cloning them.
+    pub(crate) copied: AtomicUsize,
+    /// Snapshots that gave up because writes kept coming.
+    pub(crate) postponed: AtomicUsize,
+    /// Microseconds the device spent suspended for snapshots, in all and at most at once.
+    pub(crate) paused_us: AtomicU64,
+    pub(crate) max_paused_us: AtomicU64,
+    /// The longest suspend of each [`Pause`], in microseconds.
+    pub(crate) max_pause_us: [AtomicU64; 3],
+}
+
+/// Why a snapshot suspended the device.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Pause {
+    /// To begin a new era.
+    Mark = 0,
+    /// To read the last chunks of a snapshot that clones nothing.
+    Freeze = 1,
+    /// To clone the image or the ranges written.
+    Clone = 2,
+}
+
+impl SnapshotStats {
+    fn paused(&self, kind: Pause, d: Duration) {
+        let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        self.paused_us.fetch_add(us, Ordering::Relaxed);
+        self.max_paused_us.fetch_max(us, Ordering::Relaxed);
+        self.max_pause_us[kind as usize].fetch_max(us, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +169,10 @@ struct Snaps {
     /// The last clone, which goes once a later one replaces it and its chunks are published.
     prev_path: Option<PathBuf>,
     next: u32,
+    /// With an era device: the era that began with the last snapshot, or the first era.
+    since: u32,
+    /// Snapshots in a row that gave up because writes kept coming.
+    postponed: u32,
 }
 
 impl Snaps {
@@ -123,6 +194,8 @@ pub(crate) struct Handoff {
     switched: AtomicBool,
     loop_dev: Mutex<Option<PathBuf>>,
     opts: SnapshotOptions,
+    /// The era device that tracks the image's writes, when the host has one.
+    era: Mutex<Option<String>>,
     snaps: AsyncMutex<Snaps>,
     /// Clones replaced by a later one; each stays until no unpublished flush refers to it.
     retired: Mutex<Vec<PathBuf>>,
@@ -135,6 +208,45 @@ fn with_suffix(p: &Path, s: &str) -> PathBuf {
     let mut o = p.as_os_str().to_owned();
     o.push(s);
     PathBuf::from(o)
+}
+
+/// The era device between device `dm` and the loop device of its image.
+pub(crate) fn era_name(dm: &str) -> String {
+    format!("{dm}-era")
+}
+
+/// The file that holds the era records of `image`.
+pub(crate) fn era_records(image: &Path) -> PathBuf {
+    with_suffix(image, ".era")
+}
+
+/// The length of the sparse records file for an image of `size` bytes, which may grow to many
+/// times that.
+fn era_records_len(size: u64) -> u64 {
+    ERA_FIXED + size.saturating_mul(4).max(ERA_ROOM).div_ceil(CHUNK) * ERA_PER_CHUNK
+}
+
+/// How many chunks `blocks` holds.
+fn count(blocks: &[Range<u64>]) -> u64 {
+    blocks.iter().map(|r| r.end - r.start).sum()
+}
+
+/// The chunks in `a` and `b`, sorted, disjoint and merged.
+fn merge(a: &[Range<u64>], b: &[Range<u64>]) -> Vec<Range<u64>> {
+    let mut all: Vec<Range<u64>> = a.iter().chain(b).filter(|r| r.start < r.end).cloned().collect();
+    all.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<u64>> = Vec::with_capacity(all.len());
+    for r in all {
+        match out.last_mut() {
+            Some(l) if r.start <= l.end => l.end = l.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+fn chunks(blocks: &[Range<u64>]) -> Vec<u64> {
+    blocks.iter().flat_map(Clone::clone).collect()
 }
 
 fn base36(mut n: u128) -> String {
@@ -181,7 +293,11 @@ impl Handoff {
             switched: AtomicBool::new(false),
             loop_dev: Mutex::default(),
             opts,
-            snaps: AsyncMutex::default(),
+            era: Mutex::default(),
+            snaps: AsyncMutex::new(Snaps {
+                since: 1,
+                ..Snaps::default()
+            }),
             retired: Mutex::default(),
             stop: watch::Sender::new(false),
             task: Mutex::default(),
@@ -224,18 +340,31 @@ impl Handoff {
     }
 
     /// Clones the image while the device is suspended, so the clone holds every completed
-    /// write and none in flight.
-    async fn frozen_clone(&self, path: &Path) -> Result<Duration> {
+    /// write and none in flight. With era device `era`, also begins a new era during the
+    /// suspend and returns it: the writes the clone lacks belong to it or later ones.
+    async fn frozen_clone(&self, path: &Path, era: Option<&str>) -> Result<(Duration, Option<u32>)> {
         let t0 = Instant::now();
-        self.env.devices.suspend(&self.dm).await?;
-        let cloned = self.clone_to(path).await;
-        let resumed = self.env.devices.resume(&self.dm).await;
+        let devices = self.env.devices.as_ref();
+        devices.suspend(&self.dm).await?;
+        let cloned = async {
+            let now = match era {
+                Some(e) => Some(devices.era_begin(e).await?),
+                None => None,
+            };
+            self.clone_to(path).await?;
+            Ok::<_, crate::Error>(now)
+        }
+        .await;
+        let resumed = devices.resume(&self.dm).await;
         let paused = t0.elapsed();
+        if let (Some(e), Ok(Some(_))) = (era, &cloned) {
+            let _ = devices.era_listed(e, u32::MAX).await;
+        }
         if let Err(e) = resumed {
             let _ = self.env.ports.fs.remove(path).await;
             return Err(e.into());
         }
-        cloned.map(|()| paused)
+        cloned.map(|now| (paused, now))
     }
 
     async fn set_prev(&self, s: &mut Snaps, path: PathBuf) -> Result<()> {
@@ -258,12 +387,200 @@ impl Handoff {
         }
     }
 
-    /// Takes one snapshot: clones the image under suspend and takes the chunks whose extents
-    /// moved since the last clone as writes, then flushes them.
+    fn era(&self) -> Option<String> {
+        self.era.lock().clone()
+    }
+
+    pub(crate) fn tracked(&self) -> bool {
+        self.era.lock().is_some()
+    }
+
+    /// Takes one snapshot: clones what the kernel wrote to the image since the last one under
+    /// suspend, takes those chunks as writes, then flushes them.
+    /// Takes a snapshot now. It does not give up while writes keep coming, so a flush after it
+    /// publishes the image as it was at one moment.
     pub(crate) async fn snapshot_once(&self, v: &Volume) -> Result<usize> {
+        self.snapshot(v, false).await
+    }
+
+    async fn snapshot(&self, v: &Volume, may_postpone: bool) -> Result<usize> {
+        match self.era() {
+            Some(era) => self.snapshot_era(v, &era, may_postpone).await,
+            None => self.snapshot_extents(v).await,
+        }
+    }
+
+    /// Runs `f` while device `dm` is suspended, so no write is in flight or reaches the image.
+    async fn suspended<T>(&self, kind: Pause, f: impl Future<Output = Result<T>>) -> Result<T> {
+        let t0 = Instant::now();
+        let devices = self.env.devices.as_ref();
+        devices.suspend(&self.dm).await?;
+        let r = f.await;
+        let resumed = devices.resume(&self.dm).await;
+        self.stats.paused(kind, t0.elapsed());
+        resumed?;
+        r
+    }
+
+    /// Begins a new era on `era` while the device is suspended, so no write in flight
+    /// straddles it, and returns it.
+    async fn mark(&self, era: &str) -> Result<u32> {
+        self.suspended(Pause::Mark, async { Ok(self.env.devices.era_begin(era).await?) })
+            .await
+    }
+
+    /// A snapshot of the chunks era device `era` saw written. With few enough, it reads them
+    /// from the image, or gives up for now when writes keep coming; else it clones them. Most
+    /// are listed before the suspend; the suspend lists the rest and clones or reads them.
+    async fn snapshot_era(&self, v: &Volume, era: &str, may_postpone: bool) -> Result<usize> {
+        let mut s = self.snaps.lock().await;
+        let devices = self.env.devices.as_ref();
+        let copy_max = self.opts.copy_max;
+        let now = self.mark(era).await?;
+        let early = EraWritten {
+            blocks: devices.era_listed(era, s.since).await?,
+            now,
+        };
+        if early.blocks.is_empty() {
+            s.since = early.now;
+            s.postponed = 0;
+            self.stats.taken.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        }
+        if copy_max > 0 && count(&early.blocks) * CHUNK <= copy_max && s.postponed < POSTPONE_MAX {
+            if let Some((n, now)) = self.copy_era(v, era, &early).await? {
+                self.retire_prev(&mut s);
+                s.since = now;
+                s.postponed = 0;
+                self.stats.taken.fetch_add(1, Ordering::Relaxed);
+                self.stats.copied.fetch_add(1, Ordering::Relaxed);
+                self.stats.chunks.fetch_add(n, Ordering::Relaxed);
+                return Ok(n);
+            }
+            if may_postpone {
+                s.postponed += 1;
+                self.stats.postponed.fetch_add(1, Ordering::Relaxed);
+                return Ok(0);
+            }
+        }
+        let path = s.next_path(&self.image);
+        let taken = self.clone_era(era, &early, &path).await?;
+        let n = match self.absorb_clone(v, &path, &chunks(&taken.blocks)).await {
+            Ok(n) => n,
+            Err(e) => {
+                self.retired.lock().push(path);
+                return Err(e);
+            }
+        };
+        self.retire_prev(&mut s);
+        s.prev_path = Some(path);
+        s.since = taken.now;
+        s.postponed = 0;
+        self.stats.taken.fetch_add(1, Ordering::Relaxed);
+        self.stats.chunks.fetch_add(n, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    /// Reads the chunks in `early`, whose era began with the device suspended, from the image
+    /// while the device serves, then in rounds the chunks written while the last round read,
+    /// until few are left. Then, suspended, it reads those and the ones written since, and
+    /// flushes. Returns the chunks taken and the era that began at that suspend, or `None`
+    /// when the writes did not let up; what it read then stays unflushed for the next try.
+    async fn copy_era(&self, v: &Volume, era: &str, early: &EraWritten) -> Result<Option<(usize, u32)>> {
+        let devices = self.env.devices.as_ref();
+        let (mut list, mut from, mut n) = (early.blocks.clone(), early.now, 0);
+        let mut rounds = 0;
+        while count(&list) > FREEZE_CHUNKS {
+            if rounds == COPY_ROUNDS {
+                return Ok(None);
+            }
+            n += v.read_chunks(&self.file, &chunks(&list)).await?;
+            let next = self.mark(era).await?;
+            let written = devices.era_listed(era, from).await?;
+            if count(&written) > FREEZE_CHUNKS && count(&written) * 2 > count(&list) {
+                return Ok(None);
+            }
+            (list, from) = (written, next);
+            rounds += 1;
+        }
+        let (m, now) = self
+            .suspended(Pause::Freeze, async {
+                let now = devices.era_begin(era).await?;
+                let newer = devices.era_listed(era, from).await?;
+                let m = v.read_chunks(&self.file, &chunks(&merge(&list, &newer))).await?;
+                Ok((m, now))
+            })
+            .await?;
+        v.flush().await?;
+        Ok(Some((n + m, now)))
+    }
+
+    async fn absorb_clone(&self, v: &Volume, path: &Path, idxs: &[u64]) -> Result<usize> {
+        let file = self.env.ports.fs.open(path, Open::Read).await?;
+        let n = v.absorb_chunks(&file, path, idxs).await?;
+        v.flush().await?;
+        Ok(n)
+    }
+
+    /// Clones the chunks in `early`, whose era began with the device suspended, to `path` while
+    /// the device serves, then in rounds the chunks written while the last round cloned, until
+    /// few are left. Then, suspended, it clones those and the ones written since. Returns every
+    /// chunk it cloned and the era that began at that suspend.
+    async fn clone_era(&self, era: &str, early: &EraWritten, path: &Path) -> Result<EraWritten> {
+        let devices = self.env.devices.as_ref();
+        let _ = self.env.ports.fs.remove(path).await;
+        let taken = async {
+            let (mut list, mut from, mut all) = (early.blocks.clone(), early.now, early.blocks.clone());
+            for _ in 0..COPY_ROUNDS {
+                if count(&list) <= FREEZE_CHUNKS {
+                    break;
+                }
+                self.clone_chunks(path, &list).await?;
+                let next = self.mark(era).await?;
+                list = devices.era_listed(era, from).await?;
+                all = merge(&all, &list);
+                from = next;
+            }
+            self.suspended(Pause::Clone, async {
+                let now = devices.era_begin(era).await?;
+                let newer = devices.era_listed(era, from).await?;
+                self.clone_chunks(path, &merge(&list, &newer)).await?;
+                Ok(EraWritten {
+                    blocks: merge(&all, &newer),
+                    now,
+                })
+            })
+            .await
+        }
+        .await;
+        if taken.is_err() {
+            let _ = self.env.ports.fs.remove(path).await;
+        }
+        taken
+    }
+
+    async fn clone_chunks(&self, path: &Path, blocks: &[Range<u64>]) -> Result<()> {
+        let size = self.file.size().await?;
+        let ranges: Vec<Range<u64>> = blocks
+            .iter()
+            .map(|r| r.start * CHUNK..(r.end * CHUNK).min(size))
+            .filter(|r| r.start < r.end)
+            .collect();
+        Ok(self
+            .env
+            .ports
+            .image
+            .clone_ranges(&self.image, path, &ranges)
+            .await?)
+    }
+
+    /// A snapshot that clones the whole image and takes the chunks whose extents moved since
+    /// the last clone.
+    async fn snapshot_extents(&self, v: &Volume) -> Result<usize> {
         let mut s = self.snaps.lock().await;
         let path = s.next_path(&self.image);
-        self.frozen_clone(&path).await?;
+        let (paused, _) = self.frozen_clone(&path, None).await?;
+        self.stats.paused(Pause::Clone, paused);
         let cur = match self.env.ports.image.extents(&path).await {
             Ok(c) => c,
             Err(e) => {
@@ -327,6 +644,7 @@ impl Handoff {
         let poll = SNAPSHOT_POLL.min(self.opts.every);
         let mut last = Instant::now();
         let mut base = self.written().await;
+        let (mut seen, mut changed) = (base, Instant::now());
         loop {
             tokio::select! {
                 r = stop.changed() => {
@@ -342,14 +660,17 @@ impl Handoff {
                 () = tokio::time::sleep(poll) => {}
             }
             let now = self.written().await;
+            if now != seen {
+                (seen, changed) = (now, Instant::now());
+            }
             let written = match (now, base) {
                 (Some(w), Some(b)) if w >= b => Some(w - b),
                 _ => None,
             };
-            if !snapshot_due(last.elapsed(), written, self.opts.every, self.opts.burst).0 || self.stopped() {
+            if !snapshot_due(last.elapsed(), written, changed.elapsed(), &self.opts).0 || self.stopped() {
                 continue;
             }
-            if let Err(e) = self.snapshot_once(&v).await {
+            if let Err(e) = self.snapshot(&v, true).await {
                 self.stats.failed.fetch_add(1, Ordering::Relaxed);
                 *self.stats.last_error.lock() = Some(e.to_string());
             }
@@ -368,7 +689,14 @@ impl Handoff {
             let _ = t.await;
         }
         let mut s = self.snaps.lock().await;
-        let r = match &s.prev {
+        if let Some(era) = self.era()
+            && let Ok(w) = self.env.devices.era_written(&era, s.since).await
+        {
+            let r = v.absorb_chunks(&self.file, &self.image, &chunks(&w.blocks)).await;
+            self.retire_prev(&mut s);
+            return r;
+        }
+        let r = match s.prev.as_ref().filter(|_| self.era().is_none()) {
             Some(prev) => match self.env.ports.image.extents(&self.image).await {
                 Ok(cur) => {
                     v.absorb_chunks(&self.file, &self.image, &changed_chunks(prev, &cur).0)
@@ -402,16 +730,63 @@ impl Handoff {
             .ok_or_else(|| crate::Error::Corrupt(format!("{}: no loop device", self.image.display())))?;
         let devices = self.env.devices.as_ref();
         devices.refresh_loop(&lp).await?;
-        resize_table(devices, &self.dm, &lp, size).await
+        let Some(era) = self.era() else {
+            return resize_table(devices, &self.dm, &lp, size).await;
+        };
+        devices.resize_era(&era, size).await?;
+        let path = devices
+            .era(&era)
+            .await?
+            .ok_or_else(|| crate::Error::Corrupt(format!("era device {era} is gone")))?
+            .path;
+        resize_table(devices, &self.dm, &path, size).await
     }
 
-    /// After a checkpoint published everything: removes the image, its clones and its owner.
+    /// After a checkpoint published everything: removes the era device, the image, its clones,
+    /// its era records and its owner. The device must no longer map the era device.
     pub(crate) async fn remove(&self, v: &Volume) {
+        if let Some(era) = self.era() {
+            let _ = self.env.devices.remove(&era).await;
+        }
         self.remove_retired(v).await;
         v.tree().cache().drop_file(&self.image);
         let fs = self.env.ports.fs.as_ref();
         let _ = fs.remove(&self.image).await;
+        let _ = fs.remove(&era_records(&self.image)).await;
         let _ = fs.remove(&owner::path(&self.image)).await;
+    }
+
+    /// Puts era device `era_name(dm)` over loop device `lp` of the image, on a new records file,
+    /// and returns it; fails when the host cannot track eras. An era device of that name is
+    /// left from an earlier run that no table maps any more, and goes first.
+    async fn start_era(&self, lp: &Path, size: u64) -> Result<PathBuf> {
+        let devices = self.env.devices.as_ref();
+        let fs = self.env.ports.fs.as_ref();
+        let name = era_name(&self.dm);
+        if devices.era(&name).await?.is_some() {
+            devices.remove(&name).await?;
+        }
+        let records = era_records(&self.image);
+        let _ = fs.remove(&records).await;
+        let made = async {
+            fs.open(&records, Open::CreateNew)
+                .await?
+                .set_len(era_records_len(size))
+                .await?;
+            let mlp = devices.attach_loop(&records).await?;
+            devices.create_era(&name, &mlp, lp, size, CHUNK).await
+        }
+        .await;
+        match made {
+            Ok(path) => {
+                *self.era.lock() = Some(name);
+                Ok(path)
+            }
+            Err(e) => {
+                let _ = fs.remove(&records).await;
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -544,7 +919,15 @@ async fn copy_and_switch(h: &Arc<Handoff>, v: &Arc<Volume>, shared: Option<&Base
     let devices = h.env.devices.as_ref();
     let lp = devices.attach_loop(&h.image).await?;
     *h.loop_dev.lock() = Some(lp.clone());
-    devices.load(&h.dm, &lp, v.size()).await?;
+    let target = match h.start_era(&lp, v.size()).await {
+        Ok(p) => p,
+        Err(e) => {
+            report.untracked = Some(e.to_string());
+            lp.clone()
+        }
+    };
+    report.tracked = h.tracked();
+    devices.load(&h.dm, &target, v.size()).await?;
     let t0 = Instant::now();
     if let Err(e) = devices.suspend(&h.dm).await {
         let _ = devices.clear_inactive(&h.dm).await;
@@ -575,7 +958,7 @@ async fn copy_and_switch(h: &Arc<Handoff>, v: &Arc<Volume>, shared: Option<&Base
 }
 
 /// The steps of the switch while the device is suspended: the last copy, a flush, the owner
-/// record and the first clone, which later snapshots compare with.
+/// record and, without an era device, the first clone, which later snapshots compare with.
 async fn under_suspend(h: &Handoff, v: &Volume) -> Result<(usize, Option<PathBuf>)> {
     let last = v.take_tracked();
     v.stop_tracking();
@@ -583,6 +966,9 @@ async fn under_suspend(h: &Handoff, v: &Volume) -> Result<(usize, Option<PathBuf
     h.file.sync_data().await?;
     v.flush().await?;
     h.owner(v, true).await?;
+    if h.tracked() {
+        return Ok((n, None));
+    }
     Ok((n, h.clone_image().await.ok()))
 }
 

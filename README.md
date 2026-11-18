@@ -1,5 +1,8 @@
 # Pando
 
+[![xfstests](https://img.shields.io/github/actions/workflow/status/usespotlightai/pando/xfstests.yml?branch=main&label=xfstests)](https://github.com/usespotlightai/pando/actions/workflows/xfstests.yml?query=branch%3Amain)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+
 Writable branches of a large workspace for AI agents, stored in S3.
 
 Each agent run needs its own copy of a repository and everything installed in it, often on a
@@ -20,25 +23,34 @@ sharing one root system.
 - **Chunks and branch refs.** The device is split into 64 KiB chunks named by their hash. A
   persistent radix tree maps each chunk index to a chunk. Each branch is one root entry in a
   small ref object, and forking copies that ref. Branches share every chunk they have not changed.
+  A checkpoint freezes a branch's root under a name that never changes, so a host that has read it
+  once forks from it with a single request to the store.
 - **Segment storage.** Chunks and tree nodes are packed into ~8 MiB segments containing zstd
   frames of up to 1 MiB. A single range GET fetches neighbouring chunks, and uploads take a few
   PUTs rather than one per write. Where possible, changed chunks are stored as 4 KiB block
   references to the base, reducing the data uploaded by `npm ci` by about 13x.
-- **Write-back with fencing.** A flush is immediately durable locally and uploads in the
-  background. A conditional PUT updates the ref. Opening a branch takes a new writer generation
-  that fences any older writer.
+- **Write-back with fencing.** A flush is immediately durable locally, reaches a write log in
+  the store moments later, and uploads in the background. A conditional PUT updates the ref.
+  Opening a branch takes a new writer generation that fences any older writer, and applies what
+  the log has beyond the ref, so a lost host loses at most the last moments of writes. With
+  `attach --log strict`, a flush returns only once the log in the store has it.
 - **Fast starts.** Each host keeps a base image per root and clones it with reflink. A later
   branch of the same root therefore starts in about 250 ms. The first run records the frames it
   touched, and the next run on another host prefetches them. Once the branch is local, Pando
   hands the device to the kernel through device-mapper over a loop device and leaves the I/O path.
 - **Crash safety.** ublk user recovery and a local journal preserve acknowledged writes through
-  a daemon crash. After restarting, the daemon resumes serving the device where it left off.
+  a daemon crash. After restarting, the daemon resumes serving the device where it left off. On
+  SIGTERM it publishes what it holds and leaves the device to the next daemon, so an upgrade
+  does not unmount anything. [docs/hosts.md](docs/hosts.md) covers running it under systemd.
+- **Host daemon.** `pando serve --socket PATH` keeps the store's connections, the cache and the
+  checkpoints it has read. `pando --socket PATH <command>` runs the command there, so a branch or
+  attach skips process start-up, credential loading and cold connections.
 
 ## Crates
 
 | Crate | Contents |
 |---|---|
-| `pando-format` | the store format: hashes, entries, refs, tree nodes, frames, segment indexes, recipes, change lists, object keys. No I/O. |
+| `pando-format` | the store format: hashes, entries, refs, checkpoints, tree nodes, frames, segment indexes, recipes, change lists, write log records, object keys. No I/O. |
 | `pando-engine` | the volume engine: the block map tree, the cache, fetch and its scheduler, the uploader and writer fencing, dedup, base builds, seeding and the handoff steps. It reaches the outside world only through ports. |
 | `pando-s3` | the object-store port over any S3-compatible store with conditional writes (AWS S3, Cloudflare R2, MinIO) |
 | `pando-host` | the host ports on a real machine: files, base images, clock, randomness, CPU pool. Linux gets reflinks, extent hints and hole punching; other systems get plain fallbacks. |
@@ -46,10 +58,19 @@ sharing one root system.
 | `pando-dst` | deterministic simulation, crash and fault scenarios, and conformance suites for every port adapter |
 | `pando` | the command-line tool |
 
+## Installing
+
+Releases have binaries for x86_64 and aarch64 Linux, checksums and build provenance.
+[docs/hosts.md](docs/hosts.md) covers installing one and upgrading a host with attached
+branches; [docs/releasing.md](docs/releasing.md) covers cutting one.
+
 ## Building
 
 Build with Rust 1.100, pinned in `rust-toolchain.toml`. The block device requires Linux with
-`ublk_drv`. The engine's tests run anywhere; on macOS, `pando-host` falls back to plain file
+`ublk_drv`. After a handoff, snapshots clone only the chunks the kernel wrote when the host has
+the `dm-era` target and `era_invalidate` from thin-provisioning-tools; without them each
+snapshot clones the whole image, and every block written after it pays a copy-on-write. The
+engine's tests run anywhere; on macOS, `pando-host` falls back to plain file
 operations. To build and test the Linux crates from macOS, `tools/cargo.sh` runs cargo in a
 Linux container and takes the same arguments.
 
@@ -61,6 +82,13 @@ cargo test --workspace
 (`tools/Dockerfile`, `tools/install.sh`): with no arguments it runs the lints, the supply-chain
 checks and the tests. It also takes `asan`, `fuzz [seconds]`, `coverage`, `mutants`, or any
 single check by name, such as `clippy` or `shellcheck`. The fuzz targets are in `fuzz/`.
+
+Dependabot proposes weekly updates for the crates, actions, base images and Terraform providers
+(`.github/dependabot.yml`). A crate update passes `vet` only once each new version has an audit
+or exemption in `supply-chain/`. Dependabot moves the `rust` image only within its minor version,
+so a new Rust release is a manual change to `rust-toolchain.toml`, `rust-version` in
+`Cargo.toml`, and the `FROM` and `rustup` lines in `tools/Dockerfile`, all in one commit. The
+nightly in `tools/nightly` and `fuzz/README.md` also moves by hand.
 
 Fixtures in `pando-format/tests/fixtures` pin the byte encoding of every stored object.
 
@@ -294,7 +322,7 @@ last write. Three runs each.
 
 | time to durable after npm ci | median | range |
 |---|---|---|
-| Pando | 4.94 s | 2.43 s to 7.68 s |
+| Pando | 3.37 s | 2.31 s to 8.29 s |
 | tar from S3 | 3.2 s | 3.17 s to 3.2 s |
 | Docker (overlayfs) | 41.1 s | 40.9 s to 41.2 s |
 | EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
@@ -304,7 +332,7 @@ last write. Three runs each.
 
 | uploaded after npm ci | median | range |
 |---|---|---|
-| Pando | 208 MiB | 207 MiB to 214 MiB |
+| Pando | 210 MiB | 207 MiB to 214 MiB |
 | tar from S3 | 323 MiB | 323 MiB to 323 MiB |
 | Docker (overlayfs) | 194 MiB | 194 MiB to 194 MiB |
 | EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |

@@ -14,6 +14,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::client::{
+    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpResponseBody,
+    HttpService, ReqwestConnector,
+};
 use object_store::path::Path;
 use object_store::{
     ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
@@ -25,6 +29,9 @@ use tokio::sync::{OnceCell, oneshot};
 /// The longest one request may take. A segment PUT shares the uplink with the other PUTs in
 /// flight, so on a slow link it takes minutes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// The longest a connection to the store may take to open, so a store that does not answer
+/// fails each try quickly and the engine's retries and waits apply.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where the store is and how to sign in. Credentials come from the caller, never from a file
 /// this crate reads.
@@ -90,7 +97,7 @@ impl Client {
                 }
             })
             .await;
-        built.as_ref().map_err(|e| StoreError::Other {
+        built.as_ref().map_err(|e| StoreError::Permanent {
             key: key.to_string(),
             source: e.clone().into(),
         })
@@ -99,15 +106,20 @@ impl Client {
 
 impl S3Store {
     /// The port over the store `c` names. It returns before the client is built; the first
-    /// request waits for the build and fails with [`StoreError::Other`] if the build failed.
+    /// request waits for the build and fails with [`StoreError::Permanent`] if the build failed.
     pub fn new(c: &S3Config) -> Result<S3Store, StoreError> {
         let mut b = AmazonS3Builder::new()
             .with_bucket_name(&c.bucket)
             .with_region(&c.region)
             .with_access_key_id(&c.access_key_id)
             .with_secret_access_key(&c.secret_access_key)
-            .with_allow_http(c.allow_http)
-            .with_client_options(ClientOptions::new().with_timeout(REQUEST_TIMEOUT))
+            .with_client_options(
+                ClientOptions::new()
+                    .with_timeout(REQUEST_TIMEOUT)
+                    .with_connect_timeout(CONNECT_TIMEOUT)
+                    .with_allow_http(c.allow_http),
+            )
+            .with_http_connector(RefusalConnector)
             .with_conditional_put(S3ConditionalPut::ETagMatch);
         if let Some(e) = &c.endpoint {
             b = b.with_endpoint(e);
@@ -123,7 +135,7 @@ impl S3Store {
                     .map_err(|e| map_err(&bucket, e).to_string());
                 let _ = tx.send(built);
             })
-            .map_err(|e| StoreError::Other {
+            .map_err(|e| StoreError::Permanent {
                 key: c.bucket.clone(),
                 source: Box::new(e),
             })?;
@@ -182,17 +194,130 @@ impl S3Store {
     }
 }
 
+/// A client error the store answered that the same request gets again.
+#[derive(Debug, thiserror::Error)]
+#[error("the store refused the request: {status} {reason}: {body}")]
+struct Refused {
+    status: u16,
+    reason: &'static str,
+    body: String,
+}
+
+/// Error codes S3-compatible stores answer with a 4xx status for a condition that passes, as
+/// the AWS SDKs list them.
+const TRANSIENT_CODES: &[&str] = &[
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "PriorRequestNotComplete",
+    "Throttling",
+    "ThrottlingException",
+    "ThrottledException",
+    "RequestThrottled",
+    "RequestThrottledException",
+    "RequestLimitExceeded",
+    "TooManyRequestsException",
+    "SlowDown",
+    "BandwidthLimitExceeded",
+    "ProvisionedThroughputExceededException",
+    "TransactionInProgressException",
+    "EC2ThrottledException",
+];
+
+/// Whether an answer of `status` with `body` fails again if the request is repeated. Statuses
+/// `object_store` maps to errors of its own keep that mapping.
+fn refuses(status: u16, body: &str) -> bool {
+    if !(400..500).contains(&status) || matches!(status, 401 | 403 | 404 | 408 | 409 | 412 | 429) {
+        return false;
+    }
+    let code = body
+        .split_once("<Code>")
+        .and_then(|(_, rest)| rest.split_once("</Code>"))
+        .map(|(code, _)| code.trim());
+    !code.is_some_and(|c| TRANSIENT_CODES.contains(&c))
+}
+
+/// Serves requests over `reqwest` and answers a status that [`refuses`] with a [`Refused`]
+/// error, which `object_store` passes on without a retry and [`map_err`] finds in the source
+/// chain.
+#[derive(Debug)]
+struct RefusalConnector;
+
+impl HttpConnector for RefusalConnector {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        Ok(HttpClient::new(RefusalService(
+            ReqwestConnector::default().connect(options)?,
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct RefusalService(HttpClient);
+
+#[async_trait]
+impl HttpService for RefusalService {
+    async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let r = self.0.execute(req).await?;
+        let status = r.status();
+        if !status.is_client_error() {
+            return Ok(r);
+        }
+        let (parts, body) = r.into_parts();
+        let body = head(body).await?;
+        let text = String::from_utf8_lossy(&body).into_owned();
+        if !refuses(status.as_u16(), &text) {
+            return Ok(HttpResponse::from_parts(parts, body.into()));
+        }
+        Err(HttpError::new(
+            HttpErrorKind::Unknown,
+            Refused {
+                status: status.as_u16(),
+                reason: status.canonical_reason().unwrap_or(""),
+                body: text,
+            },
+        ))
+    }
+}
+
+/// The most of a client error's body that is read and kept.
+const BODY_MAX: usize = 4 << 10;
+
+/// The first [`BODY_MAX`] bytes of `body`.
+async fn head(body: HttpResponseBody) -> Result<Bytes, HttpError> {
+    let mut chunks = body.bytes_stream();
+    let mut head = Vec::new();
+    while head.len() < BODY_MAX {
+        match chunks.try_next().await? {
+            Some(c) => head.extend_from_slice(&c),
+            None => break,
+        }
+    }
+    head.truncate(BODY_MAX);
+    Ok(Bytes::from(head))
+}
+
+fn refused(e: &object_store::Error) -> bool {
+    let mut at: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(e) = at {
+        if e.is::<Refused>() {
+            return true;
+        }
+        at = e.source();
+    }
+    false
+}
+
 fn map_err(key: &str, e: object_store::Error) -> StoreError {
     let key = key.to_string();
     match e {
         object_store::Error::NotFound { .. } => StoreError::NotFound { key },
         object_store::Error::AlreadyExists { .. } => StoreError::AlreadyExists { key },
         object_store::Error::Precondition { .. } => StoreError::PreconditionFailed { key },
-        e @ object_store::Error::Generic { .. } => StoreError::Transient {
+        e @ object_store::Error::Generic { .. } if !refused(&e) => StoreError::Transient {
             key,
             source: Box::new(e),
         },
-        e @ (object_store::Error::InvalidPath { .. }
+        e @ (object_store::Error::Generic { .. }
+        | object_store::Error::InvalidPath { .. }
         | object_store::Error::JoinError { .. }
         | object_store::Error::NotSupported { .. }
         | object_store::Error::NotModified { .. }
@@ -200,7 +325,7 @@ fn map_err(key: &str, e: object_store::Error) -> StoreError {
         | object_store::Error::PermissionDenied { .. }
         | object_store::Error::Unauthenticated { .. }
         | object_store::Error::UnknownConfigurationKey { .. }
-        | _) => StoreError::Other {
+        | _) => StoreError::Permanent {
             key,
             source: Box::new(e),
         },
@@ -286,6 +411,145 @@ impl Store for S3Store {
         match self.inner.get(key).await?.delete(&self.path(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(map_err(key, e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::*;
+
+    async fn answer(mut c: TcpStream, status: &str, body: &str) {
+        let mut req = Vec::new();
+        let mut buf = [0; 4096];
+        let head_end = loop {
+            let n = c.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the request ended early");
+            req.extend_from_slice(&buf[..n]);
+            if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&req[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map_or(0, |v| v.trim().parse().unwrap());
+        while req.len() < head_end + len {
+            let n = c.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the request body ended early");
+            req.extend_from_slice(&buf[..n]);
+        }
+        let reply = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        if c.write_all(reply.as_bytes()).await.is_ok() {
+            let _ = c.shutdown().await;
+        }
+    }
+
+    async fn answering(status: &'static str, body: &'static str) -> (S3Store, Arc<AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let n = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let (c, _) = l.accept().await.unwrap();
+                n.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(answer(c, status, body));
+            }
+        });
+        let s = S3Store::new(&S3Config {
+            bucket: "b".into(),
+            endpoint: Some(format!("http://{addr}")),
+            region: "us-east-1".into(),
+            access_key_id: "id".into(),
+            secret_access_key: "secret".into(),
+            allow_http: true,
+            ..S3Config::default()
+        })
+        .unwrap();
+        (s, seen)
+    }
+
+    #[tokio::test]
+    async fn a_refused_put_is_permanent_and_not_retried() {
+        let (s, seen) = answering(
+            "400 Bad Request",
+            "<Error><Code>ValidationException</Code><Message>bucket over 64 MiB</Message></Error>",
+        )
+        .await;
+        let e = s.put("k", Bytes::from_static(b"v")).await.unwrap_err();
+        assert!(matches!(e, StoreError::Permanent { .. }), "{e}");
+        assert!(e.to_string().contains("ValidationException"), "{e}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_keeps_only_the_head_of_a_long_body() {
+        let body: &'static str = Box::leak(
+            format!(
+                "<Error><Code>InvalidArgument</Code>{}</Error>",
+                "x".repeat(1 << 20)
+            )
+            .into_boxed_str(),
+        );
+        let (s, _) = answering("400 Bad Request", body).await;
+        let e = s.put("k", Bytes::from_static(b"v")).await.unwrap_err();
+        assert!(matches!(e, StoreError::Permanent { .. }), "{e}");
+        assert!(
+            e.to_string().len() < 2 * BODY_MAX,
+            "{} bytes",
+            e.to_string().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_too_large_put_is_permanent() {
+        let (s, _) = answering("413 Payload Too Large", "").await;
+        let e = s.create("k", Bytes::from_static(b"v")).await.unwrap_err();
+        assert!(matches!(e, StoreError::Permanent { .. }), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_answered_with_400_stays_transient() {
+        let (s, _) = answering(
+            "400 Bad Request",
+            "<Error><Code>RequestTimeout</Code><Message>idle</Message></Error>",
+        )
+        .await;
+        let e = s.put("k", Bytes::from_static(b"v")).await.unwrap_err();
+        assert!(matches!(e, StoreError::Transient { .. }), "{e}");
+    }
+
+    #[tokio::test]
+    async fn statuses_object_store_maps_keep_their_errors() {
+        let (s, _) = answering("404 Not Found", "<Error><Code>NoSuchKey</Code></Error>").await;
+        let e = s.get("k").await.unwrap_err();
+        assert!(matches!(e, StoreError::NotFound { .. }), "{e}");
+        let (s, _) = answering("412 Precondition Failed", "").await;
+        let e = s
+            .update("k", Bytes::from_static(b"v"), &Version("\"e\"".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, StoreError::PreconditionFailed { .. }), "{e}");
+    }
+
+    #[test]
+    fn only_lasting_client_errors_refuse() {
+        assert!(refuses(400, "<Error><Code>InvalidArgument</Code></Error>"));
+        assert!(refuses(400, ""));
+        assert!(refuses(413, ""));
+        assert!(!refuses(400, "<Error><Code>SlowDown</Code></Error>"));
+        for s in [401, 403, 404, 408, 409, 412, 429, 500, 503] {
+            assert!(!refuses(s, ""), "{s}");
         }
     }
 }

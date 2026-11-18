@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pando_format::{FormatError, Hash, SegId};
+use pando_format::{FormatError, Hash, SegId, StoreFormat};
 
 use crate::ports::StoreError;
 
@@ -27,6 +27,12 @@ pub enum Error {
     /// Bytes from the store or a local file did not decode or verify.
     #[error(transparent)]
     Format(#[from] FormatError),
+    /// The store's format marker names a format this build does not read.
+    #[error("the store is in format {found}; this pando reads format {}.x", StoreFormat::CURRENT.major)]
+    UnknownFormat {
+        /// The format the marker names.
+        found: StoreFormat,
+    },
     /// A local file or device failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -50,6 +56,9 @@ pub enum Error {
     /// A branch creation found the branch's ref taken.
     #[error("ref {0} already exists")]
     RefExists(String),
+    /// A checkpoint creation found the name taken.
+    #[error("checkpoint {0} already exists")]
+    CheckpointExists(String),
     /// The caller that led a fetch others waited for gave up.
     #[error("the fetch was cancelled")]
     Cancelled,
@@ -67,12 +76,14 @@ impl Error {
             | Error::ChunkLost { .. }
             | Error::Store(_)
             | Error::Format(_)
+            | Error::UnknownFormat { .. }
             | Error::Io(_)
             | Error::BeyondEnd
             | Error::Shrink { .. }
             | Error::Corrupt(_)
             | Error::SegmentExists(_)
             | Error::RefExists(_)
+            | Error::CheckpointExists(_)
             | Error::Cancelled) => e,
         }
     }

@@ -236,9 +236,27 @@ fn join(queues: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
 
 /// Whether the daemon of device `id` died: ublk holds its I/O (quiesced) or fails it.
 pub async fn daemon_dead(id: u32) -> io::Result<bool> {
-    blocking(move || {
-        let s = Ctrl::open()?.info(id)?.state;
-        Ok(s == ctrl::STATE_QUIESCED || s == ctrl::STATE_FAIL_IO)
+    Ok(daemon(id).await? == Daemon::Dead)
+}
+
+/// What serves device `id`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Daemon {
+    /// There is no device `id`, as after a reboot.
+    NoDevice,
+    /// A daemon serves the device, or one is starting it.
+    Alive,
+    /// The daemon died: ublk holds the device's I/O (quiesced) or fails it.
+    Dead,
+}
+
+/// What serves device `id`.
+pub async fn daemon(id: u32) -> io::Result<Daemon> {
+    blocking(move || match Ctrl::open()?.info(id) {
+        Ok(i) if i.state == ctrl::STATE_QUIESCED || i.state == ctrl::STATE_FAIL_IO => Ok(Daemon::Dead),
+        Ok(_) => Ok(Daemon::Alive),
+        Err(e) if e.raw_os_error() == Some(libc::ENODEV) => Ok(Daemon::NoDevice),
+        Err(e) => Err(e),
     })
     .await
 }
@@ -266,7 +284,7 @@ pub async fn delete(id: u32, publish_wait: Duration) -> io::Result<()> {
                     e.kind(),
                     format!(
                         "the daemon of ublk device {id} still holds it after {publish_wait:?}; it \
-                         may still be publishing its branch"
+                         may still be publishing its branch, and a detach again waits for it"
                     ),
                 )
             } else {

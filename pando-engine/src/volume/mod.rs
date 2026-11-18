@@ -1,11 +1,13 @@
 //! A volume: one writable branch, with write-back to the store.
 //!
 //! A flush commits locally: chunks and nodes go to the cache, one sync, then the local root is
-//! recorded. An uploader packs pending objects into segments, uploads them and moves the
-//! branch's ref with a conditional update. A lost host loses only what was not uploaded yet.
+//! recorded. A shipper then puts the flush's chunks in the branch's write log in the store,
+//! and an uploader packs pending objects into segments, uploads them and moves the branch's ref
+//! with a conditional update. A lost host loses only what neither has in the store yet; with
+//! [`LogMode::Strict`], a flush returns only once the log or an upload has it.
 
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +20,7 @@ use pando_format::{
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::base::{BaseView, Bases};
 use crate::cache::Cache;
@@ -27,12 +30,15 @@ use crate::flight::bounded;
 use crate::gate::Gate;
 use crate::local::{Journal, Record, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
-use crate::ports::{Cpu, CpuClass, LocalFs, Version, on_cpu};
+use crate::ports::{Cpu, CpuClass, FileLock, LocalFs, Rng, StoreError, Version, on_cpu};
 use crate::remote::Remote;
 use crate::tree::Tree;
 use crate::{Error, Ports, Result};
 
 mod image;
+mod log;
+
+pub use log::LogMode;
 
 const STRIPES: usize = 64;
 const CHUNK: u64 = u64_from(CHUNK_SIZE);
@@ -42,6 +48,14 @@ const _: () = assert!(CHUNK_LEN as usize == CHUNK_SIZE);
 const UPLOAD_EVERY: Duration = Duration::from_secs(2);
 /// After a failed upload the uploader waits this long before the next try.
 const RETRY_AFTER: Duration = Duration::from_secs(1);
+/// The longest wait between tries while the store fails transiently; see [`backoff`].
+const RETRY_MAX: Duration = Duration::from_secs(30);
+/// How long a read, write or strict flush waits on the store by default before it fails.
+pub const STORE_WAIT: Duration = Duration::from_secs(30);
+/// Uploads in a row the store may refuse before the uploader stops. The wait before each next
+/// try doubles from [`RETRY_AFTER`], so a refusal that passes within about two minutes, such
+/// as a policy that is still propagating, does not stop it.
+const REFUSED_TRIES: u32 = 8;
 /// How often an open tries to take the writer generation when the store fails transiently.
 const GENERATION_TRIES: usize = 10;
 /// Chunks a flush hashes and stores at once.
@@ -106,6 +120,24 @@ struct Mem {
 }
 
 impl Mem {
+    /// The state of a branch that opened at `root`, with nothing written since.
+    fn opened(root: Entry, tree: Arc<Tree>, size: u64, jfloor: u64) -> Mem {
+        Mem {
+            root,
+            tree,
+            size,
+            opened_now: root,
+            dirty: BTreeMap::new(),
+            touched: HashSet::new(),
+            flushing: None,
+            jfloor,
+            dirty_ref: BTreeMap::new(),
+            track: None,
+            flush_seq: 0,
+            ref_seq: HashMap::new(),
+        }
+    }
+
     /// Records that chunk `idx` is dirty now: not the base image's, and not a reference.
     fn written(&mut self, idx: u64) {
         self.touched.insert(idx);
@@ -138,6 +170,38 @@ struct Up {
     gen_taken: bool,
     error: Option<Arc<Error>>,
     last: Option<PackStats>,
+    /// Upload passes that moved the ref since the branch opened, and the segment bytes they put.
+    passes: u64,
+    put_bytes: u64,
+    last_times: Option<PassTimes>,
+}
+
+/// How long the parts of one upload pass took.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PassTimes {
+    /// Packing the pending objects and putting their segments and the change list.
+    pub pack: Duration,
+    /// Recording the packed root on this host and moving the branch's ref.
+    pub publish: Duration,
+}
+
+/// What [`Volume::checkpoint_report`] did.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckpointReport {
+    /// Committing the completed writes on this host.
+    pub flush: Duration,
+    /// From the end of the flush until the store had everything.
+    pub wait: Duration,
+    /// Upload passes that moved the ref before the checkpoint started.
+    pub passes_before: u64,
+    /// The segment bytes those passes put.
+    pub bytes_before: u64,
+    /// Upload passes that moved the ref during the checkpoint.
+    pub passes: u64,
+    /// The segment bytes those passes put.
+    pub bytes: u64,
+    /// The last of those passes; `None` when there was none.
+    pub last: Option<PassTimes>,
 }
 
 #[derive(Debug)]
@@ -157,6 +221,7 @@ struct Inner {
     writer: Arc<Writer>,
     journal: Journal,
     state_path: PathBuf,
+    state_lock: Mutex<Option<Box<dyn FileLock>>>,
     opened: Entry,
     stripes: Vec<RwLock<()>>,
     mem: Mutex<Mem>,
@@ -174,6 +239,16 @@ struct Inner {
     gate: Arc<Gate>,
     /// The last flush an upload published.
     uploaded_seq: watch::Sender<u64>,
+    log: log::Log,
+    /// The generation the local state names: the ref's when the branch opened, this writer's
+    /// once it took the branch.
+    state_generation: AtomicU64,
+    /// How long device I/O waits on the store, in milliseconds; zero waits for good.
+    store_wait: AtomicU64,
+    rng: Arc<dyn Rng>,
+    /// When committed flushes not yet uploaded were committed: the earliest time of each run
+    /// of flushes, keyed by the last flush of the run.
+    unuploaded: Mutex<VecDeque<(u64, Instant)>>,
 }
 
 /// One writable branch.
@@ -183,8 +258,9 @@ pub struct Volume {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// The local state of a branch. `size` is the size `root` belongs to; a state written before
-/// sizes could grow has none.
+/// The local state of a branch. `size` is the size `root` belongs to, and `generation` the
+/// writer that wrote it; states written before sizes could grow, or before the write log, have
+/// none.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct VolState {
     root: Entry,
@@ -192,13 +268,18 @@ struct VolState {
     publishing: Entry,
     jfloor: u64,
     size: Option<u64>,
+    generation: Option<u64>,
 }
 
 impl VolState {
     fn encode(&self) -> Bytes {
-        let size = self.size.map_or_else(String::new, |n| format!("{n}\n"));
+        let tail = match (self.size, self.generation) {
+            (Some(n), Some(g)) => format!("{n}\n{g}\n"),
+            (Some(n), None) => format!("{n}\n"),
+            (None, _) => String::new(),
+        };
         Bytes::from(format!(
-            "{}\n{}\n{}\n{}\n{size}",
+            "{}\n{}\n{}\n{}\n{tail}",
             self.root, self.published, self.publishing, self.jfloor
         ))
     }
@@ -206,9 +287,10 @@ impl VolState {
     fn decode(b: &[u8]) -> Option<VolState> {
         let s = std::str::from_utf8(b).ok()?;
         let lines: Vec<&str> = s.lines().collect();
-        let (root, published, publishing, jfloor, size) = match lines.as_slice() {
-            [r, p, q, j] => (r, p, q, j, None),
-            [r, p, q, j, n] => (r, p, q, j, Some(n.parse().ok()?)),
+        let (root, published, publishing, jfloor, size, generation) = match lines.as_slice() {
+            [r, p, q, j] => (r, p, q, j, None, None),
+            [r, p, q, j, n] => (r, p, q, j, Some(n.parse().ok()?), None),
+            [r, p, q, j, n, g] => (r, p, q, j, Some(n.parse().ok()?), Some(g.parse().ok()?)),
             _ => return None,
         };
         Some(VolState {
@@ -217,7 +299,16 @@ impl VolState {
             publishing: Entry::parse_text(publishing).ok()?,
             jfloor: jfloor.parse().ok()?,
             size,
+            generation,
         })
+    }
+
+    /// Whether a writer may resume this state over ref `r`: the ref holds the root this state
+    /// published or was publishing, and the last writer to take the branch is the one this
+    /// state names.
+    fn resumes(&self, r: &Ref) -> bool {
+        (self.published.hash == r.root.hash || self.publishing.hash == r.root.hash)
+            && self.generation.is_none_or(|g| g == r.generation)
     }
 }
 
@@ -229,6 +320,7 @@ impl Volume {
             root: Entry::EMPTY,
             generation: 0,
             from: None,
+            log: None,
         };
         Remote::new(Arc::clone(&ports.store))
             .create_ref(name, &r)
@@ -250,35 +342,36 @@ impl Volume {
     /// [`Self::open`] that returns before the writer generation is taken: reads need no
     /// generation, and uploads wait for it.
     pub async fn open_then(ports: &Ports, cache: Arc<Cache>, dir: &Path, name: &str) -> Result<Volume> {
+        Volume::open_logged(ports, cache, dir, name, LogMode::default()).await
+    }
+
+    /// [`Self::open_then`] that logs flushes as `mode` says. Writes in the log that the ref
+    /// does not hold are applied before it returns, unless this host resumes its own state.
+    pub async fn open_logged(
+        ports: &Ports,
+        cache: Arc<Cache>,
+        dir: &Path,
+        name: &str,
+        mode: LogMode,
+    ) -> Result<Volume> {
         let remote = cache.remote().clone();
         let (r, version) = remote
             .get_ref(name)
             .await?
             .ok_or_else(|| Error::Corrupt(format!("open {name}: no such branch")))?;
         let generation = r.generation + 1;
-        let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
         let state_path = dir.join("state").join(name);
-        let state = read_file(ports.fs.as_ref(), &state_path)
-            .await?
-            .and_then(|b| VolState::decode(&b));
-        let resume = state.filter(|s| s.published.hash == r.root.hash || s.publishing.hash == r.root.hash);
+        let (state_lock, state) = open_state(ports.fs.as_ref(), &state_path).await?;
+        let journal = Journal::open(Arc::clone(&ports.fs), &dir.join("journal").join(name)).await?;
+        let resume = state.filter(|s| s.resumes(&r));
+        let scan = match resume {
+            Some(_) => log::Scan::resumed(&r),
+            None => log::scan(&remote, &ports.cpu, name, &r).await?,
+        };
         let size = resume.and_then(|s| s.size).map_or(r.size, |n| n.max(r.size));
         let tree = Arc::new(Tree::new(Arc::clone(&cache), size.div_ceil(CHUNK)));
         let root = resume.map_or(r.root, |s| s.root);
-        let mem = Mem {
-            root,
-            tree: Arc::clone(&tree),
-            size,
-            opened_now: root,
-            dirty: BTreeMap::new(),
-            touched: HashSet::new(),
-            flushing: None,
-            jfloor: resume.map_or(0, |s| s.jfloor),
-            dirty_ref: BTreeMap::new(),
-            track: None,
-            flush_seq: 0,
-            ref_seq: HashMap::new(),
-        };
+        let mem = Mem::opened(root, Arc::clone(&tree), size, resume.map_or(0, |s| s.jfloor));
         let inner = Arc::new(Inner {
             name: name.to_owned(),
             size: AtomicU64::new(size),
@@ -293,6 +386,7 @@ impl Volume {
             writer: Arc::new(Writer::new(WriterId::new(name, generation), ports.rng.next_u32())),
             journal,
             state_path,
+            state_lock: Mutex::new(Some(state_lock)),
             opened: mem.root,
             stripes: (0..STRIPES).map(|_| RwLock::new(())).collect(),
             mem: Mutex::new(mem),
@@ -309,6 +403,9 @@ impl Volume {
                 gen_taken: false,
                 error: None,
                 last: None,
+                passes: 0,
+                put_bytes: 0,
+                last_times: None,
             }),
             changed: watch::Sender::new(0),
             kick: Notify::new(),
@@ -320,19 +417,30 @@ impl Volume {
             prepared: Mutex::default(),
             gate: Arc::default(),
             uploaded_seq: watch::Sender::new(0),
+            log: log::Log::new(mode, scan.start),
+            state_generation: AtomicU64::new(r.generation),
+            store_wait: AtomicU64::new(millis(STORE_WAIT)),
+            rng: Arc::clone(&ports.rng),
+            unuploaded: Mutex::default(),
         });
         inner.start_journal(resume).await?;
         let grown = size != r.size;
         let taker = tokio::spawn(Arc::clone(&inner).take_generation(r, version));
         let uploader = tokio::spawn(Arc::clone(&inner).uploader());
-        let uploaded = inner.up.lock().uploaded.hash;
-        if inner.root().hash != uploaded || grown {
-            inner.kick.notify_one();
-        }
-        Ok(Volume {
+        let shipper = tokio::spawn(Arc::clone(&inner).shipper());
+        let v = Volume {
             inner,
-            tasks: Mutex::new(vec![taker, uploader]),
-        })
+            tasks: Mutex::new(vec![taker, uploader, shipper]),
+        };
+        if let Err(e) = v.inner.replay_log(scan.writes).await {
+            v.close().await;
+            return Err(e);
+        }
+        let uploaded = v.inner.up.lock().uploaded.hash;
+        if v.inner.root().hash != uploaded || grown {
+            v.inner.kick.notify_one();
+        }
+        Ok(v)
     }
 
     /// The name of the branch.
@@ -457,14 +565,36 @@ impl Volume {
         if misses.is_empty() {
             return Ok(());
         }
-        let futs = misses
-            .iter()
-            .map(|&(idx, at, _, n)| self.inner.read_chunk(idx, at, n));
-        let got = futures::future::join_all(futs).await;
-        for ((_, _, pos, n), b) in misses.into_iter().zip(got) {
-            p[pos..pos + n].copy_from_slice(&b?);
+        let Some(until) = self.inner.deadline() else {
+            let futs = misses
+                .iter()
+                .map(|&(idx, at, _, n)| self.inner.read_chunk(idx, at, n));
+            let got = futures::future::join_all(futs).await;
+            for ((_, _, pos, n), b) in misses.into_iter().zip(got) {
+                p[pos..pos + n].copy_from_slice(&b?);
+            }
+            return Ok(());
+        };
+        loop {
+            let futs = misses
+                .iter()
+                .map(|&(idx, at, _, n)| self.inner.read_chunk_held(idx, at, n));
+            let got = futures::future::join_all(futs).await;
+            let mut again = Vec::new();
+            for (m, b) in misses.into_iter().zip(got) {
+                let (_, _, pos, n) = m;
+                match b? {
+                    Some(b) => p[pos..pos + n].copy_from_slice(&b),
+                    None => again.push(m),
+                }
+            }
+            if again.is_empty() {
+                return Ok(());
+            }
+            let needs = again.iter().map(|&(idx, ..)| (idx, true)).collect();
+            self.inner.ready(needs, Some(until)).await?;
+            misses = again;
         }
-        Ok(())
     }
 
     /// Reads only from memory and the page cache, without waiting: `false` when it would wait.
@@ -486,10 +616,30 @@ impl Volume {
         if beyond(off, u64_from(p.len()), self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
-        let writes = parts(off, p.len())
-            .into_iter()
-            .map(|(idx, at, pos, n)| self.inner.write_chunk(idx, at, &p[pos..pos + n], true));
-        futures::future::join_all(writes).await.into_iter().collect()
+        let until = self.inner.deadline();
+        let mut parts = parts(off, p.len());
+        let needs = parts.iter().map(|&(idx, .., n)| (idx, n < CHUNK_SIZE)).collect();
+        self.inner.ready(needs, until).await?;
+        loop {
+            let writes = parts.iter().map(|&(idx, at, pos, n)| {
+                self.inner
+                    .write_chunk(idx, at, &p[pos..pos + n], true, until.is_some())
+            });
+            let done = futures::future::join_all(writes).await;
+            let mut again = Vec::new();
+            for (part, applied) in parts.into_iter().zip(done) {
+                if !applied? {
+                    again.push(part);
+                }
+            }
+            if again.is_empty() {
+                return Ok(());
+            }
+            self.inner
+                .ready(again.iter().map(|&(idx, ..)| (idx, true)).collect(), until)
+                .await?;
+            parts = again;
+        }
     }
 
     /// Clears a range. Whole chunks that hold no data stay sparse.
@@ -497,12 +647,28 @@ impl Volume {
         if beyond(off, len, self.inner.size()) {
             return Err(Error::BeyondEnd);
         }
+        let mut needs = Vec::new();
+        let mut pos = off;
+        while pos < off + len {
+            let (idx, at) = (pos / CHUNK, usize_from(pos % CHUNK));
+            let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
+            needs.push((idx, n < CHUNK_SIZE));
+            pos += u64_from(n);
+        }
+        let until = self.inner.deadline();
+        self.inner.ready(needs, until).await?;
         let mut pos = off;
         while pos < off + len {
             let (idx, at) = (pos / CHUNK, usize_from(pos % CHUNK));
             let n = (CHUNK_SIZE - at).min(usize_from(off + len - pos));
             if n < CHUNK_SIZE {
-                self.inner.write_chunk(idx, at, &ZEROS[..n], true).await?;
+                while !self
+                    .inner
+                    .write_chunk(idx, at, &ZEROS[..n], true, until.is_some())
+                    .await?
+                {
+                    self.inner.ready(vec![(idx, true)], until).await?;
+                }
             } else if !self.inner.is_sparse(idx).await? {
                 self.inner.zero_chunk(idx, true).await?;
             }
@@ -518,8 +684,19 @@ impl Volume {
 
     /// Flushes and waits until everything is published in the store.
     pub async fn checkpoint(&self) -> Result<()> {
+        self.checkpoint_report().await.map(|_| ())
+    }
+
+    /// [`Self::checkpoint`], reporting how long its parts took and what the uploads put.
+    pub async fn checkpoint_report(&self) -> Result<CheckpointReport> {
         let _hurry = self.inner.gate.hurry();
+        let t0 = Instant::now();
+        let (passes_before, bytes_before) = {
+            let up = self.inner.up.lock();
+            (up.passes, up.put_bytes)
+        };
         self.inner.flush().await?;
+        let flushed = Instant::now();
         let (target, size) = {
             let m = self.inner.mem.lock();
             (m.root.hash, m.size)
@@ -530,7 +707,16 @@ impl Volume {
             {
                 let up = self.inner.up.lock();
                 if (up.last_from == target || up.uploaded.hash == target) && up.published_size >= size {
-                    return Ok(());
+                    let passes = up.passes - passes_before;
+                    return Ok(CheckpointReport {
+                        flush: flushed - t0,
+                        wait: flushed.elapsed(),
+                        passes_before,
+                        bytes_before,
+                        passes,
+                        bytes: up.put_bytes - bytes_before,
+                        last: up.last_times.filter(|_| passes > 0),
+                    });
                 }
                 if let Some(e) = &up.error {
                     return Err(Error::Shared(Arc::clone(e)));
@@ -542,19 +728,83 @@ impl Volume {
         }
     }
 
+    /// Waits until the uploader stops for good, and returns why: no later upload can publish
+    /// the branch.
+    pub async fn upload_stopped(&self) -> Arc<Error> {
+        let mut rx = self.inner.changed.subscribe();
+        loop {
+            if let Some(e) = &self.inner.up.lock().error {
+                return Arc::clone(e);
+            }
+            if rx.changed().await.is_err() {
+                return Arc::new(Error::Cancelled);
+            }
+        }
+    }
+
     /// What the last upload packed.
     pub fn last_upload(&self) -> Option<PackStats> {
         self.inner.up.lock().last
     }
 
-    /// Stops the uploader after any upload in flight finishes.
+    /// Sets how long a read, write, zero or strict flush waits on the store before it fails
+    /// with a transient store error; zero waits for good. A fetch it gave up on goes on, so
+    /// no write is half applied and a later try may find the bytes here. Opens start at
+    /// [`STORE_WAIT`].
+    pub fn set_store_wait(&self, wait: Duration) {
+        let ms = if wait.is_zero() { 0 } else { millis(wait).max(1) };
+        self.inner.store_wait.store(ms, Ordering::Relaxed);
+    }
+
+    /// How long ago the oldest committed flush that no upload has published yet committed,
+    /// to within two seconds; zero when every flush is published. It grows while the store
+    /// is unreachable.
+    pub fn upload_lag(&self) -> Duration {
+        self.inner.upload_lag()
+    }
+
+    /// How this volume logs its flushes.
+    pub fn log_mode(&self) -> LogMode {
+        self.inner.log.mode()
+    }
+
+    /// Records in the ref that this writer adds no more records to the log, so the next open
+    /// reads none. Call it after [`Self::checkpoint`], when no more writes come; without every
+    /// flush published it does nothing.
+    pub async fn close_log(&self) -> Result<()> {
+        self.inner.close_log().await
+    }
+
+    /// Stops the uploader after any upload in flight finishes, then releases the local state
+    /// for another open.
     pub async fn close(&self) {
         self.inner.stop.send_replace(true);
         let tasks = std::mem::take(&mut *self.tasks.lock());
         for t in tasks {
             let _ = t.await;
         }
+        drop(self.inner.state_lock.lock().take());
     }
+}
+
+/// Locks the local state at `state_path`, so one process at a time writes the branch from it
+/// and a writer that resumes the state knows the one before it is gone, then reads it.
+async fn open_state(fs: &dyn LocalFs, state_path: &Path) -> Result<(Box<dyn FileLock>, Option<VolState>)> {
+    if let Some(dir) = state_path.parent() {
+        fs.create_dir_all(dir).await?;
+    }
+    let mut lock_path = state_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock = fs.try_lock(Path::new(&lock_path)).await.map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("the branch state {} is in use: {e}", state_path.display()),
+        ))
+    })?;
+    let state = read_file(fs, state_path)
+        .await?
+        .and_then(|b| VolState::decode(&b));
+    Ok((lock, state))
 }
 
 /// The chunk pieces of `len` bytes at `off`: chunk, offset in it, offset in the buffer, length.
@@ -575,8 +825,37 @@ fn beyond(off: u64, len: u64, size: u64) -> bool {
     off.checked_add(len).is_none_or(|end| end > size)
 }
 
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The wait before the next try after `failed` tries in a row failed: it doubles from
+/// [`RETRY_AFTER`] up to [`RETRY_MAX`], and a random part in its upper half keeps hosts that
+/// failed together from trying again together.
+fn backoff(failed: u32, rng: &dyn Rng) -> Duration {
+    let full = millis(
+        RETRY_AFTER
+            .saturating_mul(1 << failed.saturating_sub(1).min(16))
+            .min(RETRY_MAX),
+    );
+    let half = full / 2;
+    Duration::from_millis(half + rng.next_u64() % (full - half + 1))
+}
+
+/// The error of device I/O that waited `wait` on the store for `what`.
+fn unanswered(what: String, wait: Duration) -> Error {
+    Error::Store(StoreError::Transient {
+        key: what,
+        source: format!("the store did not answer within {wait:?}").into(),
+    })
+}
+
 fn is_transient(e: &Error) -> bool {
-    matches!(e.kind(), Error::Store(crate::ports::StoreError::Transient { .. }))
+    matches!(e.kind(), Error::Store(StoreError::Transient { .. }))
+}
+
+fn is_permanent(e: &Error) -> bool {
+    matches!(e.kind(), Error::Store(StoreError::Permanent { .. }))
 }
 
 fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
@@ -586,12 +865,14 @@ fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
         | Error::ChunkLost { .. }
         | Error::Store(_)
         | Error::Format(_)
+        | Error::UnknownFormat { .. }
         | Error::Io(_)
         | Error::BeyondEnd
         | Error::Shrink { .. }
         | Error::Corrupt(_)
         | Error::SegmentExists(_)
         | Error::RefExists(_)
+        | Error::CheckpointExists(_)
         | Error::Cancelled) => Arc::new(e),
     };
     up.error = Some(Arc::clone(&e));
@@ -615,7 +896,9 @@ impl Inner {
             .await?;
         for (idx, r) in writes {
             match r {
-                Record::Data(at, data) => self.write_chunk(idx, at, &data, false).await?,
+                Record::Data(at, data) => {
+                    self.write_chunk(idx, at, &data, false, false).await?;
+                }
                 Record::ZeroChunk => self.zero_chunk(idx, false).await?,
             }
         }
@@ -685,6 +968,108 @@ impl Inner {
         Ok(())
     }
 
+    fn store_wait(&self) -> Option<Duration> {
+        match self.store_wait.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    /// When device I/O that starts now must stop waiting on the store; `None` waits for good.
+    fn deadline(&self) -> Option<Instant> {
+        self.store_wait().map(|w| Instant::now() + w)
+    }
+
+    /// Whether chunk `idx` is readable without the store: its tree nodes, and with `data` its
+    /// bytes, are on this host.
+    fn is_local(&self, idx: u64, data: bool) -> bool {
+        let (tree, root) = {
+            let m = self.mem.lock();
+            if m.dirty.contains_key(&idx) || m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
+                return true;
+            }
+            (Arc::clone(&m.tree), m.root)
+        };
+        if data && self.base_of(idx).is_some() {
+            return true;
+        }
+        match tree.lookup_nowait(&root, idx) {
+            None => false,
+            Some(e) if !data || e.is_empty() => true,
+            Some(e) => self.cache.holds(&e.hash),
+        }
+    }
+
+    /// Fetches what [`Self::is_local`] needs of chunk `idx`. It takes no stripe lock, so a
+    /// fetch the store does not answer holds up no write or flush.
+    async fn warm(&self, idx: u64, data: bool) -> Result<()> {
+        let (tree, root) = {
+            let m = self.mem.lock();
+            if m.dirty.contains_key(&idx) || m.flushing.as_ref().is_some_and(|f| f.contains_key(&idx)) {
+                return Ok(());
+            }
+            (Arc::clone(&m.tree), m.root)
+        };
+        if data && self.base_of(idx).is_some() {
+            return Ok(());
+        }
+        let e = tree.lookup(&root, idx, false).await?;
+        if data && !e.is_empty() {
+            self.cache.warm(&e).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches what each `(chunk, data)` of `needs` lacks, as [`Self::warm`] does, waiting
+    /// until `until` at most: device I/O then fails instead of hanging while the store does not
+    /// answer. The fetches go on after it gives up, so the next try may find them done, and a
+    /// try that finds a fetch of the same frame running waits for it instead of fetching again.
+    async fn ready(self: &Arc<Self>, mut needs: Vec<(u64, bool)>, until: Option<Instant>) -> Result<()> {
+        needs.retain(|&(idx, data)| !self.is_local(idx, data));
+        let Some(&(first, _)) = needs.first() else {
+            return Ok(());
+        };
+        let inner = Arc::clone(self);
+        let fetch = tokio::spawn(async move {
+            let futs = needs.iter().map(|&(idx, data)| inner.warm(idx, data)).collect();
+            bounded(futs, STORE_PARALLEL)
+                .await
+                .into_iter()
+                .collect::<Result<()>>()
+        });
+        let joined = match until {
+            None => fetch.await,
+            Some(until) => tokio::time::timeout_at(until, fetch).await.map_err(|_| {
+                let wait = self.store_wait().unwrap_or_default();
+                unanswered(format!("chunk {first} of {}", self.name), wait)
+            })?,
+        };
+        joined.map_err(|_| Error::Cancelled)?
+    }
+
+    /// Records that flush `seq` committed now.
+    fn committed(&self, seq: u64) {
+        let now = Instant::now();
+        let uploaded = *self.uploaded_seq.borrow();
+        let mut q = self.unuploaded.lock();
+        while q.front().is_some_and(|&(s, _)| s <= uploaded) {
+            q.pop_front();
+        }
+        match q.back_mut() {
+            Some((last, at)) if now.duration_since(*at) < UPLOAD_EVERY => *last = seq,
+            _ => q.push_back((seq, now)),
+        }
+    }
+
+    fn upload_lag(&self) -> Duration {
+        let uploaded = *self.uploaded_seq.borrow();
+        let mut q = self.unuploaded.lock();
+        while q.front().is_some_and(|&(s, _)| s <= uploaded) {
+            q.pop_front();
+        }
+        q.front().map_or(Duration::ZERO, |&(_, at)| at.elapsed())
+    }
+
     fn stripe(&self, idx: u64) -> &RwLock<()> {
         &self.stripes[usize_from(idx % u64_from(STRIPES))]
     }
@@ -708,12 +1093,14 @@ impl Inner {
             publishing,
             jfloor,
             size: Some(size),
+            generation: Some(self.state_generation.load(Ordering::Acquire)),
         };
         Ok(write_durable(self.fs.as_ref(), &self.state_path, st.encode()).await?)
     }
 
     async fn take_generation(self: Arc<Self>, mut r: Ref, version: Version) {
         r.generation = self.generation;
+        r.log = Some(self.log.start);
         let mut res = self.remote.put_ref(&self.name, &r, &version).await;
         for _ in 1..GENERATION_TRIES {
             if !matches!(&res, Err(e) if is_transient(e)) {
@@ -722,6 +1109,7 @@ impl Inner {
             tokio::time::sleep(RETRY_AFTER).await;
             res = self.remote.put_ref(&self.name, &r, &version).await;
         }
+        let taken = res.is_ok();
         {
             let mut up = self.up.lock();
             match res {
@@ -731,8 +1119,12 @@ impl Inner {
                     fail_with(&mut up, e);
                 }
             }
-            up.gen_taken = true;
         }
+        if taken {
+            self.state_generation.store(self.generation, Ordering::Release);
+            let _ = self.persist().await;
+        }
+        self.up.lock().gen_taken = true;
         self.notify();
     }
 
@@ -751,24 +1143,61 @@ impl Inner {
         self.cache.read(&e, at, n).await
     }
 
+    /// Bytes `[at, at + n)` of chunk `idx` when memory holds them, or else the tree and root
+    /// to read them from.
+    fn in_memory(&self, idx: u64, at: usize, n: usize) -> std::result::Result<Bytes, (Arc<Tree>, Entry)> {
+        let m = self.mem.lock();
+        match m.dirty.get(&idx) {
+            Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
+            Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
+            None => {}
+        }
+        if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
+            return Ok(f.slice(at..at + n));
+        }
+        Err((Arc::clone(&m.tree), m.root))
+    }
+
     async fn read_chunk(&self, idx: u64, at: usize, n: usize) -> Result<Bytes> {
         let _g = self.stripe(idx).read().await;
-        let (tree, root) = {
-            let m = self.mem.lock();
-            match m.dirty.get(&idx) {
-                Some(Dirty::Bytes(d)) => return Ok(Bytes::copy_from_slice(&d[at..at + n])),
-                Some(Dirty::Zero) => return Ok(Bytes::from_static(&ZEROS[at..at + n])),
-                None => {}
-            }
-            if let Some(f) = m.flushing.as_ref().and_then(|f| f.get(&idx)) {
-                return Ok(f.slice(at..at + n));
-            }
-            (Arc::clone(&m.tree), m.root)
+        let (tree, root) = match self.in_memory(idx, at, n) {
+            Ok(b) => return Ok(b),
+            Err(t) => t,
         };
         if let Some(b) = self.read_base(idx, at, n).await {
             return Ok(b);
         }
         self.read_committed(&tree, idx, &root, at, n).await
+    }
+
+    /// [`Self::read_chunk`] from this host only: `None` when it would wait on the store, which
+    /// it never does while it holds the stripe lock.
+    async fn read_chunk_held(&self, idx: u64, at: usize, n: usize) -> Result<Option<Bytes>> {
+        let _g = self.stripe(idx).read().await;
+        let (tree, root) = match self.in_memory(idx, at, n) {
+            Ok(b) => return Ok(Some(b)),
+            Err(t) => t,
+        };
+        if let Some(b) = self.read_base(idx, at, n).await {
+            return Ok(Some(b));
+        }
+        self.read_held(&tree, idx, &root, at, n).await
+    }
+
+    /// [`Self::read_committed`] from this host only: `None` when it needs the store.
+    async fn read_held(
+        &self,
+        tree: &Tree,
+        idx: u64,
+        root: &Entry,
+        at: usize,
+        n: usize,
+    ) -> Result<Option<Bytes>> {
+        match tree.lookup_nowait(root, idx) {
+            None => Ok(None),
+            Some(e) if e.is_empty() => Ok(Some(Bytes::from(vec![0; n]))),
+            Some(e) => self.cache.read_held(&e, at, n).await,
+        }
     }
 
     /// The base image's bytes of chunk `idx`, when no write since open changed it.
@@ -842,8 +1271,17 @@ impl Inner {
 
     /// Applies one write to a chunk. The chunk's stripe lock orders writes to the same chunk,
     /// in the buffer and in the journal; writes to other chunks run in parallel. A flush takes
-    /// every stripe, so no write is half applied when it takes the dirty set.
-    async fn write_chunk(&self, idx: u64, at: usize, data: &[u8], journaled: bool) -> Result<()> {
+    /// every stripe, so no write is half applied when it takes the dirty set. With `held_only`
+    /// it never waits on the store under the lock: it applies nothing and returns `false` when
+    /// the rest of a partial chunk is not on this host.
+    async fn write_chunk(
+        &self,
+        idx: u64,
+        at: usize,
+        data: &[u8],
+        journaled: bool,
+        held_only: bool,
+    ) -> Result<bool> {
         let _g = self.stripe(idx).write().await;
         let (dirty, flushing, tree, root, size) = {
             let m = self.mem.lock();
@@ -863,6 +1301,10 @@ impl Inner {
             if !self.try_read_stored(&tree, idx, &root, 0, &mut v[..n])? {
                 let b = match self.read_base(idx, 0, n).await {
                     Some(b) => b,
+                    None if held_only => match self.read_held(&tree, idx, &root, 0, n).await? {
+                        Some(b) => b,
+                        None => return Ok(false),
+                    },
                     None => self.read_committed(&tree, idx, &root, 0, n).await?,
                 };
                 v[..b.len()].copy_from_slice(&b);
@@ -890,7 +1332,7 @@ impl Inner {
                 m.dirty.insert(idx, Dirty::Bytes(buf));
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Makes chunk `idx` all zeros, as [`Self::write_chunk`] would with a chunk of zeros.
@@ -906,6 +1348,20 @@ impl Inner {
     }
 
     async fn flush(&self) -> Result<()> {
+        let seq = self.commit_flush().await?;
+        if self.log.mode() == LogMode::Strict {
+            match self.store_wait() {
+                None => self.wait_logged(seq).await?,
+                Some(wait) => tokio::time::timeout(wait, self.wait_logged(seq))
+                    .await
+                    .map_err(|_| unanswered(format!("the write log of {}", self.name), wait))??,
+            }
+        }
+        Ok(())
+    }
+
+    /// Commits completed writes locally and durably; returns the number of the last flush.
+    async fn commit_flush(&self) -> Result<u64> {
         let _c = self.commit.lock().await;
         if self.up.lock().fenced {
             return Err(Error::Fenced {
@@ -916,8 +1372,11 @@ impl Inner {
         for s in &self.stripes {
             guards.push(s.write().await);
         }
-        if self.mem.lock().dirty.is_empty() {
-            return Ok(());
+        {
+            let m = self.mem.lock();
+            if m.dirty.is_empty() {
+                return Ok(m.flush_seq);
+            }
         }
         let generation = self.journal.rotate().await?;
         let (snapshot, refs, tree, root) = {
@@ -937,8 +1396,8 @@ impl Inner {
         };
         drop(guards);
         match self.commit_snapshot(&tree, &snapshot, &refs, &root).await {
-            Ok(new_root) => {
-                {
+            Ok((new_root, updates)) => {
+                let (seq, size) = {
                     let mut m = self.mem.lock();
                     m.root = new_root;
                     m.flushing = None;
@@ -948,11 +1407,18 @@ impl Inner {
                     for r in refs.into_values() {
                         m.ref_seq.insert(r.path, seq);
                     }
-                }
+                    (seq, m.size)
+                };
+                self.committed(seq);
                 self.persist().await?;
                 self.journal.drop_below(generation).await;
+                let chunks = updates
+                    .into_iter()
+                    .map(|(idx, e)| (idx, (!e.is_empty()).then(|| (e.hash, snapshot[&idx].clone()))))
+                    .collect();
+                self.queue_flush(log::Flushed { seq, size, chunks });
                 self.kick.notify_one();
-                Ok(())
+                Ok(seq)
             }
             Err(e) => {
                 let mut m = self.mem.lock();
@@ -976,7 +1442,7 @@ impl Inner {
         snapshot: &BTreeMap<u64, Bytes>,
         refs: &BTreeMap<u64, ChunkRef>,
         root: &Entry,
-    ) -> Result<Entry> {
+    ) -> Result<(Entry, Vec<(u64, Entry)>)> {
         let mut futs = Vec::with_capacity(snapshot.len());
         for (idx, b) in snapshot {
             futs.push(self.store_chunk(*idx, b.clone(), refs.get(idx)));
@@ -996,7 +1462,7 @@ impl Inner {
         updates.sort_by_key(|u| u.0);
         let new_root = tree.update(root, &updates).await?;
         self.cache.sync_local().await?;
-        Ok(new_root)
+        Ok((new_root, updates))
     }
 
     async fn store_chunk(&self, idx: u64, b: Bytes, r: Option<&ChunkRef>) -> Result<(u64, Entry)> {
@@ -1047,20 +1513,40 @@ impl Inner {
                 _ = changed.changed() => {}
             }
         }
+        let mut refused = 0;
+        let mut failed = 0;
         loop {
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => return,
                 () = self.kick.notified() => {}
                 () = tokio::time::sleep(UPLOAD_EVERY) => {}
             }
-            if let Err(e) = self.upload().await {
-                if matches!(e.kind(), Error::Fenced { .. } | Error::ChunkLost { .. }) {
+            let e = match self.upload().await {
+                Ok(()) => {
+                    refused = 0;
+                    failed = 0;
+                    continue;
+                }
+                Err(e) => e,
+            };
+            if matches!(e.kind(), Error::Fenced { .. } | Error::ChunkLost { .. }) {
+                return;
+            }
+            let wait = if is_permanent(&e) {
+                refused += 1;
+                if refused >= REFUSED_TRIES {
+                    fail_with(&mut self.up.lock(), e);
+                    self.notify();
                     return;
                 }
-                tokio::select! {
-                    _ = stop.wait_for(|s| *s) => return,
-                    () = tokio::time::sleep(RETRY_AFTER) => {}
-                }
+                RETRY_AFTER * (1 << (refused - 1))
+            } else {
+                failed += 1;
+                backoff(failed, self.rng.as_ref())
+            };
+            tokio::select! {
+                _ = stop.wait_for(|s| *s) => return,
+                () = tokio::time::sleep(wait) => {}
             }
         }
     }
@@ -1078,6 +1564,7 @@ impl Inner {
             }
             (Arc::clone(&up.known), up.version.clone())
         };
+        let t0 = Instant::now();
         let dedup = self.dedup.lock().clone();
         let learner = self.learner.lock().clone();
         let prepared = self.prepared.lock().clone();
@@ -1105,13 +1592,16 @@ impl Inner {
         let keys = p.keys().clone();
         let (done, ()) = futures::join!(p.finish(), self.put_change_list(&tree, size, &packed, &keys));
         done?;
+        let packed_at = Instant::now();
         self.up.lock().publishing = packed;
         self.persist().await?;
+        let pos = self.log_pos(seq);
         let r = Ref {
             size,
             root: packed,
             generation: self.generation,
             from: self.from.clone(),
+            log: Some(pos),
         };
         let new_version = match self.remote.put_ref(&self.name, &r, &version).await {
             Ok(v) => v,
@@ -1129,15 +1619,7 @@ impl Inner {
         };
         let stats = p.stats();
         let added = p.added().clone();
-        if let Some(learned) = dedup.as_ref().and_then(|d| d.learned.as_ref()) {
-            learned.mark_used(p.used_learned());
-            if let Some(l) = &learner {
-                l.published(p.learned());
-                learned.add_published(l, p.learned()).await;
-            }
-        } else if let Some(l) = &learner {
-            l.published(p.learned());
-        }
+        record_learned(dedup.as_ref(), learner.as_ref(), &p).await;
         drop(p);
         {
             let mut up = self.up.lock();
@@ -1149,6 +1631,12 @@ impl Inner {
             up.uploaded = root;
             up.last_from = root.hash;
             up.last = Some(stats);
+            up.passes += 1;
+            up.put_bytes += stats.bytes;
+            up.last_times = Some(PassTimes {
+                pack: packed_at - t0,
+                publish: packed_at.elapsed(),
+            });
             let mut m = self.mem.lock();
             if m.root.hash == root.hash {
                 m.root = packed;
@@ -1158,6 +1646,7 @@ impl Inner {
         if let Some(p) = &prepared {
             p.drop_through(seq);
         }
+        self.log_published(&pos);
         self.uploaded_seq.send_modify(|s| *s = (*s).max(seq));
         self.notify();
         let _ = self.persist().await;
@@ -1190,12 +1679,24 @@ impl Inner {
     }
 }
 
+async fn record_learned(dedup: Option<&Arc<Dedup>>, learner: Option<&Arc<Learner>>, p: &Packer) {
+    if let Some(learned) = dedup.and_then(|d| d.learned.as_ref()) {
+        learned.mark_used(p.used_learned());
+        if let Some(l) = learner {
+            l.published(p.learned());
+            learned.add_published(l, p.learned()).await;
+        }
+    } else if let Some(l) = learner {
+        l.published(p.learned());
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "sim")]
 mod tests {
     use super::*;
-    use crate::ports::Open;
-    use crate::sim::{self, SimFs, SimStore};
+    use crate::ports::{Open, StoreError};
+    use crate::sim::{self, Fault, SimFs, SimStore, StoreOp};
 
     const SIZE: u64 = 64 << 20;
 
@@ -1253,6 +1754,35 @@ mod tests {
         );
         assert_eq!(read(&other, SIZE - 10, 10).await, vec![0; 10]);
         other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_checkpoint_reports_the_passes_before_it_and_its_own() {
+        let (ports, _, _) = sim::ports(3);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 300_000), 0).await.unwrap();
+        let first = v.checkpoint_report().await.unwrap();
+        assert_eq!((first.passes_before, first.bytes_before), (0, 0));
+        assert!(first.passes >= 1 && first.bytes > 0);
+        assert!(first.last.is_some());
+
+        let again = v.checkpoint_report().await.unwrap();
+        assert_eq!(again.passes, 0, "nothing new to publish");
+        assert!(again.last.is_none());
+        assert_eq!(again.bytes_before, first.bytes);
+
+        v.write_at(&data(2, 100_000), 1 << 20).await.unwrap();
+        v.flush().await.unwrap();
+        v.checkpoint().await.unwrap();
+        v.write_at(&data(3, 10), 0).await.unwrap();
+        let third = v.checkpoint_report().await.unwrap();
+        assert!(third.passes_before > first.passes);
+        assert!(third.bytes_before > first.bytes);
+        assert!(third.passes >= 1 && third.bytes > 0);
+        v.close().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1379,16 +1909,26 @@ mod tests {
     }
 
     #[test]
-    fn a_state_without_a_size_still_reads() {
+    fn a_state_without_a_size_or_generation_still_reads() {
         let s = VolState {
             root: Entry::EMPTY,
             published: Entry::EMPTY,
             publishing: Entry::EMPTY,
             jfloor: 7,
             size: Some(8 << 30),
+            generation: Some(4),
         };
         assert_eq!(VolState::decode(&s.encode()), Some(s));
-        let old = VolState { size: None, ..s };
+        let sized = VolState {
+            generation: None,
+            ..s
+        };
+        assert_eq!(VolState::decode(&sized.encode()), Some(sized));
+        let old = VolState {
+            size: None,
+            generation: None,
+            ..s
+        };
         let four = String::from_utf8(old.encode().to_vec()).unwrap();
         assert_eq!(four.lines().count(), 4);
         assert_eq!(VolState::decode(four.as_bytes()), Some(old));
@@ -1494,9 +2034,10 @@ mod tests {
             .unwrap();
         v.write_at(&data(1, 100), 0).await.unwrap();
         v.checkpoint().await.unwrap();
-        store.inject(sim::Fault {
-            op: sim::StoreOp::Update,
+        store.inject(Fault {
+            op: StoreOp::Update,
             applied: false,
+            permanent: false,
         });
         v.grow(64 << 20).await.unwrap();
         v.write_at(&data(2, 100), 40 << 20).await.unwrap();
@@ -1545,6 +2086,57 @@ mod tests {
         assert!(v.grow(SIZE + 100).await.is_err());
         v.grow(SIZE).await.unwrap();
         assert_eq!(v.size(), SIZE);
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lasting_refusal_stops_the_uploader_and_fails_the_checkpoint() {
+        let (ports, store, _) = sim::ports(5);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        let published = v.published();
+        store.refuse(StoreOp::Create);
+        v.write_at(&data(2, 100), 0).await.unwrap();
+        let refused = |e: &Error| matches!(e.kind(), Error::Store(StoreError::Permanent { .. }));
+        let e = v.checkpoint().await.unwrap_err();
+        assert!(refused(&e), "{e}");
+        let stopped = v.upload_stopped().await;
+        assert!(refused(&stopped), "{stopped}");
+        store.accept();
+        tokio::time::sleep(UPLOAD_EVERY * 30).await;
+        assert_eq!(
+            v.published(),
+            published,
+            "no upload ran after the uploader stopped"
+        );
+        let again = v.checkpoint().await.unwrap_err();
+        assert!(refused(&again), "{again}");
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_passes_does_not_stop_the_uploader() {
+        let (ports, store, _) = sim::ports(6);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        for _ in 1..REFUSED_TRIES {
+            store.inject(Fault {
+                op: StoreOp::Update,
+                applied: false,
+                permanent: true,
+            });
+        }
+        v.write_at(&data(2, 100), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        assert_eq!(v.published(), v.root());
         v.close().await;
     }
 

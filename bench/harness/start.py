@@ -46,6 +46,8 @@ NYDUS_VERSION = "2.4.5"
 NYDUS_SHA256 = "1ad7b793a1996577e462b0bf5c1a22e4450b9c04f7e9e99d4b274ccc92f19072"
 NYDUS_SNAPSHOTTER_VERSION = "0.16.1"
 NYDUS_SNAPSHOTTER_SHA256 = "6e8925642d90896b4dacd903b812548631f6f3dd12495b77bb16bffe533a8f82"
+STAT_SECTORS_WRITTEN = 6
+SECTOR = 512
 
 # The 14 command types agents ran most in Spotlight sandboxes, in order: (row, directory, command).
 REPLAY = [
@@ -121,9 +123,10 @@ def unmount(path: Path | str) -> None:
     Raises CalledProcessError when it stays mounted.
     """
     for _ in range(20):
+        if Path(path).is_mount():
+            subprocess.run(["umount", str(path)], stderr=subprocess.DEVNULL, check=False)
         if not Path(path).is_mount():
             return
-        subprocess.run(["umount", str(path)], stderr=subprocess.DEVNULL, check=False)
         time.sleep(0.5)
     run("fuser", "-km", path, check=False)
     time.sleep(1)
@@ -672,6 +675,7 @@ class Pando(Workspace):
     prefix = "pando-bench-start"
     dir = DIR / "pando"
     handoff = False
+    attach_args: tuple[str, ...] = ()
 
     @override
     def unavailable(self) -> str | None:
@@ -724,7 +728,7 @@ class Pando(Workspace):
     @override
     def open(self, i: int) -> None:
         self._pando("branch", "base", f"b{i}", capture=True)
-        self.attach(i, f"b{i}")
+        self.attach(i, f"b{i}", *self.attach_args)
         self.root(i).mkdir(exist_ok=True)
         run("mount", self._mounted(i), self.root(i))
 
@@ -763,16 +767,46 @@ class Pando(Workspace):
 
     @override
     def close(self, i: int) -> None:
+        self.close_timed(i)
+
+    def close_timed(self, i: int) -> dict[str, float]:
+        """Close branch i; return what each step of the close took and what it moved.
+
+        The keys are the seconds the unmount, `pando detach` and the end of `pando attach` took,
+        the `key=value` publish times attach printed, the page cache's dirty bytes before the
+        unmount, and the bytes the device took before and during it.
+        """
+        times: dict[str, float] = {}
+        live = Path(self.device_path(i)).exists()
+        if live:
+            times["dirty"] = dirty_bytes()
+            times["run_written"] = self.written(i)
+        t0 = time.perf_counter()
         unmount(self.root(i))
+        times["unmount"] = time.perf_counter() - t0
+        if live:
+            times["unmount_written"] = self.written(i) - times["run_written"]
         p, out = self.procs.pop(i, (None, None))
+        t0 = time.perf_counter()
         if Path(self.device_path(i)).exists():
             dm = ["--dm", self._dm(i)] if self.handoff else []
             self._pando("detach", "--device", self.device_path(i), *dm, capture=True, check=False)
+        times["detach"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         if p:
-            out.write(p.stdout.read())
+            rest = p.stdout.read()
+            out.write(rest)
             if p.wait(timeout=600) != 0:
                 log(f"{self.name}: attach of b{i} exited with {p.returncode}")
             out.close()
+            times.update(publish_times(rest))
+        times["exit"] = time.perf_counter() - t0
+        return times
+
+    def written(self, i: int) -> int:
+        """Return the bytes written to device i since it was created."""
+        stat = Path("/sys/block") / Path(self.device_path(i)).name / "stat"
+        return int(stat.read_text().split()[STAT_SECTORS_WRITTEN]) * SECTOR
 
     @override
     def teardown(self) -> None:
@@ -783,6 +817,30 @@ class Pando(Workspace):
                 "aws", "s3", "rm", "--recursive", "--quiet", f"s3://{self.bucket}/{self.prefix}/", check=False
             )
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def publish_times(text: str) -> dict[str, float]:
+    """Return the values of attach's `publish times` line in text, as numbers."""
+    for line in text.splitlines():
+        head, sep, rest = line.partition(": ")
+        if sep and head.startswith("publish times "):
+            return {k: float(v) for k, _, v in (kv.partition("=") for kv in rest.split())}
+    return {}
+
+
+def dirty_bytes() -> int:
+    """Return the dirty and writeback bytes in the page cache, host-wide."""
+    fields = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    return sum(int(fields[k].split()[0]) * 1024 for k in ("Dirty", "Writeback"))
+
+
+class PandoCapped(Pando):
+    """Pando with its device's dirty page cache capped at 64 MiB (`--dirty-limit`)."""
+
+    name = "Pando (64 MiB dirty cap)"
+    prefix = "pando-bench-capped"
+    dir = DIR / "pando-capped"
+    attach_args = ("--dirty-limit", str(64 << 20))
 
 
 class PandoHandoff(Pando):

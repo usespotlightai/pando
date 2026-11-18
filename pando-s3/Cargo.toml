@@ -13,8 +13,12 @@ bytes.workspace = true
 futures.workspace = true
 object_store = { workspace = true, features = ["aws"] }
 pando-engine.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 
 [lints]
 workspace = true

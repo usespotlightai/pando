@@ -26,8 +26,8 @@
   <path d="M212,120.0 h321.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-321.2 z" fill="#656c76"><title>tar from S3: 3.2 s (range 3.17 s to 3.2 s)</title></path>
   <text x="543.2" y="131.0" font-size="12" fill="#9198a1">3.2 s</text>
   <text x="202" y="157.0" font-size="12" fill="#f0f6fc" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,146.0 h338.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-338.8 z" fill="#4493f8"><title>Pando: 4.94 s (range 2.43 s to 7.68 s)</title></path>
-  <text x="560.8" y="157.0" font-size="12" fill="#9198a1">4.94 s</text>
+  <path d="M212,146.0 h323.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-323.4 z" fill="#4493f8"><title>Pando: 3.37 s (range 2.31 s to 8.29 s)</title></path>
+  <text x="545.4" y="157.0" font-size="12" fill="#9198a1">3.37 s</text>
   <text x="202" y="183.0" font-size="12" fill="#f0f6fc" text-anchor="end">ZeroFS (NBD)</text>
   <path d="M212,172.0 h375.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-375.9 z" fill="#656c76"><title>ZeroFS (NBD): 12.4 s (range 10.6 s to 14.1 s)</title></path>
   <text x="597.9" y="183.0" font-size="12" fill="#9198a1">12.4 s</text>
@@ -49,8 +49,8 @@
   <path d="M212,304.0 h116.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-116.6 z" fill="#656c76"><title>Docker (overlayfs): 194 MiB (range 194 MiB to 194 MiB)</title></path>
   <text x="338.6" y="315.0" font-size="12" fill="#9198a1">194 MiB</text>
   <text x="202" y="341.0" font-size="12" fill="#f0f6fc" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,330.0 h121.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-121.4 z" fill="#4493f8"><title>Pando: 208 MiB (range 207 MiB to 214 MiB)</title></path>
-  <text x="343.4" y="341.0" font-size="12" fill="#9198a1">208 MiB</text>
+  <path d="M212,330.0 h122.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-122.1 z" fill="#4493f8"><title>Pando: 210 MiB (range 207 MiB to 214 MiB)</title></path>
+  <text x="344.1" y="341.0" font-size="12" fill="#9198a1">210 MiB</text>
   <text x="202" y="367.0" font-size="12" fill="#f0f6fc" text-anchor="end">ZeroFS (NBD)</text>
   <path d="M212,356.0 h149.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-149.8 z" fill="#656c76"><title>ZeroFS (NBD): 318 MiB (range 301 MiB to 320 MiB)</title></path>
   <text x="371.8" y="367.0" font-size="12" fill="#9198a1">318 MiB</text>

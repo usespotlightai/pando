@@ -81,6 +81,24 @@ fn entries_and_refs_are_byte_exact() {
 }
 
 #[test]
+fn the_store_format_marker_is_byte_exact() {
+    let g = Golden::load();
+    let b = g.file("store_format.txt");
+    assert_eq!(StoreFormat::decode(&b).unwrap(), StoreFormat::CURRENT);
+    assert_eq!(StoreFormat::CURRENT.encode(), b);
+    rust_out("store_format.txt", &StoreFormat::CURRENT.encode());
+}
+
+#[test]
+fn checkpoints_are_byte_exact() {
+    let g = Golden::load();
+    let c = Checkpoint::decode(&g.file("checkpoint.txt")).unwrap();
+    let ea = Entry::parse_text(g.get("entry_a")).unwrap();
+    assert_eq!((c.size, c.root, c.branch.as_str()), (1 << 30, ea, "main"));
+    assert_eq!(c.encode(), g.file("checkpoint.txt"));
+}
+
+#[test]
 fn writer_ids_match() {
     let g = Golden::load();
     let w = WriterId::new("main", 5);

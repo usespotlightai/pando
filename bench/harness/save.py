@@ -18,7 +18,14 @@ is durable where another host would open it, and the bytes `npm ci`'s changes ad
             it directly. Bytes: the object versions it exported to its bucket for the branch,
             once its exports settle (it waits for a file to go a minute without writes).
 
-Rows: save.time in seconds, save.uploaded in bytes, save.npm_ci in seconds.
+Rows: save.time in seconds, save.uploaded in bytes, save.npm_ci in seconds. Pando also splits
+save.time: save.unmount, save.detach and save.exit (the end of `pando attach`); within the
+detach, attach's publish times (save.flush, save.wait, and save.pack and save.ref of the last
+upload pass); the bytes the device took during npm ci (save.run_written) and during the unmount
+(save.unmount_written); the page cache's dirty bytes before the unmount (save.dirty); and the
+upload passes and segment bytes before the detach (save.passes_before, save.bytes_before) and
+during it (save.passes, save.bytes); and the reads that waited for the store while the branch
+was attached (save.stalls, save.stall in seconds, save.fetched_bytes).
 """
 
 import argparse
@@ -43,6 +50,7 @@ class Saver[W: start.Workspace]:
     def __init__(self, s: W) -> None:
         """Save branches of s."""
         self.s = s
+        self.split: dict[str, float] = {}
 
     def before(self) -> int:
         """Return the store bytes before `npm ci`, for systems that measure growth."""
@@ -70,7 +78,7 @@ class PandoSaver(Saver[start.Pando]):
 
     @override
     def save(self, i: int) -> int | None:
-        self.s.close(i)
+        self.split = self.s.close_timed(i)
 
     @override
     def after(self, i: int) -> None:
@@ -283,6 +291,7 @@ class S3FilesSaver(Saver[start.S3Files]):
 
 SYSTEMS: dict[str, tuple[type[start.Workspace], type[Saver]]] = {
     "pando": (start.Pando, PandoSaver),
+    "pando-capped": (start.PandoCapped, PandoSaver),
     "tar": (start.Tar, TarSaver),
     "docker": (start.Docker, DockerSaver),
     "ebs": (start.Ebs, EbsSaver),
@@ -311,7 +320,19 @@ def save_once(s: start.Workspace, saver: Saver, i: int, rep: int, out: Results) 
     note = f"rep {rep}"
     out.add(s.name, "save.time", rep, t, "s", note)
     out.add(s.name, "save.uploaded", rep, uploaded, "B", note)
+    for key, value in saver.split.items():
+        if key != "total":
+            out.add(s.name, f"save.{key}", rep, value, split_unit(key), note)
     log(f"{s.name}: save rep {rep}: {t:.2f} s, {uploaded / 2**20:.1f} MiB")
+
+
+def split_unit(key: str) -> str:
+    """Return the unit of the save row named save.<key>."""
+    if key.startswith("passes") or key == "stalls":
+        return "n"
+    if "bytes" in key or key.endswith("written") or key == "dirty":
+        return "B"
+    return "s"
 
 
 def measure(names: list[str], reps: int) -> None:

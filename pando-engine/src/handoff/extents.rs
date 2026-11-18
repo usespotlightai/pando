@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use pando_format::CHUNK_SIZE;
 
+use super::SnapshotOptions;
 use crate::ports::Extent;
 
 const CHUNK: u64 = CHUNK_SIZE as u64;
@@ -12,18 +13,22 @@ const CHUNK: u64 = CHUNK_SIZE as u64;
 pub(crate) const SNAPSHOT_GAP: Duration = Duration::from_millis(500);
 
 /// Whether to take a snapshot `since` after the last one ended, with `written` bytes (when
-/// known) reaching the image since: every `every`, or early once `burst` bytes came. The
-/// second value says whether it is early.
+/// known) reaching the image since and none for `quiet`: every `o.every`, or early once
+/// `o.burst` bytes came or once writes came and stopped for `o.idle`. The second value says
+/// whether it is early.
 pub(crate) fn snapshot_due(
     since: Duration,
     written: Option<u64>,
-    every: Duration,
-    burst: u64,
+    quiet: Duration,
+    o: &SnapshotOptions,
 ) -> (bool, bool) {
-    if burst > 0 && written.is_some_and(|w| w >= burst) && since >= SNAPSHOT_GAP {
-        return (true, since < every);
+    if since >= SNAPSHOT_GAP
+        && let Some(w) = written
+        && ((o.burst > 0 && w >= o.burst) || (!o.idle.is_zero() && w > 0 && quiet >= o.idle))
+    {
+        return (true, since < o.every);
     }
-    (since >= every, false)
+    (since >= o.every, false)
 }
 
 fn sorted(es: &[Extent]) -> Vec<Extent> {
@@ -126,21 +131,58 @@ mod tests {
 
     #[test]
     fn snapshots_come_on_time_or_after_a_burst() {
-        let every = Duration::from_secs(30);
+        let o = SnapshotOptions {
+            every: Duration::from_secs(30),
+            burst: 64,
+            ..Default::default()
+        };
+        let busy = Duration::ZERO;
         assert_eq!(
-            snapshot_due(Duration::from_secs(31), None, every, 0),
+            snapshot_due(
+                Duration::from_secs(31),
+                None,
+                busy,
+                &SnapshotOptions { burst: 0, ..o }
+            ),
             (true, false)
         );
         assert_eq!(
-            snapshot_due(Duration::from_secs(1), Some(100), every, 64),
+            snapshot_due(Duration::from_secs(1), Some(100), busy, &o),
             (true, true)
         );
         assert_eq!(
-            snapshot_due(Duration::from_millis(100), Some(100), every, 64),
+            snapshot_due(Duration::from_millis(100), Some(100), busy, &o),
             (false, false)
         );
         assert_eq!(
-            snapshot_due(Duration::from_secs(1), Some(10), every, 64),
+            snapshot_due(Duration::from_secs(1), Some(10), busy, &o),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn a_snapshot_comes_early_once_the_writes_stop() {
+        let o = SnapshotOptions {
+            every: Duration::from_secs(30),
+            idle: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let s = Duration::from_secs(2);
+        assert_eq!(
+            snapshot_due(s, Some(10), Duration::from_secs(1), &o),
+            (true, true)
+        );
+        assert_eq!(
+            snapshot_due(s, Some(10), Duration::from_millis(500), &o),
+            (false, false)
+        );
+        assert_eq!(
+            snapshot_due(s, Some(0), Duration::from_secs(5), &o),
+            (false, false)
+        );
+        assert_eq!(snapshot_due(s, None, Duration::from_secs(5), &o), (false, false));
+        assert_eq!(
+            snapshot_due(Duration::from_millis(100), Some(10), Duration::from_secs(5), &o),
             (false, false)
         );
     }

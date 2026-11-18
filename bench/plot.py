@@ -209,6 +209,7 @@ TO_BASE = {
     "IOPS": ("iops", 1.0),
     "MB/s": ("mbps", 1.0),
     "count": ("count", 1.0),
+    "n": ("count", 1.0),
     "code": ("count", 1.0),
 }
 

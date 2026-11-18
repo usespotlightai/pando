@@ -85,12 +85,14 @@ fn shared(e: Error) -> Arc<Error> {
         | Error::ChunkLost { .. }
         | Error::Store(_)
         | Error::Format(_)
+        | Error::UnknownFormat { .. }
         | Error::Io(_)
         | Error::BeyondEnd
         | Error::Shrink { .. }
         | Error::Corrupt(_)
         | Error::SegmentExists(_)
         | Error::RefExists(_)
+        | Error::CheckpointExists(_)
         | Error::Cancelled) => Arc::new(e),
     }
 }
@@ -251,9 +253,43 @@ impl Cache {
         Ok(b)
     }
 
+    /// Fetches object `e` to this host when it is not here, so a later [`Self::read`] of it
+    /// needs no store. Counts no hit.
+    pub(crate) async fn warm(&self, e: &Entry) -> Result<()> {
+        self.read_counted(e, 0, 1, false).await.map(drop)
+    }
+
+    /// Whether this host holds object `h` itself, so a read of it needs no store. Counts no hit
+    /// and leaves its age as it is.
+    pub(crate) fn holds(&self, h: &Hash) -> bool {
+        self.log.has(h) || self.base_has(h)
+    }
+
+    /// [`Self::read`] from this host only: `None` when the read would fetch from the store.
+    pub(crate) async fn read_held(&self, e: &Entry, inner: usize, len: usize) -> Result<Option<Bytes>> {
+        let b = match self.log.read_at(&e.hash, inner, len).await? {
+            Some(b) => {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                b
+            }
+            None => match self.base_read(&e.hash, inner, len).await {
+                Some(b) => b,
+                None => return Ok(None),
+            },
+        };
+        self.touched(e);
+        Ok(Some(b))
+    }
+
     async fn read_as(&self, e: &Entry, inner: usize, len: usize) -> Result<Bytes> {
+        self.read_counted(e, inner, len, true).await
+    }
+
+    async fn read_counted(&self, e: &Entry, inner: usize, len: usize, count: bool) -> Result<Bytes> {
         if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            if count {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(b);
         }
         if let Some(b) = self.base_read(&e.hash, inner, len).await {

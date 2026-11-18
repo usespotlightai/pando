@@ -141,6 +141,11 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
                 root: packed,
                 generation,
                 from: None,
+                log: Some(pando_format::LogPos {
+                    generation,
+                    closed: true,
+                    ..pando_format::LogPos::default()
+                }),
             },
         )
         .await?;
@@ -192,6 +197,7 @@ mod tests {
         store.inject(sim::Fault {
             op: sim::StoreOp::Create,
             applied: false,
+            permanent: false,
         });
         assert!(import(&ports, &c, "main", Path::new("/img/disk")).await.is_err());
         assert!(c.remote().get_ref("main").await.unwrap().is_none());
