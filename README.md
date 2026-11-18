@@ -1,5 +1,8 @@
 # Pando
 
+[![xfstests](https://img.shields.io/github/actions/workflow/status/usespotlightai/pando/kernel.yml?event=schedule&label=xfstests)](https://github.com/usespotlightai/pando/actions/workflows/kernel.yml?query=event%3Aschedule)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+
 Writable branches of a large workspace for AI agents, stored in S3.
 
 Each agent run needs its own copy of a repository and everything installed in it, often on a
