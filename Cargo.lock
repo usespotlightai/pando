@@ -1151,6 +1151,7 @@ dependencies = [
  "pando-host",
  "pando-linux",
  "pando-s3",
+ "tempfile",
  "tokio",
 ]
 
@@ -1230,6 +1231,7 @@ dependencies = [
  "object_store",
  "pando-engine",
  "parking_lot 0.13.0",
+ "thiserror",
  "tokio",
 ]
 

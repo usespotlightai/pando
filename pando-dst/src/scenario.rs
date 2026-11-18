@@ -4,9 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use pando_engine::ports::Rng;
+use pando_engine::ports::{Rng, StoreError};
 use pando_engine::sim::{self, Fault, SimFs, SimRng, SimStore, StoreOp};
-use pando_engine::{Cache, LogMode, Ports, Volume};
+use pando_engine::{Cache, Error, LogMode, Ports, Volume};
 use pando_format::{u64_from, usize_from};
 
 const SIZE: usize = 4 << 20;
@@ -94,6 +94,7 @@ impl World {
         self.store.inject(Fault {
             op,
             applied: self.below(2) == 0,
+            permanent: false,
         });
         self.report.faults += 1;
     }
@@ -220,6 +221,105 @@ fn trace_range(on: bool, what: &str, off: usize, len: usize) {
             (off + len - 1) / CHUNK
         );
     }
+}
+
+fn refused(e: &Error) -> bool {
+    matches!(e.kind(), Error::Store(StoreError::Permanent { .. }))
+}
+
+/// The store refuses one request of the uploader for good at a random step, after a write that
+/// must be uploaded. Every checkpoint from then on fails with the refusal, and the uploader
+/// stops. Nothing is lost: once the store accepts again, a restart publishes every write.
+pub async fn a_refusing_store(seed: u64, steps: usize) -> Result<Report, String> {
+    let (ports, store, fs) = sim::ports(seed);
+    Volume::create(&ports, BRANCH, u64_from(SIZE))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut w = World {
+        ports,
+        store,
+        fs,
+        rng: SimRng::new(seed ^ 0x4e0),
+        model: vec![0; SIZE],
+        flushed: vec![0; SIZE],
+        report: Report::default(),
+    };
+    let v = open(&w.ports, "/host").await?;
+    let refuse_at = w.below(steps);
+    for step in 0..steps {
+        let at = format!("seed {seed} step {step}");
+        if step == refuse_at {
+            let op = if w.below(2) == 0 {
+                StoreOp::Create
+            } else {
+                StoreOp::Update
+            };
+            w.store.inject(Fault {
+                op,
+                applied: false,
+                permanent: true,
+            });
+            w.report.faults += 1;
+            let b = [!w.model[0]];
+            v.write_at(&b, 0).await.map_err(|e| format!("{at}: write: {e}"))?;
+            w.model[0] = b[0];
+            w.report.writes += 1;
+        }
+        match w.below(100) {
+            0..60 => {
+                let (off, len) = w.range();
+                let b = w.bytes(len);
+                v.write_at(&b, u64_from(off))
+                    .await
+                    .map_err(|e| format!("{at}: write: {e}"))?;
+                w.model[off..off + len].copy_from_slice(&b);
+                w.report.writes += 1;
+            }
+            60..80 => {
+                v.flush().await.map_err(|e| format!("{at}: flush: {e}"))?;
+                w.report.flushes += 1;
+            }
+            80..90 => {
+                match v.checkpoint().await {
+                    Ok(()) if step < refuse_at => {}
+                    Ok(()) => return Err(format!("{at}: a checkpoint after the refusal passed")),
+                    Err(e) if step >= refuse_at && refused(&e) => {}
+                    Err(e) => return Err(format!("{at}: checkpoint: {e}")),
+                }
+                w.report.checkpoints += 1;
+            }
+            _ => {
+                let (off, len) = w.range();
+                w.check(&v, off, len, &at).await?;
+            }
+        }
+    }
+    match v.checkpoint().await {
+        Err(e) if refused(&e) => {}
+        r => return Err(format!("seed {seed}: the last checkpoint ended with {r:?}")),
+    }
+    let stopped = v.upload_stopped().await;
+    if !refused(&stopped) {
+        return Err(format!(
+            "seed {seed}: the uploader stopped for another reason: {stopped}"
+        ));
+    }
+    v.close().await;
+    drop(v);
+    let v = open(&w.ports, "/host")
+        .await
+        .map_err(|e| format!("seed {seed}: restart: {e}"))?;
+    v.checkpoint()
+        .await
+        .map_err(|e| format!("seed {seed}: checkpoint after the restart: {e}"))?;
+    v.close().await;
+    let fresh = open(&w.ports, "/fresh").await?;
+    for off in (0..SIZE).step_by(4 * CHUNK) {
+        w.check(&fresh, off, 4 * CHUNK, &format!("seed {seed} fresh host"))
+            .await?;
+    }
+    fresh.close().await;
+    Ok(w.report)
 }
 
 /// Two hosts take the branch in turns. Each open fences the writer before it, which must then

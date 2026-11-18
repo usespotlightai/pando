@@ -47,3 +47,16 @@ async fn a_strict_log_survives_lost_hosts() {
     }
     assert!(flushes > 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_refusing_store_stops_the_uploader_and_loses_nothing() {
+    let mut total = scenario::Report::default();
+    for seed in 0..20 {
+        let r = scenario::a_refusing_store(seed, 60)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        total.checkpoints += r.checkpoints;
+        total.faults += r.faults;
+    }
+    assert!(total.checkpoints > 0 && total.faults == 20, "{total:?}");
+}

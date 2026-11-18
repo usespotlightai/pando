@@ -36,6 +36,9 @@ pub struct Fault {
     pub op: StoreOp,
     /// The write takes effect before the failure.
     pub applied: bool,
+    /// The failure is [`StoreError::Permanent`], as for a request the store refuses; otherwise
+    /// it is [`StoreError::Transient`].
+    pub permanent: bool,
 }
 
 #[derive(Debug)]
@@ -118,17 +121,19 @@ impl SimStore {
         state.faults.remove(i)
     }
 
-    fn transient(key: &str) -> StoreError {
-        StoreError::Transient {
-            key: key.to_string(),
-            source: Box::new(Injected),
+    fn failure(key: &str, f: Fault) -> StoreError {
+        let (key, source) = (key.to_string(), Box::new(Injected));
+        if f.permanent {
+            StoreError::Permanent { key, source }
+        } else {
+            StoreError::Transient { key, source }
         }
     }
 
     fn read(&self, key: &str) -> Result<(Bytes, u64), StoreError> {
         let mut s = self.state.lock();
-        if Self::fault(&mut s, StoreOp::Get).is_some() {
-            return Err(Self::transient(key));
+        if let Some(f) = Self::fault(&mut s, StoreOp::Get) {
+            return Err(Self::failure(key, f));
         }
         s.objects
             .get(key)
@@ -145,8 +150,8 @@ impl SimStore {
     ) -> Result<Version, StoreError> {
         let mut s = self.state.lock();
         let fault = Self::fault(&mut s, op);
-        if fault.is_some_and(|f| !f.applied) {
-            return Err(Self::transient(key));
+        if let Some(f) = fault.filter(|f| !f.applied) {
+            return Err(Self::failure(key, f));
         }
         let current = s.objects.get(key).map(|o| o.version);
         match (op, current, expected) {
@@ -167,8 +172,8 @@ impl SimStore {
                 modified: self.clock.wall(),
             },
         );
-        if fault.is_some() {
-            return Err(Self::transient(key));
+        if let Some(f) = fault {
+            return Err(Self::failure(key, f));
         }
         Ok(Version(version.to_string()))
     }
@@ -218,8 +223,8 @@ impl Store for SimStore {
     async fn list(&self, dir: &str) -> Result<Vec<ObjectInfo>, StoreError> {
         self.round_trip().await;
         let mut s = self.state.lock();
-        if Self::fault(&mut s, StoreOp::List).is_some() {
-            return Err(Self::transient(dir));
+        if let Some(f) = Self::fault(&mut s, StoreOp::List) {
+            return Err(Self::failure(dir, f));
         }
         let prefix = format!("{}/", dir.trim_end_matches('/'));
         Ok(s.objects
@@ -237,12 +242,12 @@ impl Store for SimStore {
         self.round_trip().await;
         let mut s = self.state.lock();
         let fault = Self::fault(&mut s, StoreOp::Delete);
-        if fault.is_some_and(|f| !f.applied) {
-            return Err(Self::transient(key));
+        if let Some(f) = fault.filter(|f| !f.applied) {
+            return Err(Self::failure(key, f));
         }
         s.objects.remove(key);
-        if fault.is_some() {
-            return Err(Self::transient(key));
+        if let Some(f) = fault {
+            return Err(Self::failure(key, f));
         }
         Ok(())
     }
@@ -259,6 +264,7 @@ mod tests {
         s.inject(Fault {
             op: StoreOp::Create,
             applied: true,
+            permanent: false,
         });
         assert!(matches!(
             s.create("k", Bytes::from_static(b"v")).await,

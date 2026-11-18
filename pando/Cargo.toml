@@ -19,5 +19,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 [target.'cfg(target_os = "linux")'.dependencies]
 pando-linux.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

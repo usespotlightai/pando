@@ -132,7 +132,8 @@ enum Command {
     Stat,
     /// Serves a branch as a block device until `detach`, then publishes it.
     Attach(device::AttachArgs),
-    /// Stops the device of an attached branch; returns once the branch is published.
+    /// Stops the device of an attached branch; returns once the branch is published, or fails
+    /// with why the daemon could not publish it.
     Detach(device::DetachArgs),
     /// Grows an attached branch and the devices over it while it serves. The file system on
     /// it keeps its size until it is grown too, with resize2fs for ext4.

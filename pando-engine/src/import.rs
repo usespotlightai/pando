@@ -197,6 +197,7 @@ mod tests {
         store.inject(sim::Fault {
             op: sim::StoreOp::Create,
             applied: false,
+            permanent: false,
         });
         assert!(import(&ports, &c, "main", Path::new("/img/disk")).await.is_err());
         assert!(c.remote().get_ref("main").await.unwrap().is_none());
