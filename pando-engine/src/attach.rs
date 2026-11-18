@@ -374,6 +374,18 @@ impl Attachment {
         })
     }
 
+    /// Publishes what the branch held when the drain began, while the device keeps serving,
+    /// for a daemon that exits and leaves the device to the next one. A handed-off branch is
+    /// snapshotted first. Writes acknowledged later stay on this host: in the journal, or in the
+    /// image after a handoff.
+    pub async fn drain(&self) -> Result<()> {
+        let h = self.handoff.lock().clone();
+        if let Some(h) = h.filter(|h| h.switched()) {
+            h.snapshot_once(&self.volume).await?;
+        }
+        self.volume.checkpoint().await
+    }
+
     /// Publishes what the branch holds and frees it. The device must no longer write to the
     /// image: the caller removed it first.
     pub async fn finish(self) -> Result<FinishReport> {
@@ -664,6 +676,45 @@ mod tests {
         let mut want = vec![5; usize_from(SIZE)];
         want[3 * CHUNK_SIZE..3 * CHUNK_SIZE + 4096].fill(0x33);
         assert_eq!(got, want);
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_publishes_what_the_branch_holds_and_leaves_the_device_serving() {
+        let (ports, _, fs) = sim::ports(14);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let devices = SimDevices::new((*fs).clone());
+        let cache = Arc::new(Cache::open(&ports, Path::new("/c")).await.unwrap());
+        let a = Attachment::open(
+            &ports,
+            Some(Arc::new(devices.clone())),
+            cache,
+            Path::new("/v"),
+            "main",
+            opts(),
+        )
+        .await
+        .unwrap();
+        devices.add_block(Path::new(FRONT), Arc::new(Front(Arc::clone(a.volume()))));
+        devices.create("dm0", Path::new(FRONT), SIZE).await.unwrap();
+        let at = |chunk: usize| (chunk * CHUNK_SIZE) as u64;
+        devices.write("dm0", &[0x11; 4096], at(1)).await.unwrap();
+        a.drain().await.unwrap();
+        a.warm().await.unwrap();
+        a.hand_off().await.unwrap();
+        devices.write("dm0", &[0x22; 4096], at(3)).await.unwrap();
+        a.drain().await.unwrap();
+        devices.write("dm0", &[0x33; 4096], at(5)).await.unwrap();
+
+        let elsewhere = Arc::new(Cache::open(&ports, Path::new("/e")).await.unwrap());
+        let v = Volume::open(&ports, elsewhere, Path::new("/ev"), "main")
+            .await
+            .unwrap();
+        let mut got = vec![0; 4096];
+        for (chunk, want) in [(1, 0x11), (3, 0x22), (5, 0)] {
+            v.read_at(&mut got, at(chunk)).await.unwrap();
+            assert!(got.iter().all(|&b| b == want), "chunk {chunk}");
+        }
         v.close().await;
     }
 }
