@@ -3,6 +3,8 @@ name: kernel
 # The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
 # container (tests/kernel). fio verify, the crash checks, discard and drain run on every push to
 # main; xfstests and the dm-log-writes tests run each night, since the quick group takes hours.
+# The systemd test also runs on every push: on the runner itself, it installs pando with
+# packaging/install.sh and runs a branch under the pando-attach@ unit (tests/systemd).
 # Start any of them by hand from the Actions tab. The nightly run also builds pando with
 # AddressSanitizer and runs fio verify, the crash checks, discard and drain against that build;
 # any sanitizer report fails the job.
@@ -15,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       tests:
-        description: "Tests to run, from tests/kernel"
+        description: "Tests to run, from tests/kernel, or systemd"
         type: string
-        default: "fio-verify crash discard drain"
+        default: "fio-verify crash discard drain systemd"
       asan:
         description: "Build pando with AddressSanitizer"
         type: boolean
@@ -52,10 +54,16 @@ jobs:
           case $EVENT in
             schedule) tests="xfstests log-writes" ;;
             workflow_dispatch) tests=$ASKED ;;
-            *) tests="fio-verify crash discard drain" ;;
+            *) tests="fio-verify crash discard drain systemd" ;;
           esac
-          case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel only" >&2; exit 2 ;; esac
-          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel, or systemd" >&2; exit 2 ;; esac
+          inside=
+          systemd=false
+          for t in $tests; do
+            if [[ $t == systemd ]]; then systemd=true; else inside="$inside $t"; fi
+          done
+          echo "tests=${inside# }" >> "$GITHUB_OUTPUT"
+          echo "systemd=$systemd" >> "$GITHUB_OUTPUT"
 
       - name: Kernel modules
         run: |
@@ -74,9 +82,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build pando
+        id: build
         run: tools/check.sh release
 
       - name: Run the tests
+        if: steps.pick.outputs.tests != ''
         env:
           KERNEL_TESTS: ${{ steps.pick.outputs.tests }}
           PANDO: target/release/pando
@@ -86,6 +96,16 @@ jobs:
           sudo mkdir -p "$DATA"
           read -ra tests <<< "$KERNEL_TESTS"
           tests/kernel/host.sh "${tests[@]}"
+
+      - name: Install, upgrade, crash and detach under systemd
+        if: steps.pick.outputs.systemd == 'true' && !cancelled() && steps.build.outcome == 'success'
+        env:
+          PANDO: target/release/pando
+          RESULTS: ${{ runner.temp }}/kernel-results
+          DATA: /mnt/pando-tests
+        run: |
+          sudo mkdir -p "$DATA"
+          sudo --preserve-env=PANDO,RESULTS,DATA tests/systemd/run.sh
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

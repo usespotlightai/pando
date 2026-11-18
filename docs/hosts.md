@@ -6,15 +6,36 @@ daemon that crashed or drained, and it attaches the branch again after a reboot.
 
 ## Install
 
+Each [release](https://github.com/usespotlightai/pando/releases) has an archive for x86_64 and
+for aarch64 Linux, `install.sh`, and `SHA256SUMS` over all of them. The binaries need glibc
+2.39 or newer (Ubuntu 24.04, Debian 13) and a kernel with ublk. To install release 0.1.0:
+
+```
+curl -fsSLO https://github.com/usespotlightai/pando/releases/download/v0.1.0/install.sh
+curl -fsSLO https://github.com/usespotlightai/pando/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+sudo bash install.sh 0.1.0
+```
+
+`install.sh` fetches the archive for this machine, checks it against `SHA256SUMS`, and unpacks
+it to `/usr/local/lib/pando/<version>`. It points `/usr/local/bin/pando` at it, installs the
+unit, runs `systemctl daemon-reload`, and creates `/etc/pando/attach`. `--from DIR` takes the
+archive and `SHA256SUMS` from a directory instead, for host images built without network access.
+`SHA256SUMS` comes from the same release as the files it covers, so it catches a corrupt
+download, not a release someone replaced. `gh attestation verify <file> --repo
+usespotlightai/pando` checks that a file, `install.sh` or an archive, was built by this
+repository's release workflow from a commit on main.
+
 | Path | Holds |
 |---|---|
-| `/usr/local/bin/pando` | the binary |
+| `/usr/local/lib/pando/<version>/` | each installed release: the binary and the unit |
+| `/usr/local/bin/pando` | a link to the current release's binary |
 | `/etc/systemd/system/pando-attach@.service` | the unit |
 | `/etc/pando/pando.env` | the host's settings, mode 0600: `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and `PANDO_ARGS` for global flags such as `--cache` |
 | `/etc/pando/attach/<name>.env` | one branch: `PANDO_BRANCH`, `PANDO_DEVICE` (`/dev/ublkbN`), and `PANDO_ATTACH_ARGS` for the other `attach` flags, such as `--remote`, `--dm`, `--images` and `--state` |
 
 Credentials go in the env file, never in `PANDO_ARGS` or `PANDO_ATTACH_ARGS`: those end up on
-the command line.
+the command line. Quote a value that holds spaces: `PANDO_ATTACH_ARGS="--state /data/state --dm b1"`.
 
 ## Lifecycle
 
@@ -40,9 +61,14 @@ next daemon replays the journal. A signal that comes before the device serves en
 once, as a crash would. `systemctl stop` alone leaves the device waiting; `detach` is what ends a
 branch.
 
-**Upgrade.** Replace the binary, then run `systemctl restart pando-attach@<name>` for each
-branch. The old daemon drains, and the new binary takes the device over with `--recover=auto`.
-I/O pauses for the drain and the takeover.
+**Upgrade.** Run `install.sh --restart <version>`. It switches `/usr/local/bin/pando` to the
+new release in one rename, so commands started from then on run the new binary while running
+daemons keep theirs. It then restarts each running `pando-attach@` unit in turn: the old daemon
+drains, and the new binary takes the device over with `--recover=auto`. I/O pauses for the drain
+and the takeover; a mounted file system waits rather than fails. Without `--restart`, each daemon
+moves to the new binary at its next restart. To roll back, run `install.sh --restart` with the
+earlier version: it is still in `/usr/local/lib/pando` and is not fetched again. Remove a
+release's directory once no daemon runs it (`ls -l /proc/*/exe | grep /usr/local/lib/pando`).
 
 **Crash.** systemd starts a new daemon at once, and `--recover=auto` takes the device over with
 the requests in flight. The new daemon replays the journal of acknowledged writes, so none is

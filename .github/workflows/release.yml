@@ -1,0 +1,180 @@
+name: release
+
+# release-please keeps a release pull request open on main with the next version, in Cargo.toml
+# and both lock files, and its CHANGELOG.md entries. Merging it tags the commit and creates the
+# release as a draft. This then builds pando for x86_64 and aarch64 Linux on GitHub's Ubuntu
+# 24.04 runners, so the binaries need glibc 2.39 or newer, uploads the archives,
+# packaging/install.sh and SHA256SUMS over all of them to the draft with a build provenance
+# attestation for each, and publishes it. Started by hand, or by a pull request that changes the
+# packaging, it only builds, and keeps the archives as workflow artifacts. Nothing here restores
+# a cache, so no other workflow can change what a release is built from. docs/releasing.md has
+# the details.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - packaging/**
+      - release-please-config.json
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GLIBC_MAX: "2.39"
+
+jobs:
+  release-please:
+    name: Release pull request
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Token of the infrastructure app, so the release pull request runs the checks
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: release-please
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs.release-please.outputs.created == 'true') }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag || github.sha }}
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml, and cargo-auditable as tools/install.sh pins it
+        run: |
+          rustup toolchain install
+          tool=$(grep -o 'cargo-auditable@[0-9.]*' tools/install.sh)
+          cargo install --quiet --locked "$tool"
+
+      - name: Release build with its dependency list embedded
+        run: tools/check.sh release
+
+      - name: Version
+        id: version
+        env:
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          built=$(target/release/pando --version)
+          built=${built#pando }
+          if [[ -n $TAG ]]; then
+            if [[ $TAG != "v$built" ]]; then
+              echo "release $TAG does not match the workspace version $built" >&2
+              exit 1
+            fi
+            version=$built
+          else
+            version=$built-dev.${GITHUB_SHA::12}
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: The binary needs glibc ${{ env.GLIBC_MAX }} at most
+        run: |
+          need=$(objdump -T target/release/pando | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "needs glibc $need"
+          [[ $(printf '%s\n' "$need" "$GLIBC_MAX" | sort -V | tail -1) == "$GLIBC_MAX" ]]
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: packaging/package.sh "$VERSION" "$ARCH" target/release/pando dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pando-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [release-please, build]
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # uploads the files to the draft release and publishes it
+      id-token: write # signs the provenance attestation
+      attestations: write # stores the provenance attestation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pando-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cp packaging/install.sh dist/
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Upload the files and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+          version=${TAG#v}
+          url=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG
+          {
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body
+            echo
+            echo "### Install or upgrade a host"
+            echo
+            echo "[docs/hosts.md](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/hosts.md) has the details."
+            echo
+            echo '```'
+            echo "curl -fsSLO $url/install.sh"
+            echo "curl -fsSLO $url/SHA256SUMS"
+            echo "sha256sum -c --ignore-missing SHA256SUMS"
+            echo "sudo bash install.sh --restart $version"
+            echo '```'
+            echo
+            echo "\`SHA256SUMS\` catches a corrupt download. To check that a file was built by this repository's"
+            echo "release workflow, run \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\` on it."
+            echo "The binaries need Linux with ublk and glibc $GLIBC_MAX or newer."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md" --draft=false
