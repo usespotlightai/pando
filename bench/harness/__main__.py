@@ -1,4 +1,4 @@
-"""Bench harness. Runs on a bench host as root:
+"""Bench harness, run on a bench host as root.
 
     python3 bench/harness workspace                    build the workspace image (once per host)
     python3 bench/harness fork [--systems a,b] [--branches N] [--rep R]
@@ -18,17 +18,22 @@ import start
 import workspace
 
 
-def main():
+def main() -> None:
+    """Parse the command line and run the chosen measure."""
     p = argparse.ArgumentParser(prog="bench/harness")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("workspace", help="build the workspace image")
     f = sub.add_parser("fork", help="the fork measure")
-    f.add_argument("--systems", default=",".join(fork.SYSTEMS), help=f"comma-separated, from {', '.join(fork.SYSTEMS)}")
+    f.add_argument(
+        "--systems",
+        default=",".join(fork.SYSTEMS),
+        help=f"comma-separated, from {', '.join(fork.SYSTEMS)}",
+    )
     f.add_argument("--branches", type=int, default=1000, help="branches per system (capped per system)")
     f.add_argument("--rep", type=int, default=1, help="repetition number written to the results")
-    start.main_args(sub)
+    start.main_args(sub.add_parser)
     more = {"fio": rawio, "save": save, "crash": crash}
-    systems = {k: m.main_args(sub) for k, m in more.items()}
+    systems = {k: m.main_args(sub.add_parser) for k, m in more.items()}
     a = p.parse_args()
 
     if a.command == "workspace":

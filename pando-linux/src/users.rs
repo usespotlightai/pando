@@ -80,15 +80,12 @@ fn unescape(s: &str) -> String {
         let octal = b
             .get(i + 1..i + 4)
             .filter(|d| b[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
-        match octal {
-            Some(d) => {
-                out.push(d.iter().fold(0u8, |n, c| n.wrapping_mul(8) + (c - b'0')));
-                i += 4;
-            }
-            None => {
-                out.push(b[i]);
-                i += 1;
-            }
+        if let Some(d) = octal {
+            out.push(d.iter().fold(0u8, |n, c| n.wrapping_mul(8) + (c - b'0')));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
         }
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -137,8 +134,8 @@ mod tests {
     fn mounts_match_the_device_number_exactly() {
         assert_eq!(mount_points(MOUNTINFO, "259:1"), ["/mnt/ublk one", "/srv/bind"]);
         assert_eq!(mount_points(MOUNTINFO, "259:10"), ["/mnt/other"]);
-        assert!(mount_points(MOUNTINFO, "259:3").is_empty());
-        assert!(mount_points("short line\n", "259:1").is_empty());
+        assert_eq!(mount_points(MOUNTINFO, "259:3"), Vec::<String>::new());
+        assert_eq!(mount_points("short line\n", "259:1"), Vec::<String>::new());
     }
 
     #[test]
@@ -151,7 +148,7 @@ mod tests {
     #[test]
     fn holders_are_the_entries_of_the_directory() {
         let d = tempfile::tempdir().unwrap();
-        assert!(holders(&d.path().join("missing")).unwrap().is_empty());
+        assert_eq!(holders(&d.path().join("missing")).unwrap(), Vec::<String>::new());
         fs::write(d.path().join("dm-3"), "").unwrap();
         fs::write(d.path().join("dm-1"), "").unwrap();
         assert_eq!(holders(d.path()).unwrap(), ["dm-1", "dm-3"]);
@@ -205,13 +202,16 @@ mod tests {
     fn an_unused_device_has_no_users() {
         let root = fake_root(&[]);
         let (found, under_over) = mounts_and_holders_in(root.path(), "259:7", Some("pando-b1")).unwrap();
-        assert!(found.is_empty());
+        assert_eq!(found, Vec::<String>::new());
         assert!(!under_over);
     }
 
     #[test]
     fn a_missing_device_has_no_users() {
-        assert!(users(Path::new("/dev/ublkb987654"), None).unwrap().is_empty());
+        assert_eq!(
+            users(Path::new("/dev/ublkb987654"), None).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

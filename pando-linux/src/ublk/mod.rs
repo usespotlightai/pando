@@ -77,10 +77,15 @@ impl Frontend {
     /// Adds device `id` (or recovers it), serves its queues from `vol` on runtime `rt`, and
     /// starts it.
     pub async fn start(rt: Handle, vol: Arc<Volume>, id: u32, opts: FrontendOptions) -> io::Result<Frontend> {
-        blocking(move || Frontend::start_blocking(rt, vol, id, opts)).await
+        blocking(move || Frontend::start_blocking(&rt, &vol, id, opts)).await
     }
 
-    fn start_blocking(rt: Handle, vol: Arc<Volume>, id: u32, opts: FrontendOptions) -> io::Result<Frontend> {
+    fn start_blocking(
+        rt: &Handle,
+        vol: &Arc<Volume>,
+        id: u32,
+        opts: FrontendOptions,
+    ) -> io::Result<Frontend> {
         let mut c = Ctrl::open()?;
         let (mut queues, mut depth) = (opts.queues.max(1), DEPTH);
         if opts.recover {
@@ -109,7 +114,7 @@ impl Frontend {
                 id,
                 queues,
                 depth,
-                max_io: queue::MAX_IO as u32,
+                max_io: queue::MAX_IO_BYTES,
                 flags,
             })?;
         }
@@ -120,7 +125,7 @@ impl Frontend {
         };
         let started = (|| {
             if !opts.recover {
-                c.set_params(id, vol.size(), queue::MAX_IO as u32)?;
+                c.set_params(id, vol.size(), queue::MAX_IO_BYTES)?;
             }
             let name = format!("ublkc{id}");
             let devt = std::fs::read_to_string(format!("/sys/class/ublk-char/{name}/dev"))?;
@@ -133,14 +138,14 @@ impl Frontend {
                     cdev: fd,
                     q,
                     depth,
-                    vol: vol.clone(),
+                    vol: Arc::clone(vol),
                     rt: rt.clone(),
                 };
                 let tx = tx.clone();
                 fe.queues.push(
                     std::thread::Builder::new()
                         .name(format!("ublk-q{q}"))
-                        .spawn(move || queue.run(tx))?,
+                        .spawn(move || queue.run(&tx))?,
                 );
             }
             for _ in 0..queues {
@@ -151,43 +156,53 @@ impl Frontend {
             } else {
                 ctrl::CMD_START_DEV
             };
-            c.cmd(nr, id, std::process::id() as u64, None)
+            c.cmd(nr, id, u64::from(std::process::id()), None)
         })();
         match started {
             Ok(()) => Ok(fe),
             Err(e) if opts.recover => Err(e),
             Err(e) => {
+                let mut also = Vec::new();
                 if let Err(se) = c.cmd(ctrl::CMD_STOP_DEV, id, 0, None) {
-                    eprintln!("stop ublk device {id}: {se}");
+                    also.push(format!("stop ublk device {id}: {se}"));
                 }
-                join(std::mem::take(&mut fe.queues));
+                if let Err(qe) = join(std::mem::take(&mut fe.queues)) {
+                    also.push(qe.to_string());
+                }
                 fe.cdev = None;
                 if let Err(de) = c.cmd(ctrl::CMD_DEL_DEV, id, 0, None) {
-                    eprintln!("delete ublk device {id}: {de}");
+                    also.push(format!("delete ublk device {id}: {de}"));
                 }
-                Err(e)
+                if also.is_empty() {
+                    Err(e)
+                } else {
+                    Err(io::Error::new(e.kind(), format!("{e}; then {}", also.join("; "))))
+                }
             }
         }
     }
 
+    /// The number of the device, N of `/dev/ublkbN`.
     pub fn id(&self) -> u32 {
         self.id
     }
 
-    /// Waits until the device stops, which ends every queue.
-    pub async fn stopped(&mut self) {
+    /// Waits until the device stops, which ends every queue. The error names each queue that
+    /// ended with one.
+    pub async fn stopped(&mut self) -> io::Result<()> {
         let queues = std::mem::take(&mut self.queues);
-        let _ = tokio::task::spawn_blocking(move || join(queues)).await;
+        blocking(move || join(queues)).await
     }
 
     /// Stops and deletes the device this frontend started, when the start of what sits on it
-    /// failed.
+    /// failed. A queue that ended with an error does not keep the device from being deleted.
     pub async fn abort(mut self) -> io::Result<()> {
         let id = self.id;
         blocking(move || Ctrl::open()?.cmd(ctrl::CMD_STOP_DEV, id, 0, None)).await?;
-        self.stopped().await;
+        let stopped = self.stopped().await;
         drop(self.cdev.take());
-        blocking(move || Ctrl::open()?.cmd(ctrl::CMD_DEL_DEV, id, 0, None)).await
+        blocking(move || Ctrl::open()?.cmd(ctrl::CMD_DEL_DEV, id, 0, None)).await?;
+        stopped
     }
 }
 
@@ -203,21 +218,45 @@ impl Drop for Frontend {
     }
 }
 
-fn join(queues: Vec<JoinHandle<io::Result<()>>>) {
+fn join(queues: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    let mut failed = Vec::new();
     for (q, t) in queues.into_iter().enumerate() {
         match t.join() {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("ublk queue {q}: {e}"),
-            Err(_) => eprintln!("ublk queue {q} panicked"),
+            Ok(Err(e)) => failed.push(format!("ublk queue {q}: {e}")),
+            Err(_) => failed.push(format!("ublk queue {q} panicked")),
         }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(failed.join("; ")))
     }
 }
 
 /// Whether the daemon of device `id` died: ublk holds its I/O (quiesced) or fails it.
 pub async fn daemon_dead(id: u32) -> io::Result<bool> {
-    blocking(move || {
-        let s = Ctrl::open()?.info(id)?.state;
-        Ok(s == ctrl::STATE_QUIESCED || s == ctrl::STATE_FAIL_IO)
+    Ok(daemon(id).await? == Daemon::Dead)
+}
+
+/// What serves device `id`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Daemon {
+    /// There is no device `id`, as after a reboot.
+    NoDevice,
+    /// A daemon serves the device, or one is starting it.
+    Alive,
+    /// The daemon died: ublk holds the device's I/O (quiesced) or fails it.
+    Dead,
+}
+
+/// What serves device `id`.
+pub async fn daemon(id: u32) -> io::Result<Daemon> {
+    blocking(move || match Ctrl::open()?.info(id) {
+        Ok(i) if i.state == ctrl::STATE_QUIESCED || i.state == ctrl::STATE_FAIL_IO => Ok(Daemon::Dead),
+        Ok(_) => Ok(Daemon::Alive),
+        Err(e) if e.raw_os_error() == Some(libc::ENODEV) => Ok(Daemon::NoDevice),
+        Err(e) => Err(e),
     })
     .await
 }
@@ -334,9 +373,8 @@ mod tests {
     fn a_call_that_never_returns_times_out() {
         let t0 = Instant::now();
         let e = within(Duration::from_millis(50), || -> io::Result<()> {
-            loop {
-                std::thread::park();
-            }
+            std::thread::sleep(Duration::from_secs(3600));
+            Ok(())
         })
         .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);

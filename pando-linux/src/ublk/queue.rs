@@ -17,7 +17,9 @@ use tokio::runtime::Handle;
 
 use crate::sys::{self, Mapping};
 
-pub(crate) const MAX_IO: usize = 512 << 10;
+/// The largest request, in bytes.
+pub(crate) const MAX_IO_BYTES: u32 = 512 << 10;
+pub(crate) const MAX_IO: usize = MAX_IO_BYTES as usize;
 /// The largest queue depth ublk allows, which sets the stride of the descriptor areas.
 const MAX_QUEUE_DEPTH: usize = 4096;
 const DESC_LEN: usize = 24;
@@ -35,7 +37,7 @@ const IO_F_FUA: u32 = 1 << 13;
 const EFD_TAG: u64 = 1 << 63;
 
 fn io_op(nr: u32) -> u32 {
-    sys::ioc(3, b'u', nr, 16) as u32
+    sys::ioc32(3, b'u', nr, 16)
 }
 
 /// One request, as its descriptor gives it.
@@ -53,6 +55,11 @@ impl Request {
 
     fn has_data(&self) -> bool {
         matches!(self.op(), OP_READ | OP_WRITE)
+    }
+
+    /// Whether the queue can serve it: data fits a tag's buffer and the length fits the result.
+    fn fits(&self) -> bool {
+        (!self.has_data() || self.len <= MAX_IO) && i32::try_from(self.len).is_ok()
     }
 }
 
@@ -88,17 +95,31 @@ async fn handle(vol: &Volume, r: Request, buf: Option<&mut [u8]>) -> i32 {
         (OP_DISCARD | OP_WRITE_ZEROES, _) => vol.zero(r.off, r.len as u64).await,
         _ => return -libc::EINVAL,
     };
-    result(done, r.len as i32)
+    result(done, done_len(r))
+}
+
+/// The result that completes `r`: its length. The queue fails a request that does not
+/// [`Request::fits`] before it runs, so the fallback is never reported.
+fn done_len(r: Request) -> i32 {
+    i32::try_from(r.len).unwrap_or(-libc::EINVAL)
 }
 
 fn result(done: pando_engine::Result<()>, ok: i32) -> i32 {
     match done {
         Ok(()) => ok,
         Err(e) => {
-            eprintln!("ublk io: {e}");
+            log(format_args!("ublk io: {e}"));
             -libc::EIO
         }
     }
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "queue threads and I/O tasks have no caller to return a diagnostic to; the daemon's stderr is its log"
+)]
+fn log(msg: std::fmt::Arguments<'_>) {
+    eprintln!("{msg}");
 }
 
 /// A read served on the queue thread, when memory and the page cache hold it.
@@ -107,7 +128,7 @@ fn try_read(vol: &Volume, r: Request, buf: &mut [u8]) -> Option<i32> {
         return None;
     }
     match vol.try_read_at(buf, r.off) {
-        Ok(true) => Some(r.len as i32),
+        Ok(true) => Some(done_len(r)),
         Ok(false) => None,
         Err(e) => Some(result(Err(e), 0)),
     }
@@ -150,18 +171,18 @@ pub(crate) struct Queue {
 }
 
 struct Ring {
-    ring: IoUring,
+    uring: IoUring,
     cdev: RawFd,
     q: u16,
     bufs: *mut u8,
 }
 
 impl Ring {
-    fn push(&mut self, e: squeue::Entry) -> io::Result<()> {
+    fn push(&mut self, e: &squeue::Entry) -> io::Result<()> {
         // SAFETY: each entry's buffers (a tag's data buffer, the eventfd counter) live until
         // the queue ends, after its last completion.
-        while unsafe { self.ring.submission().push(&e) }.is_err() {
-            self.ring.submit()?;
+        while unsafe { self.uring.submission().push(e) }.is_err() {
+            self.uring.submit()?;
         }
         Ok(())
     }
@@ -176,21 +197,21 @@ impl Ring {
         let e = opcode::UringCmd16::new(types::Fd(self.cdev), io_op(nr))
             .cmd(cmd)
             .build()
-            .user_data(tag as u64);
-        self.push(e)
+            .user_data(u64::from(tag));
+        self.push(&e)
     }
 
     fn arm_eventfd(&mut self, efd: &OwnedFd, counter: *mut u8) -> io::Result<()> {
         let e = opcode::Read::new(types::Fd(efd.as_raw_fd()), counter, 8)
             .build()
             .user_data(EFD_TAG);
-        self.push(e)
+        self.push(&e)
     }
 
     fn wait(&mut self) -> io::Result<()> {
         loop {
-            match self.ring.submit_and_wait(1) {
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            match self.uring.submit_and_wait(1) {
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 r => return r.map(drop),
             }
         }
@@ -204,12 +225,12 @@ fn round_up(n: usize, to: usize) -> usize {
 impl Queue {
     /// Serves the queue until the device stops. `ready` gets the result of the setup, before
     /// the device may start.
-    pub(crate) fn run(self, ready: mpsc::Sender<io::Result<()>>) -> io::Result<()> {
+    pub(crate) fn run(self, ready: &mpsc::Sender<io::Result<()>>) -> io::Result<()> {
         let q = self.q;
         if (q as usize) < sys::cpu_count()
             && let Err(e) = sys::pin_to_cpu(q as usize)
         {
-            eprintln!("ublk queue {q}: pin to CPU {q}: {e}");
+            log(format_args!("ublk queue {q}: pin to CPU {q}: {e}"));
         }
         let setup = (|| {
             let page = sys::page_size();
@@ -218,7 +239,7 @@ impl Queue {
                 (q as usize * round_up(MAX_QUEUE_DEPTH * DESC_LEN, page)) as u64,
                 round_up(self.depth as usize * DESC_LEN, page),
             )?;
-            let ring = IoUring::new(4 * self.depth as u32)?;
+            let ring = IoUring::new(4 * u32::from(self.depth))?;
             Ok::<_, io::Error>((descs, ring, sys::eventfd()?))
         })();
         let (descs, ring, efd) = match setup {
@@ -231,7 +252,7 @@ impl Queue {
         let mut bufs = vec![0u8; self.depth as usize * MAX_IO].into_boxed_slice();
         let mut counter = Box::new([0u8; 8]);
         let mut r = Ring {
-            ring,
+            uring: ring,
             cdev: self.cdev,
             q,
             bufs: bufs.as_mut_ptr(),
@@ -241,14 +262,14 @@ impl Queue {
                 r.io_cmd(IO_FETCH, tag, -1)?;
             }
             r.arm_eventfd(&efd, counter.as_mut_ptr())?;
-            r.ring.submit()
+            r.uring.submit()
         })();
         if let Err(e) = started {
             let _ = ready.send(Err(io::Error::new(e.kind(), e.to_string())));
             return Err(e);
         }
         let _ = ready.send(Ok(()));
-        let served = self.serve(&mut r, &descs, Arc::new(efd), counter.as_mut_ptr());
+        let served = self.serve(&mut r, &descs, &Arc::new(efd), counter.as_mut_ptr());
         drop(r);
         drop(bufs);
         served
@@ -261,12 +282,12 @@ impl Queue {
             return;
         }
         let batch = std::mem::take(started);
-        let (vol, out) = (self.vol.clone(), out.clone());
+        let (vol, out) = (Arc::clone(&self.vol), out.clone());
         self.rt.spawn(async move {
             let mut batch = batch.into_iter();
             let first = batch.next();
             for (tag, req, buf) in batch {
-                tokio::spawn(run(vol.clone(), out.clone(), tag, req, buf));
+                tokio::spawn(run(Arc::clone(&vol), out.clone(), tag, req, buf));
             }
             if let Some((tag, req, buf)) = first {
                 run(vol, out, tag, req, buf).await;
@@ -274,12 +295,12 @@ impl Queue {
         });
     }
 
-    fn serve(&self, r: &mut Ring, descs: &Mapping, efd: Arc<OwnedFd>, counter: *mut u8) -> io::Result<()> {
+    fn serve(&self, r: &mut Ring, descs: &Mapping, efd: &Arc<OwnedFd>, counter: *mut u8) -> io::Result<()> {
         let _rt = self.rt.enter();
         let (tx, rx) = mpsc::channel::<(u16, i32)>();
         let out = Results {
             tx,
-            efd: efd.clone(),
+            efd: Arc::clone(efd),
             pending: Arc::default(),
         };
         let mut started = Vec::with_capacity(self.depth as usize);
@@ -292,7 +313,7 @@ impl Queue {
                 break;
             }
             batch.clear();
-            batch.extend(r.ring.completion().map(|c| (c.user_data(), c.result())));
+            batch.extend(r.uring.completion().map(|c| (c.user_data(), c.result())));
             let new = batch.iter().filter(|(u, res)| *u != EFD_TAG && *res == 0).count();
             for &(user, res) in &batch {
                 if user == EFD_TAG {
@@ -303,19 +324,24 @@ impl Queue {
                             failed.get_or_insert(e);
                         }
                     }
-                    if let Err(e) = r.arm_eventfd(&efd, counter) {
+                    if let Err(e) = r.arm_eventfd(efd, counter) {
                         failed.get_or_insert(e);
                     }
                     continue;
                 }
-                let tag = user as u16;
+                let Some(tag) = u16::try_from(user).ok().filter(|&t| t < self.depth) else {
+                    failed.get_or_insert_with(|| {
+                        io::Error::other(format!("ublk queue {}: completion of unknown tag {user}", self.q))
+                    });
+                    continue;
+                };
                 if res != 0 {
                     if res != -libc::ENODEV {
-                        eprintln!(
+                        log(format_args!(
                             "ublk queue {} tag {tag}: {}",
                             self.q,
                             io::Error::from_raw_os_error(-res)
-                        );
+                        ));
                     }
                     active -= 1;
                     continue;
@@ -323,11 +349,11 @@ impl Queue {
                 let at = tag as usize * DESC_LEN;
                 let head = descs.read_u64(at);
                 let req = Request {
-                    op_flags: head as u32,
+                    op_flags: (head & 0xffff_ffff) as u32,
                     len: ((head >> 32) as usize) << 9,
                     off: descs.read_u64(at + 8) << 9,
                 };
-                if req.has_data() && req.len > MAX_IO {
+                if !req.fits() {
                     if let Err(e) = r.io_cmd(IO_COMMIT_AND_FETCH, tag, -libc::EINVAL) {
                         failed.get_or_insert(e);
                     }
@@ -365,13 +391,28 @@ mod tests {
 
     #[test]
     fn io_ioctls_match_the_kernel() {
-        assert_eq!(io_op(IO_FETCH), 0xc0107520);
-        assert_eq!(io_op(IO_COMMIT_AND_FETCH), 0xc0107521);
+        assert_eq!(io_op(IO_FETCH), 0xc010_7520);
+        assert_eq!(io_op(IO_COMMIT_AND_FETCH), 0xc010_7521);
     }
 
     #[test]
     fn descriptor_areas_are_page_aligned() {
         assert_eq!(round_up(64 * DESC_LEN, 4096), 4096);
         assert_eq!(round_up(MAX_QUEUE_DEPTH * DESC_LEN, 4096), 24 * 4096);
+    }
+
+    #[test]
+    fn requests_fit_a_buffer_and_a_result() {
+        let r = |op, len| Request {
+            op_flags: op,
+            off: 0,
+            len,
+        };
+        assert!(r(OP_READ, MAX_IO).fits());
+        assert!(!r(OP_WRITE, MAX_IO + 512).fits());
+        assert!(r(OP_DISCARD, 1 << 30).fits());
+        assert!(!r(OP_DISCARD, (u32::MAX as usize) << 9).fits());
+        assert!(!r(OP_WRITE_ZEROES, 1 << 31).fits());
+        assert!(r(OP_FLUSH, 0).fits());
     }
 }

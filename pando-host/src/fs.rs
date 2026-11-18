@@ -136,7 +136,7 @@ struct HostFile {
 #[async_trait]
 impl LocalFile for HostFile {
     async fn read_at(&self, len: usize, offset: u64) -> io::Result<Bytes> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || {
             let mut buf = BytesMut::zeroed(len);
             let mut got = 0;
@@ -165,7 +165,7 @@ impl LocalFile for HostFile {
     }
 
     async fn write_at(&self, bufs: Vec<Bytes>, offset: u64) -> io::Result<()> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || {
             let mut at = offset;
             for b in bufs {
@@ -182,17 +182,17 @@ impl LocalFile for HostFile {
     }
 
     async fn sync_data(&self) -> io::Result<()> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || f.sync_data()).await
     }
 
     async fn set_len(&self, len: u64) -> io::Result<()> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || f.set_len(len)).await
     }
 
     async fn size(&self) -> io::Result<u64> {
-        let f = self.file.clone();
+        let f = Arc::clone(&self.file);
         blocking(move || {
             let m = f.metadata()?;
             if m.file_type().is_block_device() {
@@ -206,7 +206,7 @@ impl LocalFile for HostFile {
     async fn start_writeback(&self) {
         #[cfg(target_os = "linux")]
         {
-            let f = self.file.clone();
+            let f = Arc::clone(&self.file);
             let _ = blocking(move || {
                 crate::linux::start_writeback(&f);
                 Ok(())
@@ -224,10 +224,10 @@ impl LocalFile for HostFile {
 }
 
 fn copy_range(src: &File, dst: &File, start: u64, end: u64) -> io::Result<()> {
-    let mut buf = vec![0u8; (1 << 20).min(end - start) as usize];
+    let mut buf = vec![0u8; usize::try_from(end - start).map_or(1 << 20, |r| r.min(1 << 20))];
     let mut at = start;
     while at < end {
-        let n = buf.len().min((end - at) as usize);
+        let n = usize::try_from(end - at).map_or(buf.len(), |r| r.min(buf.len()));
         src.read_exact_at(&mut buf[..n], at)?;
         dst.write_all_at(&buf[..n], at)?;
         at += n as u64;
@@ -387,7 +387,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("a"), dir.path().join("b"));
         let mut want = vec![0u8; (3 << 16) + 100];
-        let src: Vec<u8> = (0..want.len()).map(|i| (i % 251) as u8 + 1).collect();
+        let src: Vec<u8> = (0..want.len())
+            .map(|i| u8::try_from(i % 251).unwrap() + 1)
+            .collect();
         let f = HostFs.open(&a, Open::CreateNew).await.unwrap();
         f.write_at(vec![Bytes::from(src.clone())], 0).await.unwrap();
         f.sync_data().await.unwrap();

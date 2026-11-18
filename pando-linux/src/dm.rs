@@ -1,5 +1,6 @@
 //! The [`DeviceSwitch`] port over device-mapper ioctls and loop devices.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -8,7 +9,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,7 +21,8 @@ use crate::sys;
 /// thin-provisioning-tools.
 const ERA_INVALIDATE: &str = "era_invalidate";
 
-const DM_IOCTL_LEN: usize = 312;
+const DM_IOCTL_SIZE: u32 = 312;
+const DM_IOCTL_LEN: usize = DM_IOCTL_SIZE as usize;
 const DM_SPEC_LEN: usize = 40;
 const DM_DATA_LEN: usize = 16 << 10;
 const DM_NAME_LEN: usize = 128;
@@ -56,7 +58,7 @@ const SUSPEND_FLAGS: u32 = DM_SUSPEND_FLAG | DM_SKIP_LOCKFS_FLAG;
 const USABLE_WAIT: Duration = Duration::from_secs(30);
 
 fn dm_op(nr: u32) -> libc::c_ulong {
-    sys::ioc(3, 0xfd, nr, DM_IOCTL_LEN as u32)
+    sys::ioc(3, 0xfd, nr, DM_IOCTL_SIZE)
 }
 
 /// One target of a device-mapper table.
@@ -77,12 +79,23 @@ struct Reply {
     dev: u64,
 }
 
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"))
+fn field<const N: usize>(b: &[u8], at: usize) -> io::Result<[u8; N]> {
+    b.get(at..)
+        .and_then(<[u8]>::first_chunk::<N>)
+        .copied()
+        .ok_or_else(|| io::Error::other("short device-mapper reply"))
 }
 
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
+fn le32(b: &[u8], at: usize) -> io::Result<u32> {
+    field(b, at).map(u32::from_le_bytes)
+}
+
+fn le64(b: &[u8], at: usize) -> io::Result<u64> {
+    field(b, at).map(u64::from_le_bytes)
+}
+
+fn len32(n: usize) -> io::Result<u32> {
+    u32::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -109,7 +122,7 @@ fn encode(name: &str, flags: u32, targets: &[Target]) -> io::Result<Vec<u8>> {
         spec[0..8].copy_from_slice(&t.start.to_le_bytes());
         spec[8..16].copy_from_slice(&t.sectors.to_le_bytes());
         if i + 1 < targets.len() {
-            spec[20..24].copy_from_slice(&((DM_SPEC_LEN + p.len()) as u32).to_le_bytes());
+            spec[20..24].copy_from_slice(&len32(DM_SPEC_LEN + p.len())?.to_le_bytes());
         }
         let kind = t.kind.as_bytes();
         spec[24..24 + kind.len().min(15)].copy_from_slice(&kind[..kind.len().min(15)]);
@@ -117,28 +130,28 @@ fn encode(name: &str, flags: u32, targets: &[Target]) -> io::Result<Vec<u8>> {
         b.extend_from_slice(&p);
     }
     b.resize(DM_IOCTL_LEN + DM_DATA_LEN.max(b.len() - DM_IOCTL_LEN), 0);
-    let len = b.len() as u32;
+    let len = len32(b.len())?;
     b[0..4].copy_from_slice(&DM_VERSION_MAJOR.to_le_bytes());
     b[12..16].copy_from_slice(&len.to_le_bytes());
-    b[16..20].copy_from_slice(&(DM_IOCTL_LEN as u32).to_le_bytes());
-    b[20..24].copy_from_slice(&(targets.len() as u32).to_le_bytes());
+    b[16..20].copy_from_slice(&DM_IOCTL_SIZE.to_le_bytes());
+    b[20..24].copy_from_slice(&len32(targets.len())?.to_le_bytes());
     b[28..32].copy_from_slice(&flags.to_le_bytes());
     b[48..48 + name.len()].copy_from_slice(name.as_bytes());
     Ok(b)
 }
 
-fn decode(b: &[u8]) -> Reply {
-    Reply {
-        targets: le32(b, 20),
-        open_count: le32(b, 24) as i32,
-        flags: le32(b, 28),
-        dev: le64(b, 40),
-    }
+fn decode(b: &[u8]) -> io::Result<Reply> {
+    Ok(Reply {
+        targets: le32(b, 20)?,
+        open_count: le32(b, 24)?.cast_signed(),
+        flags: le32(b, 28)?,
+        dev: le64(b, 40)?,
+    })
 }
 
 /// Decodes the targets of a table status reply.
 fn decode_targets(b: &[u8], r: &Reply) -> io::Result<Vec<Target>> {
-    let start = le32(b, 16) as usize;
+    let start = le32(b, 16)? as usize;
     let data = b.get(start..).unwrap_or_default();
     let mut out = Vec::new();
     let mut off = 0;
@@ -147,12 +160,12 @@ fn decode_targets(b: &[u8], r: &Reply) -> io::Result<Vec<Target>> {
             .get(off..off + DM_SPEC_LEN)
             .ok_or_else(|| io::Error::other("short table status"))?;
         out.push(Target {
-            start: le64(spec, 0),
-            sectors: le64(spec, 8),
+            start: le64(spec, 0)?,
+            sectors: le64(spec, 8)?,
             kind: cstr(&spec[24..40]),
             params: cstr(&data[off + DM_SPEC_LEN..]),
         });
-        off = le32(spec, 20) as usize;
+        off = le32(spec, 20)? as usize;
     }
     Ok(out)
 }
@@ -188,17 +201,17 @@ fn encode_message(name: &str, msg: &str) -> io::Result<Vec<u8>> {
 fn target_message(name: &str, msg: &str) -> io::Result<()> {
     dm_send(DM_TARGET_MSG, encode_message(name, msg)?)
         .map(drop)
-        .map_err(|e| ctx(e, &format!("{msg} to {name}")))
+        .map_err(|e| ctx(&e, &format!("{msg} to {name}")))
 }
 
 fn dm(nr: u32, name: &str, flags: u32, targets: &[Target]) -> io::Result<Reply> {
-    dm_call(nr, name, flags, targets).map(|b| decode(&b))
+    dm_call(nr, name, flags, targets).and_then(|b| decode(&b))
 }
 
 /// The targets of the table device `name` serves, not of a loaded inactive one.
 fn live_table(name: &str) -> io::Result<Vec<Target>> {
     let b = dm_call(DM_TABLE_STATUS, name, DM_STATUS_TABLE_FLAG, &[])?;
-    let r = decode(&b);
+    let r = decode(&b)?;
     if r.flags & DM_BUFFER_FULL_FLAG != 0 {
         return Err(io::Error::other(format!(
             "the table of {name} does not fit the buffer"
@@ -300,7 +313,7 @@ fn linear(target: &Path, size: u64) -> io::Result<Vec<Target>> {
     }])
 }
 
-fn mapper_node(name: &str) -> PathBuf {
+pub(crate) fn mapper_node(name: &str) -> PathBuf {
     Path::new("/dev/mapper").join(name)
 }
 
@@ -401,15 +414,15 @@ fn resize_era(name: &str, size: u64) -> io::Result<()> {
         sectors: size >> 9,
         ..t
     }];
-    dm(DM_TABLE_LOAD, name, 0, &table).map_err(|e| ctx(e, "load"))?;
+    dm(DM_TABLE_LOAD, name, 0, &table).map_err(|e| ctx(&e, "load"))?;
     if let Err(e) = dm(DM_DEV_SUSPEND, name, SUSPEND_FLAGS, &[]) {
         let _ = dm(DM_TABLE_CLEAR, name, 0, &[]);
-        return Err(ctx(e, "suspend"));
+        return Err(ctx(&e, "suspend"));
     }
     if let Err(e) = dm(DM_DEV_SUSPEND, name, 0, &[]) {
         let _ = dm(DM_TABLE_CLEAR, name, 0, &[]);
         let _ = dm(DM_DEV_SUSPEND, name, 0, &[]);
-        return Err(ctx(e, "resume"));
+        return Err(ctx(&e, "resume"));
     }
     Ok(())
 }
@@ -426,7 +439,7 @@ fn parse_era_status(status: &str) -> io::Result<u32> {
 
 fn current_era(name: &str) -> io::Result<u32> {
     let b = dm_call(DM_TABLE_STATUS, name, 0, &[])?;
-    let r = decode(&b);
+    let r = decode(&b)?;
     match decode_targets(&b, &r)?.as_slice() {
         [t] if t.kind == "era" => parse_era_status(&t.params),
         _ => Err(io::Error::other(format!("{name} is not an era device"))),
@@ -455,8 +468,8 @@ fn parse_invalidate(xml: &str) -> io::Result<Vec<Range<u64>>> {
     let mut rest = xml.trim_start();
     while !rest.is_empty() {
         let t = rest.strip_prefix('<').ok_or_else(|| bad(rest))?;
-        let end = t.find('>').ok_or_else(|| bad("an unclosed tag"))?;
-        let (tag, after) = (t[..end].trim(), &t[end + 1..]);
+        let (tag, after) = t.split_once('>').ok_or_else(|| bad("an unclosed tag"))?;
+        let tag = tag.trim();
         rest = after.trim_start();
         let (body, empty) = match tag.strip_suffix('/') {
             Some(b) => (b.trim_end(), true),
@@ -539,10 +552,10 @@ fn era_written(name: &str, since: u32) -> io::Result<pando_engine::ports::EraWri
 }
 
 fn create_table(name: &str, table: &[Target]) -> io::Result<()> {
-    let r = dm(DM_DEV_CREATE, name, 0, &[]).map_err(|e| ctx(e, "create"))?;
+    let r = dm(DM_DEV_CREATE, name, 0, &[]).map_err(|e| ctx(&e, "create"))?;
     let undo = |e: io::Error, what: &str| {
         let _ = dm(DM_DEV_REMOVE, name, 0, &[]);
-        ctx(e, what)
+        ctx(&e, what)
     };
     dm(DM_TABLE_LOAD, name, 0, table).map_err(|e| undo(e, "load"))?;
     dm(DM_DEV_SUSPEND, name, 0, &[]).map_err(|e| undo(e, "resume"))?;
@@ -553,7 +566,7 @@ fn create_table(name: &str, table: &[Target]) -> io::Result<()> {
     Ok(())
 }
 
-fn ctx(e: io::Error, what: &str) -> io::Error {
+fn ctx(e: &io::Error, what: &str) -> io::Error {
     io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
@@ -638,7 +651,11 @@ fn attach_loop(image: &Path) -> io::Result<(PathBuf, OwnedFd)> {
     let lf = open_usable(&dev, true, Some(&devt))?;
     let img = OpenOptions::new().read(true).write(true).open(image)?;
     let mut cfg = [0u8; LOOP_CONFIG_LEN];
-    cfg[0..4].copy_from_slice(&(img.as_raw_fd() as u32).to_le_bytes());
+    cfg[0..4].copy_from_slice(
+        &u32::try_from(img.as_raw_fd())
+            .map_err(io::Error::other)?
+            .to_le_bytes(),
+    );
     cfg[4..8].copy_from_slice(&4096u32.to_le_bytes());
     let flags_at = 8 + 52;
     cfg[flags_at..flags_at + 4].copy_from_slice(&(LO_FLAGS_DIRECT_IO | LO_FLAGS_AUTOCLEAR).to_le_bytes());
@@ -696,6 +713,7 @@ pub struct DmSwitch {
 }
 
 impl DmSwitch {
+    /// A switch with no loop devices bound yet.
     pub fn new() -> DmSwitch {
         DmSwitch::default()
     }
@@ -734,10 +752,10 @@ impl DeviceSwitch for DmSwitch {
 
     async fn load(&self, name: &str, target: &Path, size: u64) -> io::Result<()> {
         let (name, target) = (name.to_owned(), target.to_owned());
-        let loops = self.loops.clone();
+        let loops = Arc::clone(&self.loops);
         blocking(move || {
             let done = linear(&target, size).and_then(|t| dm(DM_TABLE_LOAD, &name, 0, &t));
-            loops.lock().expect("loops lock").remove(&target);
+            loops.lock().remove(&target);
             done.map(drop)
         })
         .await
@@ -761,7 +779,7 @@ impl DeviceSwitch for DmSwitch {
     async fn attach_loop(&self, image: &Path) -> io::Result<PathBuf> {
         let image = image.to_owned();
         let (dev, fd) = blocking(move || attach_loop(&image)).await?;
-        self.loops.lock().expect("loops lock").insert(dev.clone(), fd);
+        self.loops.lock().insert(dev.clone(), fd);
         Ok(dev)
     }
 
@@ -789,10 +807,10 @@ impl DeviceSwitch for DmSwitch {
         block: u64,
     ) -> io::Result<PathBuf> {
         let (name, metadata, origin) = (name.to_owned(), metadata.to_owned(), origin.to_owned());
-        let loops = self.loops.clone();
+        let loops = Arc::clone(&self.loops);
         blocking(move || {
             let made = create_era(&name, &metadata, &origin, size, block);
-            let mut l = loops.lock().expect("loops lock");
+            let mut l = loops.lock();
             l.remove(&metadata);
             if made.is_ok() {
                 l.remove(&origin);
@@ -845,7 +863,7 @@ mod tests {
         ];
         let b = encode("pando-main", SUSPEND_FLAGS, &t).unwrap();
         assert_eq!(b.len(), DM_IOCTL_LEN + DM_DATA_LEN);
-        let r = decode(&b);
+        let r = decode(&b).unwrap();
         assert_eq!((r.flags, r.targets), (SUSPEND_FLAGS, 2));
         assert_eq!(cstr(&b[48..176]), "pando-main");
         assert_eq!(decode_targets(&b, &r).unwrap(), t);
@@ -853,8 +871,8 @@ mod tests {
 
     #[test]
     fn ioctl_numbers_match_the_kernel() {
-        assert_eq!(dm_op(DM_TABLE_CLEAR), 0xc138fd0a);
-        assert_eq!(dm_op(DM_DEV_SUSPEND), 0xc138fd06);
+        assert_eq!(dm_op(DM_TABLE_CLEAR), 0xc138_fd0a);
+        assert_eq!(dm_op(DM_DEV_SUSPEND), 0xc138_fd06);
     }
 
     #[test]
@@ -871,10 +889,10 @@ mod tests {
 
     #[test]
     fn a_target_message_follows_its_sector() {
-        assert_eq!(dm_op(DM_TARGET_MSG), 0xc138fd0e);
+        assert_eq!(dm_op(DM_TARGET_MSG), 0xc138_fd0e);
         let b = encode_message("pando-main-era", "take_metadata_snap").unwrap();
-        assert_eq!(le32(&b, 16) as usize, DM_IOCTL_LEN);
-        assert_eq!(le64(&b, DM_IOCTL_LEN), 0);
+        assert_eq!(usize::try_from(le32(&b, 16).unwrap()).unwrap(), DM_IOCTL_LEN);
+        assert_eq!(le64(&b, DM_IOCTL_LEN).unwrap(), 0);
         assert_eq!(cstr(&b[DM_IOCTL_LEN + 8..]), "take_metadata_snap");
         assert!(encode_message("x", "a\0b").is_err());
     }
@@ -944,7 +962,7 @@ mod tests {
         let want = EraDevice {
             path: ep.clone(),
             origin: lp.clone(),
-            metadata: mlp.clone(),
+            metadata: mlp,
         };
         assert_eq!(era(name).unwrap(), Some(want));
         assert_eq!(era(top).unwrap(), None);

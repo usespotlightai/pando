@@ -5,10 +5,10 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use pando_format::{CHUNK_SIZE, Entry, Hash, is_zero};
+use pando_format::{CHUNK_SIZE, Entry, Hash, is_zero, usize_from};
 use tokio::sync::watch;
 
-use super::{CHUNK, ChunkRef, Volume};
+use super::{CHUNK, ChunkRef, Dirty, Volume};
 use crate::Result;
 use crate::dedup::PreparedChunks;
 use crate::flight::bounded;
@@ -25,43 +25,42 @@ impl Volume {
 
     /// Lets an absorb prepare the uploads of the chunks it takes.
     pub(crate) fn set_prepared(&self, p: Option<Arc<PreparedChunks>>) {
-        *self.inner.prepared.lock().expect("prepared lock") = p;
+        *self.inner.prepared.lock() = p;
     }
 
     /// Records the index of every chunk written from now on.
     pub(crate) fn start_tracking(&self) {
-        self.inner.mem.lock().expect("mem lock").track = Some(HashSet::new());
+        self.inner.mem.lock().track = Some(HashSet::new());
     }
 
     /// The chunks written since tracking started or since the last call.
     pub(crate) fn take_tracked(&self) -> Vec<u64> {
-        let mut m = self.inner.mem.lock().expect("mem lock");
+        let mut m = self.inner.mem.lock();
         m.track
             .as_mut()
-            .map(|t| std::mem::take(t).into_iter().collect())
-            .unwrap_or_default()
+            .map_or_default(|t| std::mem::take(t).into_iter().collect())
     }
 
     /// Tracks `idxs` again, as if just written.
     pub(crate) fn keep_tracked(&self, idxs: &[u64]) {
-        if let Some(t) = &mut self.inner.mem.lock().expect("mem lock").track {
+        if let Some(t) = &mut self.inner.mem.lock().track {
             t.extend(idxs);
         }
     }
 
     pub(crate) fn stop_tracking(&self) {
-        self.inner.mem.lock().expect("mem lock").track = None;
+        self.inner.mem.lock().track = None;
     }
 
     /// The chunks written but not committed, the current root, the root the branch opened
     /// at as a root of the same tree, and that tree.
     fn uncommitted(&self) -> (BTreeSet<u64>, Entry, Entry, Arc<Tree>) {
-        let m = self.inner.mem.lock().expect("mem lock");
+        let m = self.inner.mem.lock();
         let mut out: BTreeSet<u64> = m.dirty.keys().copied().collect();
         if let Some(f) = &m.flushing {
             out.extend(f.keys());
         }
-        (out, m.root, m.opened_now, m.tree.clone())
+        (out, m.root, m.opened_now, Arc::clone(&m.tree))
     }
 
     /// The chunks that differ now from the root the branch opened at: committed changes and
@@ -98,7 +97,7 @@ impl Volume {
                 let off = idx * CHUNK;
                 let b = self
                     .inner
-                    .read_chunk(idx, 0, CHUNK.min(size - off) as usize)
+                    .read_chunk(idx, 0, usize_from(CHUNK.min(size - off)))
                     .await?;
                 if !overwrite && is_zero(&b) {
                     return Ok(false);
@@ -135,15 +134,15 @@ impl Volume {
 
     async fn take_chunks(&self, f: &Arc<dyn LocalFile>, path: Option<&Path>, idxs: &[u64]) -> Result<usize> {
         let (size, tree, root) = {
-            let m = self.inner.mem.lock().expect("mem lock");
-            (m.size, m.tree.clone(), m.root)
+            let m = self.inner.mem.lock();
+            (m.size, Arc::clone(&m.tree), m.root)
         };
         let tree = &tree;
         let mut futs = Vec::with_capacity(idxs.len());
         for &idx in idxs.iter().filter(|i| **i * CHUNK < size) {
             futs.push(async move {
                 let off = idx * CHUNK;
-                let n = CHUNK.min(size - off) as usize;
+                let n = usize_from(CHUNK.min(size - off));
                 let got = f.read_at(n, off).await?;
                 let full = got.len() == CHUNK_SIZE;
                 let mut buf = got.to_vec();
@@ -203,52 +202,41 @@ impl Volume {
     }
 
     async fn prepare(&self, h: Hash, b: &[u8]) {
-        let Some(p) = self.inner.prepared.lock().expect("prepared lock").clone() else {
+        let Some(p) = self.inner.prepared.lock().clone() else {
             return;
         };
         let dedup = self.dedup();
-        let next = self.inner.mem.lock().expect("mem lock").flush_seq + 1;
+        let next = self.inner.mem.lock().flush_seq + 1;
         p.add(h, b, dedup, next).await;
     }
 
     async fn drop_write(&self, idx: u64) -> bool {
         let _g = self.inner.stripe(idx).write().await;
-        let mut m = self.inner.mem.lock().expect("mem lock");
+        let mut m = self.inner.mem.lock();
         m.dirty_ref.remove(&idx);
         m.dirty.remove(&idx).is_some()
     }
 
     async fn take_write(&self, idx: u64, buf: Vec<u8>, r: Option<ChunkRef>) {
         let _g = self.inner.stripe(idx).write().await;
-        let mut m = self.inner.mem.lock().expect("mem lock");
-        m.dirty.insert(idx, buf);
-        m.touched.insert(idx);
-        if let Some(t) = &mut m.track {
-            t.insert(idx);
+        let mut m = self.inner.mem.lock();
+        m.written(idx);
+        m.dirty.insert(idx, Dirty::Bytes(buf));
+        if let Some(r) = r {
+            m.dirty_ref.insert(idx, r);
         }
-        match r {
-            Some(r) => m.dirty_ref.insert(idx, r),
-            None => m.dirty_ref.remove(&idx),
-        };
     }
 
     /// Whether a flush recorded chunks as references into the file at `path` that no upload
     /// has published yet.
     pub(crate) fn referenced(&self, path: &Path) -> bool {
-        let seq = self
-            .inner
-            .mem
-            .lock()
-            .expect("mem lock")
-            .ref_seq
-            .get(path)
-            .copied();
+        let seq = self.inner.mem.lock().ref_seq.get(path).copied();
         seq.is_some_and(|s| s > *self.inner.uploaded_seq.borrow())
     }
 
     /// Marks every flush so far as one that references the files at `paths`.
     pub(crate) fn reference_until_published(&self, paths: &[impl AsRef<Path>]) {
-        let mut m = self.inner.mem.lock().expect("mem lock");
+        let mut m = self.inner.mem.lock();
         let seq = m.flush_seq;
         for p in paths {
             let e = m.ref_seq.entry(p.as_ref().to_owned()).or_default();

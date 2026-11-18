@@ -19,9 +19,10 @@ const RECORD: usize = 12;
 pub(crate) struct BlockAt(pub(crate) u32);
 
 impl BlockAt {
-    pub(crate) fn new(chunk: u64, block: usize) -> BlockAt {
-        debug_assert!(chunk < 1 << 28 && block < BLOCKS_PER_CHUNK);
-        BlockAt((chunk as u32) << 4 | block as u32)
+    /// `None` when `chunk` does not fit in 28 bits or `block` is not a block of a chunk.
+    pub(crate) fn new(chunk: u64, block: usize) -> Option<BlockAt> {
+        let (chunk, block) = (u32::try_from(chunk).ok()?, u32::try_from(block).ok()?);
+        (chunk < 1 << 28 && block < 16).then_some(BlockAt(chunk << 4 | block))
     }
 
     pub(crate) fn chunk(self) -> u64 {
@@ -38,8 +39,8 @@ impl BlockAt {
 pub(crate) struct BlockMap(HashMap<BlockKey, BlockAt>);
 
 impl BlockMap {
-    pub(crate) fn get(&self, k: &BlockKey) -> Option<BlockAt> {
-        self.0.get(k).copied()
+    pub(crate) fn get(&self, k: BlockKey) -> Option<BlockAt> {
+        self.0.get(&k).copied()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -55,8 +56,10 @@ impl BlockMap {
             .take(BLOCKS_PER_CHUNK)
             .enumerate()
         {
-            if !is_zero(part) {
-                self.0.entry(BlockKey::of(part)).or_insert(BlockAt::new(idx, blk));
+            if !is_zero(part)
+                && let Some(at) = BlockAt::new(idx, blk)
+            {
+                self.0.entry(BlockKey::of(part)).or_insert(at);
             }
         }
     }
@@ -67,6 +70,10 @@ impl BlockMap {
     }
 
     /// Adds every block of `other` that this map does not have.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "each key of `other` is inserted at most once, so the result does not depend on the order"
+    )]
     pub(crate) fn merge(&mut self, other: BlockMap) {
         for (k, at) in other.0 {
             self.0.entry(k).or_insert(at);
@@ -75,16 +82,20 @@ impl BlockMap {
 
     /// Adds block `blk` of chunk `idx` under key `k`, unless `k` is mapped already.
     pub(crate) fn add(&mut self, k: BlockKey, idx: u64, blk: usize) {
-        self.0.entry(k).or_insert(BlockAt::new(idx, blk));
+        if let Some(at) = BlockAt::new(idx, blk) {
+            self.0.entry(k).or_insert(at);
+        }
     }
 
-    /// Encoding: the magic, then `[key u64][place u32]` per block, little endian.
+    /// Encoding: the magic, then `[key u64][place u32]` per block, little endian, by key.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(MAGIC.len() + self.0.len() * RECORD);
+        let mut records: Vec<(u64, u32)> = self.0.iter().map(|(k, at)| (k.0, at.0)).collect();
+        records.sort_unstable();
+        let mut out = Vec::with_capacity(MAGIC.len() + records.len() * RECORD);
         out.extend_from_slice(MAGIC);
-        for (k, at) in &self.0 {
-            out.extend_from_slice(&k.0.to_le_bytes());
-            out.extend_from_slice(&at.0.to_le_bytes());
+        for (k, at) in records {
+            out.extend_from_slice(&k.to_le_bytes());
+            out.extend_from_slice(&at.to_le_bytes());
         }
         out
     }
@@ -95,11 +106,10 @@ impl BlockMap {
             .ok_or_else(|| Error::Corrupt("the block map has another format".into()))?;
         let (records, _) = body.as_chunks::<RECORD>();
         let mut m = HashMap::with_capacity(records.len());
-        for r in records {
-            let (k, at) = r.split_at(8);
+        for &[k @ .., a0, a1, a2, a3] in records {
             m.insert(
-                BlockKey(u64::from_le_bytes(k.try_into().expect("8 bytes"))),
-                BlockAt(u32::from_le_bytes(at.try_into().expect("4 bytes"))),
+                BlockKey(u64::from_le_bytes(k)),
+                BlockAt(u32::from_le_bytes([a0, a1, a2, a3])),
             );
         }
         Ok(BlockMap(m))
@@ -136,7 +146,7 @@ mod tests {
             1,
             "zero blocks are left out and a repeat keeps its first place"
         );
-        let at = m.get(&BlockKey::of(&chunk[BLOCK_SIZE..2 * BLOCK_SIZE])).unwrap();
+        let at = m.get(BlockKey::of(&chunk[BLOCK_SIZE..2 * BLOCK_SIZE])).unwrap();
         assert_eq!((at.chunk(), at.block()), (5, 1));
         assert_eq!(BlockMap::decode(&m.encode()).unwrap(), m);
         assert!(BlockMap::decode(b"bxi2").is_err());

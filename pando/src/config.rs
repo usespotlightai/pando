@@ -9,9 +9,13 @@ use pando_s3::{S3Config, S3Store};
 /// show in help or errors.
 #[derive(Args, Debug)]
 pub(crate) struct StoreArgs {
-    /// The store: s3://<prefix>.
-    #[arg(long, global = true, default_value = "s3://")]
-    remote: String,
+    /// The store: s3://<prefix> [default: s3://].
+    #[expect(
+        rustdoc::invalid_html_tags,
+        reason = "the comment is the help text, where <...> marks a placeholder"
+    )]
+    #[arg(long, global = true)]
+    remote: Option<String>,
     #[arg(long, env = "S3_BUCKET", hide_env_values = true, global = true)]
     bucket: Option<String>,
     #[arg(long, env = "S3_ENDPOINT", hide_env_values = true, global = true)]
@@ -43,8 +47,13 @@ pub(crate) struct StoreArgs {
 }
 
 impl StoreArgs {
+    /// The store this names: `s3://<prefix>`.
+    pub(crate) fn remote(&self) -> &str {
+        self.remote.as_deref().unwrap_or("s3://")
+    }
+
     pub(crate) fn open(&self) -> Result<Arc<dyn Store>> {
-        let Some(prefix) = self.remote.strip_prefix("s3://") else {
+        let Some(prefix) = self.remote().strip_prefix("s3://") else {
             bail!("--remote must be s3://<prefix>");
         };
         let (Some(bucket), Some(access_key_id), Some(secret_access_key)) =
@@ -66,11 +75,16 @@ impl StoreArgs {
 
     /// A name of the store that tells it apart from other stores and holds no secret.
     pub(crate) fn identity(&self) -> String {
+        self.identity_or(self.remote())
+    }
+
+    /// [`Self::identity`], with `remote` as the store when none was given.
+    pub(crate) fn identity_or(&self, remote: &str) -> String {
         format!(
             "{}|{}|{}",
             self.endpoint.as_deref().unwrap_or_default(),
             self.bucket.as_deref().unwrap_or_default(),
-            self.remote
+            self.remote.as_deref().unwrap_or(remote)
         )
     }
 }

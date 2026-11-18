@@ -1,8 +1,9 @@
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,7 +15,9 @@ use crate::ports::{DeviceSwitch, EraDevice, LocalFs, Open};
 /// A block device the simulated device-mapper can map onto, such as a branch's frontend.
 #[async_trait]
 pub trait SimBlock: Send + Sync {
+    /// Fills `buf` with the bytes at `off`.
     async fn read(&self, buf: &mut [u8], off: u64) -> io::Result<()>;
+    /// Writes `b` at `off`; reads see it once this returns.
     async fn write(&self, b: &[u8], off: u64) -> io::Result<()>;
 }
 
@@ -89,6 +92,7 @@ enum Target {
 }
 
 impl SimDevices {
+    /// No devices yet; loop devices bind to files of `fs`.
     pub fn new(fs: SimFs) -> SimDevices {
         SimDevices {
             fs,
@@ -103,8 +107,8 @@ impl SimDevices {
         d
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().expect("sim devices lock")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, State> {
+        self.state.lock()
     }
 
     /// Makes `block` a device at `path` that tables can map onto.
@@ -112,6 +116,7 @@ impl SimDevices {
         self.lock().blocks.insert(path.to_owned(), block);
     }
 
+    /// Removes the block device at `path`; tables that map onto it fail their I/O.
     pub fn remove_block(&self, path: &Path) {
         self.lock().blocks.remove(path);
     }
@@ -127,7 +132,7 @@ impl SimDevices {
     fn route(&self, name: &str) -> io::Result<(Arc<RwLock<()>>, PathBuf, u64)> {
         let s = self.lock();
         let d = s.devs.get(name).ok_or_else(|| no_device(name))?;
-        Ok((d.io.clone(), d.live.clone(), d.size))
+        Ok((Arc::clone(&d.io), d.live.clone(), d.size))
     }
 
     /// The target of the live table of `name`, for I/O that ends at byte `end`, and the loop
@@ -139,7 +144,7 @@ impl SimDevices {
         }
         let s = self.lock();
         if let Some(b) = s.blocks.get(&live) {
-            return Ok((live, Target::Block(b.clone())));
+            return Ok((live, Target::Block(Arc::clone(b))));
         }
         let mut era = None;
         if let Some((n, e)) = s.eras.iter().find(|(_, e)| e.dev.path == live) {
@@ -147,7 +152,7 @@ impl SimDevices {
                 return Err(beyond(n, end, e.size));
             }
             era = Some(n.clone());
-            live = e.dev.origin.clone();
+            live.clone_from(&e.dev.origin);
         }
         let (image, cap) = s
             .loops
@@ -211,10 +216,12 @@ impl SimDevices {
         }
     }
 
+    /// Whether device `name` holds its I/O after [`DeviceSwitch::suspend`].
     pub fn is_suspended(&self, name: &str) -> bool {
         self.lock().devs.get(name).is_some_and(|d| d.held.is_some())
     }
 
+    /// Whether device `name` has a table [`DeviceSwitch::load`] loaded and no resume swapped in.
     pub fn has_inactive(&self, name: &str) -> bool {
         self.lock().devs.get(name).is_some_and(|d| d.inactive.is_some())
     }
@@ -390,7 +397,9 @@ impl DeviceSwitch for SimDevices {
         if size > cap {
             return Err(beyond(name, size, cap));
         }
-        s.eras.get_mut(name).expect("era checked above").size = size;
+        if let Some(e) = s.eras.get_mut(name) {
+            e.size = size;
+        }
         Ok(())
     }
 

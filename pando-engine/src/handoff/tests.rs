@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use pando_format::CHUNK_SIZE;
+use pando_format::{CHUNK_SIZE, u64_from, usize_from};
 
 use super::adopt::{adopt_leftovers, rejoin};
 use super::*;
@@ -66,7 +66,7 @@ impl Host {
 
     async fn open(&self) -> Arc<Volume> {
         Arc::new(
-            Volume::open(&self.ports, self.cache.clone(), Path::new("/v"), "main")
+            Volume::open(&self.ports, Arc::clone(&self.cache), Path::new("/v"), "main")
                 .await
                 .unwrap(),
         )
@@ -74,7 +74,7 @@ impl Host {
 
     async fn serve(&self, v: &Arc<Volume>) {
         self.devices
-            .add_block(Path::new(FRONT), Arc::new(VolBlock(v.clone())));
+            .add_block(Path::new(FRONT), Arc::new(VolBlock(Arc::clone(v))));
         if self.devices.live_target(DM).await.unwrap().is_none() {
             self.devices.create(DM, Path::new(FRONT), SIZE).await.unwrap();
         }
@@ -82,7 +82,7 @@ impl Host {
 
     async fn write(&self, at_chunk: u64, fill: u8) {
         self.devices
-            .write(DM, &vec![fill; CHUNK_SIZE + 100], at_chunk * CHUNK_SIZE as u64)
+            .write(DM, &vec![fill; CHUNK_SIZE + 100], at_chunk * u64_from(CHUNK_SIZE))
             .await
             .unwrap();
     }
@@ -111,7 +111,7 @@ impl Host {
             .collect();
         out.sort_by_key(|p| {
             let s = p.to_string_lossy();
-            s[s.rfind(".snap").unwrap() + 5..].parse::<u32>().unwrap()
+            s.rsplit_once(".snap").unwrap().1.parse::<u32>().unwrap()
         });
         out
     }
@@ -122,7 +122,7 @@ impl Host {
         let v = Volume::open(&self.ports, c, Path::new("/fresh-v"), "main")
             .await
             .unwrap();
-        let mut b = vec![0; SIZE as usize];
+        let mut b = vec![0; usize_from(SIZE)];
         v.read_at(&mut b, 0).await.unwrap();
         v.close().await;
         let _ = self.ports.fs.remove(Path::new("/fresh-v/state/main")).await;
@@ -131,9 +131,9 @@ impl Host {
 }
 
 fn expect(writes: &[(u64, u8)]) -> Vec<u8> {
-    let mut b = vec![0; SIZE as usize];
+    let mut b = vec![0; usize_from(SIZE)];
     for &(at, fill) in writes {
-        let off = at as usize * CHUNK_SIZE;
+        let off = usize_from(at) * CHUNK_SIZE;
         b[off..off + CHUNK_SIZE + 100].fill(fill);
     }
     b
@@ -167,7 +167,7 @@ async fn moves_the_device_and_publishes_at_detach(seed: u64, eras: bool) {
     host.write(9, 0x99).await;
     host.write(1, 0x12).await;
     let want = expect(&[(1, 0x11), (5, 0x55), (9, 0x99), (1, 0x12)]);
-    let mut got = vec![0; SIZE as usize];
+    let mut got = vec![0; usize_from(SIZE)];
     host.devices.read(DM, &mut got, 0).await.unwrap();
     assert_eq!(got, want);
 
@@ -287,7 +287,7 @@ async fn an_era_snapshot_clones_only_the_chunks_written_since_the_last() {
     v.checkpoint().await.unwrap();
     h.remove(&v).await;
     v.close().await;
-    let mut want = vec![0x5a; SIZE as usize];
+    let mut want = vec![0x5a; usize_from(SIZE)];
     for (at, fill) in [(12usize, 0x12u8), (20, 0x20), (30, 0x30)] {
         want[at * CHUNK_SIZE..at * CHUNK_SIZE + CHUNK_SIZE + 100].fill(fill);
     }
@@ -316,12 +316,12 @@ async fn a_copy_snapshot_reads_the_written_chunks_without_a_clone() {
     tokio::time::sleep(Duration::from_secs(6)).await;
     assert_eq!(h.stats.chunks.load(Ordering::Relaxed), 2, "chunks 12 and 13");
     assert_eq!(h.stats.copied.load(Ordering::Relaxed), 1);
-    assert!(host.clones().await.is_empty());
+    assert_eq!(host.clones().await, Vec::<PathBuf>::new());
 
     host.write(20, 0x20).await;
     tokio::time::sleep(Duration::from_secs(6)).await;
     assert_eq!(h.stats.chunks.load(Ordering::Relaxed), 4, "only chunks 20 and 21");
-    assert!(host.clones().await.is_empty());
+    assert_eq!(host.clones().await, Vec::<PathBuf>::new());
 
     host.write(30, 0x30).await;
     host.devices.remove(DM).await.unwrap();
@@ -342,9 +342,9 @@ fn chunk_writes(first: u64, n: u64, fill: u8) -> Vec<(u64, Vec<u8>)> {
 }
 
 fn chunks_filled(runs: &[(u64, u64, u8)]) -> Vec<u8> {
-    let mut b = vec![0; SIZE as usize];
+    let mut b = vec![0; usize_from(SIZE)];
     for &(first, n, fill) in runs {
-        b[first as usize * CHUNK_SIZE..(first + n) as usize * CHUNK_SIZE].fill(fill);
+        b[usize_from(first) * CHUNK_SIZE..usize_from(first + n) * CHUNK_SIZE].fill(fill);
     }
     b
 }
@@ -366,7 +366,7 @@ async fn a_copy_snapshot_reads_again_what_was_written_while_it_read() {
     assert_eq!(h.stats.copied.load(Ordering::Relaxed), 1);
     assert_eq!(h.stats.postponed.load(Ordering::Relaxed), 0);
     assert_eq!(h.stats.chunks.load(Ordering::Relaxed), 12, "ten, then two again");
-    assert!(host.clones().await.is_empty());
+    assert_eq!(host.clones().await, Vec::<PathBuf>::new());
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 0);
     v.checkpoint().await.unwrap();
@@ -610,7 +610,7 @@ async fn rejoin_after_handoff(host: &Host, v: Arc<Volume>, shared: bool, before:
     tokio::time::sleep(Duration::from_secs(6)).await;
     host.write(5, 0x55).await;
     h.stop.send_replace(true);
-    let task = h.task.lock().expect("task lock").take();
+    let task = h.task.lock().take();
     if let Some(t) = task {
         t.await.unwrap();
     }
@@ -691,5 +691,5 @@ async fn after_a_restart_the_next_attach_adopts_the_image() {
 #[test]
 fn merged_ranges_are_sorted_and_disjoint() {
     assert_eq!(merge(&[4..6, 0..2], &[1..3, 6..7, 9..9]), vec![0..3, 4..7]);
-    assert_eq!(merge(&[], &[]), Vec::<std::ops::Range<u64>>::new());
+    assert_eq!(merge(&[], &[]), Vec::<Range<u64>>::new());
 }

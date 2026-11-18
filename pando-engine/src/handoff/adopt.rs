@@ -174,7 +174,7 @@ pub(crate) async fn rejoin(
     let file = fs.open(&image, Open::ReadWrite).await?;
     let h = Arc::new(Handoff::new(env, dm, image.clone(), file, o.base, opts));
     h.switched.store(true, Ordering::Release);
-    *h.loop_dev.lock().expect("loop lock") = Some(lp);
+    *h.loop_dev.lock() = Some(lp);
     h.owner(v, true).await?;
     {
         let mut s = h.snaps.lock().await;
@@ -197,7 +197,7 @@ pub(crate) async fn rejoin(
     }
     let first = h.snaps.lock().await.prev.is_some();
     if let Some((name, _)) = era {
-        *h.era.lock().expect("era lock") = Some(name.clone());
+        *h.era.lock() = Some(name.clone());
         let mut s = h.snaps.lock().await;
         let base = s.prev.take();
         let path = s.next_path(&image);

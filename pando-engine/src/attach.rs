@@ -9,25 +9,31 @@
 //! image. A grow raises the branch's size while it serves: the volume first, then each device
 //! above it.
 
+use parking_lot::Mutex;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::base::{Bases, BuildOptions, BuildReport, build};
 use crate::cache::{BaseKey, Cache};
 use crate::dedup::learned::{LearnedIndex, Learner};
 use crate::handoff::{self, Handoff, HandoffReport, HostEnv, SnapshotOptions, resize_table};
 use crate::ports::DeviceSwitch;
-use crate::{Ports, Result, Volume, ext4, recording};
+use crate::{CheckpointReport, Error, LogMode, Ports, Result, Volume, ext4, recording};
 
 const BUILD_PARALLEL: usize = 16;
 
 /// How a host serves its branches.
 #[derive(Clone, Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent host option the CLI sets from its own switch"
+)]
 pub struct AttachOptions {
     /// Where handoff images go, with the host's base images in `bases` under it. Without it the
     /// branch is served by the frontend until detach.
@@ -40,7 +46,9 @@ pub struct AttachOptions {
     pub dedup: bool,
     /// Keep uploaded chunks in this directory, and take blocks from them in later runs.
     pub learned: Option<PathBuf>,
+    /// How often a handoff snapshots its image in the background; zero takes none until detach.
     pub snapshot_every: Duration,
+    /// Snapshot early once this many bytes reached the image since the last one; zero never does.
     pub snapshot_bytes: u64,
     /// Snapshot early once writes came and none came for this long; zero never does.
     pub snapshot_idle: Duration,
@@ -58,6 +66,9 @@ pub struct AttachOptions {
     pub hydrate: usize,
     /// Take over a device whose writer died while the kernel served it from an image.
     pub rejoin: bool,
+    /// How the branch logs its flushes to the store. [`LogMode::Strict`] cannot hand off: the
+    /// kernel flushes an image without the branch.
+    pub log: LogMode,
 }
 
 /// What [`Attachment::warm`] did.
@@ -65,40 +76,59 @@ pub struct AttachOptions {
 pub struct WarmReport {
     /// The base image was on this host: no warming.
     pub base_ready: bool,
+    /// Frames fetched for the recording of earlier mounts' first reads.
     pub recorded_frames: usize,
     /// Frames fetched for the ext4 metadata; `None` when the branch holds no ext4 it can read.
     pub metadata_frames: Option<usize>,
+    /// The build of the base image this attach started; `None` when it started none.
     pub base: Option<BuildReport>,
+    /// Frames fetched to bring every chunk of the branch to this host.
     pub hydrated_frames: usize,
 }
 
 /// What [`Attachment::finish`] did.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FinishReport {
     /// Chunks taken back from the image.
     pub absorbed: usize,
     /// Chunks the saved recording lists.
     pub recorded: usize,
+    /// Taking back what the kernel wrote to the image.
+    pub absorb: Duration,
+    /// What the checkpoint that published the branch did.
+    pub checkpoint: CheckpointReport,
+    /// Closing the write log, saving what the run learned and its recording, and closing the
+    /// volume.
+    pub after: Duration,
+    /// Why the write log was left open, when closing it failed. The branch is published all
+    /// the same; the next open reads the log and seals it.
+    pub log_open: Option<String>,
 }
 
 /// What the background snapshots of a handoff did.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotCounts {
+    /// Snapshots that completed.
     pub taken: usize,
     /// Chunks they took back from the image.
     pub chunks: usize,
+    /// Snapshots that failed; the next one retries what they missed.
     pub failed: usize,
+    /// The error of the latest failed snapshot.
     pub last_error: Option<String>,
     /// Snapshots that read the chunks from the image instead of cloning them.
     pub copied: usize,
     /// Snapshots that gave up because writes kept coming.
     pub postponed: usize,
-    /// Time the device spent suspended for snapshots, in all and at most at once.
+    /// Time the device spent suspended for snapshots.
     pub paused: Duration,
+    /// The longest suspend for a snapshot.
     pub max_paused: Duration,
-    /// The longest suspend to begin an era, to read a snapshot's last chunks, and to clone.
+    /// The longest suspend to begin an era.
     pub max_mark: Duration,
+    /// The longest suspend to read a snapshot's last chunks.
     pub max_freeze: Duration,
+    /// The longest suspend to clone a snapshot's last chunks.
     pub max_clone: Duration,
 }
 
@@ -134,7 +164,12 @@ impl Attachment {
         name: &str,
         opts: AttachOptions,
     ) -> Result<Attachment> {
-        let v = Arc::new(Volume::open_then(ports, cache.clone(), dir, name).await?);
+        if opts.log == LogMode::Strict && opts.images.is_some() {
+            return Err(Error::Corrupt(
+                "a strict log needs every flush, so the branch cannot hand off to an image".into(),
+            ));
+        }
+        let v = Arc::new(Volume::open_logged(ports, Arc::clone(&cache), dir, name, opts.log).await?);
         let bases = opts
             .images
             .as_ref()
@@ -145,8 +180,8 @@ impl Attachment {
         let mut a = Attachment {
             ports: ports.clone(),
             devices,
-            cache: cache.clone(),
-            volume: v.clone(),
+            cache: Arc::clone(&cache),
+            volume: Arc::clone(&v),
             opts,
             bases,
             build: Mutex::default(),
@@ -162,12 +197,12 @@ impl Attachment {
                 a.base_ready = true;
             } else {
                 let (cache, tree, after) = (
-                    cache.clone(),
-                    v.opened_tree().clone(),
+                    Arc::clone(&cache),
+                    Arc::clone(v.opened_tree()),
                     Some(a.touched.subscribe()),
                 );
                 let size = v.opened_size();
-                *a.build.lock().expect("build lock") = Some(tokio::spawn(async move {
+                *a.build.lock() = Some(tokio::spawn(async move {
                     let opts = BuildOptions {
                         parallel: BUILD_PARALLEL,
                         serve: true,
@@ -186,7 +221,7 @@ impl Attachment {
     }
 
     async fn open_rest(&mut self) -> Result<()> {
-        let v = self.volume.clone();
+        let v = Arc::clone(&self.volume);
         if let (Some(images), Some(from)) = (&self.opts.images, v.copied_from()) {
             let _ = Bases::new(&self.ports, &images.join("bases"))
                 .note_follow(from)
@@ -198,7 +233,7 @@ impl Attachment {
                 && let Some(h) =
                     handoff::adopt::rejoin(&env, &v, &dm, &images, self.snapshot_options()).await?
             {
-                *self.handoff.lock().expect("handoff lock") = Some(h);
+                *self.handoff.lock() = Some(h);
                 self.warmed.send_replace(true);
                 return Ok(());
             }
@@ -234,14 +269,20 @@ impl Attachment {
         }
     }
 
+    /// The volume that serves the branch.
     pub fn volume(&self) -> &Arc<Volume> {
         &self.volume
+    }
+
+    /// The cache the branch reads its chunks through.
+    pub fn cache(&self) -> &Arc<Cache> {
+        &self.cache
     }
 
     /// Whether the kernel already serves the branch from an image a dead writer left, so no
     /// frontend is needed.
     pub fn rejoined(&self) -> bool {
-        self.handoff.lock().expect("handoff lock").is_some() && *self.warmed.borrow()
+        self.handoff.lock().is_some() && *self.warmed.borrow()
     }
 
     /// Brings what the first reads need to this host: the recording of earlier mounts' first
@@ -277,9 +318,9 @@ impl Attachment {
         };
         (r.recorded_frames, r.metadata_frames) = futures::join!(recorded, metadata);
         self.touched.send_replace(true);
-        let build = self.build.lock().expect("build lock").take();
+        let build = self.build.lock().take();
         let built = match build {
-            Some(b) => b.await.ok().and_then(|r| r.ok()),
+            Some(b) => b.await.ok().and_then(std::result::Result::ok),
             None => None,
         };
         r.base = built;
@@ -294,7 +335,7 @@ impl Attachment {
     /// Once [`Self::warm`] is done, moves the device to a local image of the branch.
     pub async fn hand_off(&self) -> Result<HandoffReport> {
         let (Some(images), Some(dm)) = (self.opts.images.clone(), self.opts.device.clone()) else {
-            return Err(crate::Error::Corrupt(
+            return Err(Error::Corrupt(
                 "a handoff needs an image directory and a device".into(),
             ));
         };
@@ -305,7 +346,7 @@ impl Attachment {
         let env = self.env(learned);
         let image = handoff::image_path(&self.ports, &images, self.volume.name());
         let (h, report) = handoff::hand_off(&env, &self.volume, &dm, image, self.snapshot_options()).await?;
-        *self.handoff.lock().expect("handoff lock") = Some(h);
+        *self.handoff.lock() = Some(h);
         Ok(report)
     }
 
@@ -321,12 +362,7 @@ impl Attachment {
         let Some(dm) = &self.opts.device else {
             return Ok(());
         };
-        let switched = self
-            .handoff
-            .lock()
-            .expect("handoff lock")
-            .clone()
-            .filter(|h| h.switched());
+        let switched = self.handoff.lock().clone().filter(|h| h.switched());
         if let Some(h) = switched {
             return h.grow(size).await;
         }
@@ -348,20 +384,20 @@ impl Attachment {
             .as_ref()
             .filter(|_| self.opts.dedup && self.bases.is_some())?;
         let p = &self.ports;
-        let li = LearnedIndex::load(p.fs.clone(), p.cpu.clone(), p.clock.clone(), dir)
+        let li = LearnedIndex::load(Arc::clone(&p.fs), Arc::clone(&p.cpu), Arc::clone(&p.clock), dir)
             .await
             .ok()?;
-        if let Ok(l) = Learner::new(p.fs.clone(), p.clock.clone(), dir, self.volume.name()).await {
+        if let Ok(l) = Learner::new(Arc::clone(&p.fs), Arc::clone(&p.clock), dir, self.volume.name()).await {
             let l = Arc::new(l);
-            self.volume.set_learner(Some(l.clone()));
-            *self.learner.lock().expect("learner lock") = Some(l);
+            self.volume.set_learner(Some(Arc::clone(&l)));
+            *self.learner.lock() = Some(l);
         }
         Some(Arc::new(li))
     }
 
     /// What the background snapshots of the handoff did so far.
     pub fn snapshots(&self) -> Option<SnapshotCounts> {
-        let h = self.handoff.lock().expect("handoff lock").clone()?;
+        let h = self.handoff.lock().clone()?;
         let load = |a: &std::sync::atomic::AtomicUsize| a.load(std::sync::atomic::Ordering::Relaxed);
         let max = |i: usize| {
             Duration::from_micros(h.stats.max_pause_us[i].load(std::sync::atomic::Ordering::Relaxed))
@@ -370,7 +406,7 @@ impl Attachment {
             taken: load(&h.stats.taken),
             chunks: load(&h.stats.chunks),
             failed: load(&h.stats.failed),
-            last_error: h.stats.last_error.lock().expect("stats lock").clone(),
+            last_error: h.stats.last_error.lock().clone(),
             copied: load(&h.stats.copied),
             postponed: load(&h.stats.postponed),
             paused: Duration::from_micros(h.stats.paused_us.load(std::sync::atomic::Ordering::Relaxed)),
@@ -383,23 +419,43 @@ impl Attachment {
         })
     }
 
+    /// Publishes what the branch held when the drain began, while the device keeps serving,
+    /// for a daemon that exits and leaves the device to the next one. A handed-off branch is
+    /// snapshotted first. Writes acknowledged later stay on this host: in the journal, or in the
+    /// image after a handoff.
+    pub async fn drain(&self) -> Result<()> {
+        let h = self.handoff.lock().clone();
+        if let Some(h) = h.filter(|h| h.switched()) {
+            h.snapshot_once(&self.volume).await?;
+        }
+        self.volume.checkpoint().await
+    }
+
     /// Publishes what the branch holds and frees it. The device must no longer write to the
     /// image: the caller removed it first.
     pub async fn finish(self) -> Result<FinishReport> {
         let v = &self.volume;
         let mut report = FinishReport::default();
-        let h = self.handoff.lock().expect("handoff lock").clone();
+        let h = self.handoff.lock().clone();
         let mut done = Ok(());
+        let t0 = Instant::now();
         if let Some(h) = h.as_ref().filter(|h| h.switched()) {
             match h.absorb_final(v).await {
                 Ok(n) => report.absorbed = n,
                 Err(e) => done = Err(e),
             }
         }
+        report.absorb = t0.elapsed();
         if done.is_ok() {
-            done = v.checkpoint().await;
+            done = v.checkpoint_report().await.map(|c| report.checkpoint = c);
         }
-        let learner = self.learner.lock().expect("learner lock").take();
+        let t1 = Instant::now();
+        if done.is_ok()
+            && let Err(e) = v.close_log().await
+        {
+            report.log_open = Some(e.to_string());
+        }
+        let learner = self.learner.lock().take();
         if let Some(l) = learner {
             if done.is_ok() {
                 let _ = l.save().await;
@@ -423,6 +479,7 @@ impl Attachment {
                 .unwrap_or(0);
         }
         v.close().await;
+        report.after = t1.elapsed();
         done.map(|()| report)
     }
 }
@@ -487,12 +544,13 @@ fn no_devices() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Unsupported, "this host has no device switch")
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use std::io;
 
     use async_trait::async_trait;
-    use pando_format::CHUNK_SIZE;
+    use pando_format::{CHUNK_SIZE, u64_from, usize_from};
 
     use super::*;
     use crate::sim::{self, SimBlock, SimDevices};
@@ -536,21 +594,21 @@ mod tests {
         let a = Attachment::open(
             ports,
             Some(Arc::new(devices.clone())),
-            cache.clone(),
+            Arc::clone(cache),
             Path::new("/v"),
             name,
             opts(),
         )
         .await
         .unwrap();
-        devices.add_block(Path::new(FRONT), Arc::new(Front(a.volume().clone())));
+        devices.add_block(Path::new(FRONT), Arc::new(Front(Arc::clone(a.volume()))));
         devices.create("dm0", Path::new(FRONT), SIZE).await.unwrap();
         let mut b = vec![0; 100];
         devices.read("dm0", &mut b, 0).await.unwrap();
         let w = a.warm().await.unwrap();
         let h = a.hand_off().await.unwrap();
         devices
-            .write("dm0", &vec![fill; 4096], at * CHUNK_SIZE as u64)
+            .write("dm0", &vec![fill; 4096], at * u64_from(CHUNK_SIZE))
             .await
             .unwrap();
         devices.remove("dm0").await.unwrap();
@@ -566,7 +624,7 @@ mod tests {
         Volume::create(&ports, "main", SIZE).await.unwrap();
         let w = Arc::new(Cache::open(&ports, Path::new("/w")).await.unwrap());
         let v = Volume::open(&ports, w, Path::new("/wv"), "main").await.unwrap();
-        v.write_at(&vec![5; SIZE as usize], 0).await.unwrap();
+        v.write_at(&vec![5; usize_from(SIZE)], 0).await.unwrap();
         v.checkpoint().await.unwrap();
         v.close().await;
         crate::branch::copy(&ports, "main", "fork", None).await.unwrap();
@@ -583,14 +641,14 @@ mod tests {
         )
         .await
         .unwrap();
-        devices.add_block(Path::new(FRONT), Arc::new(Front(a.volume().clone())));
+        devices.add_block(Path::new(FRONT), Arc::new(Front(Arc::clone(a.volume()))));
         devices.create("dm0", Path::new(FRONT), SIZE).await.unwrap();
         let block = |b: u8| vec![b; 4096];
 
         let mid: u64 = 32 << 20;
         assert!(devices.write("dm0", &block(1), SIZE).await.is_err());
         let grown = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let g = grown.clone();
+        let g = Arc::clone(&grown);
         a.grow(mid, async move {
             g.store(mid, std::sync::atomic::Ordering::Relaxed);
             Ok(())
@@ -649,7 +707,7 @@ mod tests {
         Volume::create(&ports, "main", SIZE).await.unwrap();
         let w = Arc::new(Cache::open(&ports, Path::new("/w")).await.unwrap());
         let v = Volume::open(&ports, w, Path::new("/wv"), "main").await.unwrap();
-        v.write_at(&vec![5; SIZE as usize], 0).await.unwrap();
+        v.write_at(&vec![5; usize_from(SIZE)], 0).await.unwrap();
         v.checkpoint().await.unwrap();
         v.close().await;
         crate::branch::copy(&ports, "main", "fork", None).await.unwrap();
@@ -678,11 +736,50 @@ mod tests {
 
         let c = Arc::new(Cache::open(&ports, Path::new("/fresh")).await.unwrap());
         let v = Volume::open(&ports, c, Path::new("/fv"), "fork").await.unwrap();
-        let mut got = vec![0; SIZE as usize];
+        let mut got = vec![0; usize_from(SIZE)];
         v.read_at(&mut got, 0).await.unwrap();
-        let mut want = vec![5; SIZE as usize];
+        let mut want = vec![5; usize_from(SIZE)];
         want[3 * CHUNK_SIZE..3 * CHUNK_SIZE + 4096].fill(0x33);
         assert_eq!(got, want);
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_publishes_what_the_branch_holds_and_leaves_the_device_serving() {
+        let (ports, _, fs) = sim::ports(14);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let devices = SimDevices::new((*fs).clone());
+        let cache = Arc::new(Cache::open(&ports, Path::new("/c")).await.unwrap());
+        let a = Attachment::open(
+            &ports,
+            Some(Arc::new(devices.clone())),
+            cache,
+            Path::new("/v"),
+            "main",
+            opts(),
+        )
+        .await
+        .unwrap();
+        devices.add_block(Path::new(FRONT), Arc::new(Front(Arc::clone(a.volume()))));
+        devices.create("dm0", Path::new(FRONT), SIZE).await.unwrap();
+        let at = |chunk: usize| (chunk * CHUNK_SIZE) as u64;
+        devices.write("dm0", &[0x11; 4096], at(1)).await.unwrap();
+        a.drain().await.unwrap();
+        a.warm().await.unwrap();
+        a.hand_off().await.unwrap();
+        devices.write("dm0", &[0x22; 4096], at(3)).await.unwrap();
+        a.drain().await.unwrap();
+        devices.write("dm0", &[0x33; 4096], at(5)).await.unwrap();
+
+        let elsewhere = Arc::new(Cache::open(&ports, Path::new("/e")).await.unwrap());
+        let v = Volume::open(&ports, elsewhere, Path::new("/ev"), "main")
+            .await
+            .unwrap();
+        let mut got = vec![0; 4096];
+        for (chunk, want) in [(1, 0x11), (3, 0x22), (5, 0)] {
+            v.read_at(&mut got, at(chunk)).await.unwrap();
+            assert!(got.iter().all(|&b| b == want), "chunk {chunk}");
+        }
         v.close().await;
     }
 }

@@ -8,8 +8,9 @@
 //! when the bytes arrived made mounts slower. Reads do not go through the window: they
 //! fetch their own frame and may take over a frame a background run holds.
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -56,7 +57,7 @@ pub(super) struct Urgent<'a>(&'a Window);
 
 impl Drop for Urgent<'_> {
     fn drop(&mut self) {
-        self.0.state.lock().expect("window lock").urgent -= 1;
+        self.0.state.lock().urgent -= 1;
         self.0.wake.notify_waiters();
     }
 }
@@ -71,7 +72,7 @@ pub(super) struct Permit<'a> {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         {
-            let mut s = self.window.state.lock().expect("window lock");
+            let mut s = self.window.state.lock();
             s.bytes -= self.bytes;
             s.gets -= 1;
         }
@@ -81,7 +82,7 @@ impl Drop for Permit<'_> {
 
 impl Window {
     pub(super) fn urgent(&self) -> Urgent<'_> {
-        self.state.lock().expect("window lock").urgent += 1;
+        self.state.lock().urgent += 1;
         Urgent(self)
     }
 
@@ -92,7 +93,7 @@ impl Window {
             let mut woken = std::pin::pin!(self.wake.notified());
             woken.as_mut().enable();
             {
-                let mut s = self.state.lock().expect("window lock");
+                let mut s = self.state.lock();
                 let limit = if !urgent && s.urgent > 0 {
                     URGENT_GETS
                 } else {
@@ -114,7 +115,7 @@ impl Window {
 
     /// The most GETs in flight at once so far.
     pub(super) fn peak_gets(&self) -> usize {
-        self.state.lock().expect("window lock").peak
+        self.state.lock().peak
     }
 }
 
@@ -233,23 +234,22 @@ impl Cache {
             {
                 whole.insert(k);
             }
-            job.need.write().expect("need lock").insert(e.hash);
+            job.need.write().insert(e.hash);
             if !job.frame_of.contains_key(&k) {
-                want.push((*e, i as i64));
+                want.push((*e, i64::try_from(i).unwrap_or(i64::MAX)));
             }
             job.frame_of.entry(k).or_default().push(i);
         }
         let frames = job.frame_of.len();
 
-        let need = job.need.clone();
-        let follow = move |h: &Hash| need.read().expect("need lock").contains(h);
+        let need = Arc::clone(&job.need);
+        let follow = move |h: &Hash| need.read().contains(h);
         let whole_frame = |k: FrameKey| whole.contains(&k);
         let decode = Decode {
             background: true,
-            asked: opts.asked_only.as_ref().map(|_| {
-                let need = job.need.clone();
-                Arc::new(move |h: &Hash| need.read().expect("need lock").contains(h))
-                    as super::fetch::HashTest
+            asked: opts.asked_only.as_ref().map(|_| -> super::fetch::HashTest {
+                let need = Arc::clone(&job.need);
+                Arc::new(move |h: &Hash| need.read().contains(h))
             }),
             whole: Some(&whole_frame),
             keep_rest: opts.asked_only.as_ref().is_some_and(|a| a.keep_rest),
@@ -344,18 +344,19 @@ impl Cache {
     /// Notes the frames of `want` this fetch has not seen and starts getting their segments'
     /// indexes. Sources (position -1) will go ahead of the runs already waiting.
     fn want<'a>(&'a self, job: &mut Job<'_>, want: Vec<(Entry, i64)>, tasks: &mut Tasks<'a>) {
-        let mut segs: HashMap<SegId, SegWant> = HashMap::new();
-        let mut order = Vec::new();
+        let mut slot_of: HashMap<SegId, usize> = HashMap::new();
+        let mut order: Vec<(SegId, SegWant)> = Vec::new();
         for (e, pos) in want {
-            job.need.write().expect("need lock").insert(e.hash);
+            job.need.write().insert(e.hash);
             let k = (e.loc.seg, e.loc.frame);
             if !job.seen.insert(k) {
                 continue;
             }
-            let sw = segs.entry(k.0).or_insert_with(|| {
-                order.push(k.0);
-                SegWant::default()
+            let slot = *slot_of.entry(k.0).or_insert_with(|| {
+                order.push((k.0, SegWant::default()));
+                order.len() - 1
             });
+            let sw = &mut order[slot].1;
             sw.frames.push(k.1);
             sw.pos.insert(k.1, pos);
             sw.hash.insert(k.1, e.hash);
@@ -365,8 +366,7 @@ impl Cache {
         }
         tasks.push(Box::pin(async move {
             let mut futs = Vec::with_capacity(order.len());
-            for seg in order {
-                let sw = segs.remove(&seg).expect("every ordered segment is wanted");
+            for (seg, sw) in order {
                 futs.push(async move { (seg, self.seg_index(seg).await, sw) });
             }
             Event::Indexed(bounded(futs, MAX_GETS).await)
@@ -425,7 +425,7 @@ impl Cache {
                     }
                     _ => runs.push(Run {
                         seg,
-                        idx: idx.clone(),
+                        idx: Arc::clone(&idx),
                         frames: vec![(f, claim)],
                         pos,
                     }),
@@ -449,7 +449,7 @@ impl Cache {
             Err(e) => {
                 let e = shared(e);
                 for (_, c) in run.frames {
-                    let _ = c.finish(Err(Error::Shared(e.clone())));
+                    let _ = c.finish(Err(Error::Shared(Arc::clone(&e))));
                 }
                 Vec::new()
             }

@@ -12,6 +12,7 @@ async-trait.workspace = true
 io-uring.workspace = true
 libc.workspace = true
 pando-engine.workspace = true
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -15,29 +15,39 @@ sharing one root system.
 
 - **Branches are block devices.** Pando serves each attached branch to the kernel over ublk, with
   a normal file system (ext4) on top. Agents see an ordinary disk, so `git`, `npm`
-  and compilers work without changes.
+  and compilers work without changes. The disk has 4 KiB sectors, a volatile write cache with
+  FUA, and discard: a discarded range reads as zeros, and its chunks no longer take space.
 - **Chunks and branch refs.** The device is split into 64 KiB chunks named by their hash. A
   persistent radix tree maps each chunk index to a chunk. Each branch is one root entry in a
   small ref object, and forking copies that ref. Branches share every chunk they have not changed.
+  A checkpoint freezes a branch's root under a name that never changes, so a host that has read it
+  once forks from it with a single request to the store.
 - **Segment storage.** Chunks and tree nodes are packed into ~8 MiB segments containing zstd
   frames of up to 1 MiB. A single range GET fetches neighbouring chunks, and uploads take a few
   PUTs rather than one per write. Where possible, changed chunks are stored as 4 KiB block
   references to the base, reducing the data uploaded by `npm ci` by about 13x.
-- **Write-back with fencing.** A flush is immediately durable locally and uploads in the
-  background. A conditional PUT updates the ref. Opening a branch takes a new writer generation
-  that fences any older writer.
+- **Write-back with fencing.** A flush is immediately durable locally, reaches a write log in
+  the store moments later, and uploads in the background. A conditional PUT updates the ref.
+  Opening a branch takes a new writer generation that fences any older writer, and applies what
+  the log has beyond the ref, so a lost host loses at most the last moments of writes. With
+  `attach --log strict`, a flush returns only once the log in the store has it.
 - **Fast starts.** Each host keeps a base image per root and clones it with reflink. A later
   branch of the same root therefore starts in about 250 ms. The first run records the frames it
   touched, and the next run on another host prefetches them. Once the branch is local, Pando
   hands the device to the kernel through device-mapper over a loop device and leaves the I/O path.
 - **Crash safety.** ublk user recovery and a local journal preserve acknowledged writes through
-  a daemon crash. After restarting, the daemon resumes serving the device where it left off.
+  a daemon crash. After restarting, the daemon resumes serving the device where it left off. On
+  SIGTERM it publishes what it holds and leaves the device to the next daemon, so an upgrade
+  does not unmount anything. [docs/hosts.md](docs/hosts.md) covers running it under systemd.
+- **Host daemon.** `pando serve --socket PATH` keeps the store's connections, the cache and the
+  checkpoints it has read. `pando --socket PATH <command>` runs the command there, so a branch or
+  attach skips process start-up, credential loading and cold connections.
 
 ## Crates
 
 | Crate | Contents |
 |---|---|
-| `pando-format` | the store format: hashes, entries, refs, tree nodes, frames, segment indexes, recipes, change lists, object keys. No I/O. |
+| `pando-format` | the store format: hashes, entries, refs, checkpoints, tree nodes, frames, segment indexes, recipes, change lists, write log records, object keys. No I/O. |
 | `pando-engine` | the volume engine: the block map tree, the cache, fetch and its scheduler, the uploader and writer fencing, dedup, base builds, seeding and the handoff steps. It reaches the outside world only through ports. |
 | `pando-s3` | the object-store port over any S3-compatible store with conditional writes (AWS S3, Cloudflare R2, MinIO) |
 | `pando-host` | the host ports on a real machine: files, base images, clock, randomness, CPU pool. Linux gets reflinks, extent hints and hole punching; other systems get plain fallbacks. |
@@ -58,6 +68,18 @@ Linux container and takes the same arguments.
 ```bash
 cargo test --workspace
 ```
+
+`tools/check.sh` runs the checks CI runs, in a container with every tool pinned
+(`tools/Dockerfile`, `tools/install.sh`): with no arguments it runs the lints, the supply-chain
+checks and the tests. It also takes `asan`, `fuzz [seconds]`, `coverage`, `mutants`, or any
+single check by name, such as `clippy` or `shellcheck`. The fuzz targets are in `fuzz/`.
+
+Dependabot proposes weekly updates for the crates, actions, base images and Terraform providers
+(`.github/dependabot.yml`). A crate update passes `vet` only once each new version has an audit
+or exemption in `supply-chain/`. Dependabot moves the `rust` image only within its minor version,
+so a new Rust release is a manual change to `rust-toolchain.toml`, `rust-version` in
+`Cargo.toml`, and the `FROM` and `rustup` lines in `tools/Dockerfile`, all in one commit. The
+nightly in `tools/nightly` and `fuzz/README.md` also moves by hand.
 
 Fixtures in `pando-format/tests/fixtures` pin the byte encoding of every stored object.
 
@@ -97,8 +119,8 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** The fork, cold-start, warm-start and agent-workload charts have results so far; the others fill in
-> as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> **Partly measured.** Every chart has results; SOCI, Nydus, ZeroFS and Amazon S3 Files
+> are not set up yet and fill in as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
 > [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
 > `bench/results/`.
 
@@ -130,7 +152,6 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | EBS snapshot to volume | 2.6 s | 2.6 s to 2.6 s |
 | JuiceFS | 12.8 s | 12.8 s to 12.8 s |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 | XFS reflink (local) | 1 ms | 1 ms to 1 ms |
 
 | storage added per branch | median | range |
@@ -140,7 +161,6 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | EBS snapshot to volume | 16 GiB | 16 GiB to 16 GiB |
 | JuiceFS | 25.4 MiB | 25.4 MiB to 25.4 MiB |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 | XFS reflink (local) | 4.61 KiB | 4.61 KiB to 4.61 KiB |
 
 | storage added by a 5 MiB edit to a branch | median | range |
@@ -150,7 +170,6 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | EBS snapshot to volume | none: billed by volume size | |
 | JuiceFS | 5 MiB | 5 MiB to 5 MiB |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 | XFS reflink (local) | 5.75 MiB | 5.75 MiB to 5.75 MiB |
 
 </details>
@@ -184,7 +203,6 @@ reads it recorded in the bucket.
 | JuiceFS | 3.88 min | 3.8 min to 3.92 min |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
-| Archil | — | |
 | XFS reflink (local) | local only | |
 
 </details>
@@ -221,7 +239,6 @@ over ublk.
 | JuiceFS | 18.8 s | 18.4 s to 19.1 s |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
-| Archil | — | |
 | XFS reflink (local) | 563 ms | 410 ms to 613 ms |
 
 </details>
@@ -256,14 +273,19 @@ repetition one `vitest` run failed, and it passed in the other two.
 | JuiceFS | 9.96x | 9.90x to 12.07x |
 | ZeroFS (NBD) | — | |
 | Amazon S3 Files | — | |
-| Archil | — | |
 
 </details>
 <!-- /bench:replay -->
 
 ### Save
 
-After `npm ci`, time from the last write until another host can open the branch.
+After `npm ci`, time from the last write until another host can open the branch, and the bytes
+`npm ci`'s changes added to the store. Pando's time is unmount and `pando detach`, which uploads
+what changed since its last background snapshot and publishes the branch. JuiceFS uploads each
+file as it closes, so its save is a `sync` that finds nothing left, and the upload cost lands in
+`npm ci` itself: about 15 min on JuiceFS against 8 s on the others. tar uploads the whole
+workspace every time. EBS's bytes are the 512 KiB blocks the snapshot holds beyond the workspace
+snapshot. Three runs each.
 
 <!-- bench:save -->
 <picture>
@@ -276,30 +298,33 @@ After `npm ci`, time from the last write until another host can open the branch.
 
 | time to durable after npm ci | median | range |
 |---|---|---|
-| Pando | — | |
-| tar from S3 | — | |
-| Docker (overlayfs) | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| Pando | 4.94 s | 2.43 s to 7.68 s |
+| tar from S3 | 3.2 s | 3.17 s to 3.2 s |
+| Docker (overlayfs) | 41.1 s | 40.9 s to 41.2 s |
+| EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
+| JuiceFS | 2.76 ms | 2.5 ms to 3.52 ms |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 
 | uploaded after npm ci | median | range |
 |---|---|---|
-| Pando | — | |
-| tar from S3 | — | |
-| Docker (overlayfs) | — | |
-| EBS snapshot to volume | — | |
-| JuiceFS | — | |
+| Pando | 208 MiB | 207 MiB to 214 MiB |
+| tar from S3 | 323 MiB | 323 MiB to 323 MiB |
+| Docker (overlayfs) | 194 MiB | 194 MiB to 194 MiB |
+| EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |
+| JuiceFS | 732 MiB | 665 MiB to 785 MiB |
 | ZeroFS (NBD) | — | |
-| Archil | — | |
 
 </details>
 <!-- /bench:save -->
 
 ### Raw I/O
 
-Direct I/O measured with fio on the device or mount.
+Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs each. Pando
+(ublk) comes out ahead of the local NVMe because its daemon keeps the branch in cache files read
+and written through the host's page cache: direct I/O skips the page cache of the device, not of
+the daemon, so these rows mostly measure memory. After handoff, reads go through device-mapper
+and a loop device to the image on the NVMe; writes are slow there, about 21 MB/s sequential,
+for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s.
 
 <!-- bench:fio -->
 <picture>
@@ -312,47 +337,47 @@ Direct I/O measured with fio on the device or mount.
 
 | 4 KiB random read, QD1 | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 11k | 10.4k to 11.1k |
+| Pando (ublk) | 109k | 108k to 110k |
+| Pando (after handoff) | 6.72k | 5.99k to 7.24k |
+| EBS gp3 | 1.54k | 1.54k to 1.6k |
+| JuiceFS | 6.37k | 5.98k to 6.58k |
 | ZeroFS (NBD) | — | |
 
 | 4 KiB random read, 4 x QD32 | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 269k | 269k to 269k |
+| Pando (ublk) | 814k | 813k to 817k |
+| Pando (after handoff) | 237k | 233k to 265k |
+| EBS gp3 | 2.99k | 2.99k to 3k |
+| JuiceFS | 76.7k | 76.4k to 77.3k |
 | ZeroFS (NBD) | — | |
 
 | 4 KiB random write, 4 x QD32 | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 134k | 134k to 134k |
+| Pando (ublk) | 467k | 455k to 481k |
+| Pando (after handoff) | 2.47k | 2.14k to 5.09k |
+| EBS gp3 | 2.99k | 2.99k to 3k |
+| JuiceFS | 484 | 456 to 493 |
 | ZeroFS (NBD) | — | |
 
 | 1 MiB sequential read | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
+| Pando (ublk) | 6,430 MB/s | 6,419 MB/s to 6,461 MB/s |
+| Pando (after handoff) | 1,849 MB/s | 1,826 MB/s to 1,856 MB/s |
+| EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
+| JuiceFS | 1,611 MB/s | 1,576 MB/s to 1,660 MB/s |
 | ZeroFS (NBD) | — | |
 
 | 1 MiB sequential write | median | range |
 |---|---|---|
-| local NVMe | — | |
-| Pando (ublk) | — | |
-| Pando (after handoff) | — | |
-| EBS gp3 | — | |
-| JuiceFS | — | |
+| local NVMe | 908 MB/s | 908 MB/s to 908 MB/s |
+| Pando (ublk) | 1,689 MB/s | 1,523 MB/s to 1,806 MB/s |
+| Pando (after handoff) | 21 MB/s | 16 MB/s to 24 MB/s |
+| EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
+| JuiceFS | 1,328 MB/s | 1,317 MB/s to 1,330 MB/s |
 | ZeroFS (NBD) | — | |
 
 </details>
@@ -360,10 +385,13 @@ Direct I/O measured with fio on the device or mount.
 
 ### Crash
 
-The storage daemon is killed with `kill -9` during writes, then the branch is opened on a fresh host.
+The storage daemon is killed with `kill -9` while a writer writes and fsyncs 256 KiB files, and is
+restarted at once (`pando attach --recover`, or a new JuiceFS mount). The branch is then opened
+with a new cache and state directory, sharing nothing with the first, its file system checked
+and every acknowledged file read back. Medians of three runs.
 
 | System | Failed writes | Stall | fsck | Files correct |
 |---|---|---|---|---|
-| Pando | — | — | — | — |
-| JuiceFS | — | — | — | — |
+| Pando | 0 | 0.12 s | clean | all acknowledged (1,403 to 1,438 per run) |
+| JuiceFS | 2 | 0.23 s | clean | all acknowledged (264 to 270 per run) |
 | ZeroFS | — | — | — | — |

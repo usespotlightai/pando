@@ -13,13 +13,17 @@ pub struct SegId(pub [u8; 16]);
 /// fenced writer's leftovers from an upload in flight.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct WriterId {
+    /// The first 8 bytes of the SHA-256 of the branch name.
     pub branch: [u8; 8],
+    /// The low 32 bits of the writer's generation.
     pub generation: u32,
 }
 
 impl SegId {
+    /// No segment: an [`Entry`](crate::Entry) location in it is not uploaded yet.
     pub const ZERO: SegId = SegId([0; 16]);
 
+    /// The id of segment `seq` of `writer`.
     pub fn new(writer: WriterId, seq: u32) -> SegId {
         let mut s = [0; 16];
         s[..8].copy_from_slice(&writer.branch);
@@ -28,10 +32,12 @@ impl SegId {
         SegId(s)
     }
 
+    /// Whether this is [`SegId::ZERO`].
     pub fn is_zero(&self) -> bool {
         *self == Self::ZERO
     }
 
+    /// The writer the id names, as [`SegId::new`] put it in.
     pub fn writer(&self) -> WriterId {
         let mut branch = [0; 8];
         branch.copy_from_slice(&self.0[..8]);
@@ -47,9 +53,10 @@ impl WriterId {
     pub fn new(branch: &str, generation: u64) -> WriterId {
         let mut b = [0; 8];
         b.copy_from_slice(&Hash::of(branch.as_bytes()).0[..8]);
+        let [g0, g1, g2, g3, ..] = generation.to_le_bytes();
         WriterId {
             branch: b,
-            generation: generation as u32,
+            generation: u32::from_le_bytes([g0, g1, g2, g3]),
         }
     }
 }
@@ -63,6 +70,7 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// The writer `id`, whose first segment is numbered `start + 1` (wrapping).
     pub fn new(id: WriterId, start: u32) -> Writer {
         Writer {
             id,
@@ -70,10 +78,12 @@ impl Writer {
         }
     }
 
+    /// The writer's id, the same in every segment id it hands out.
     pub fn id(&self) -> WriterId {
         self.id
     }
 
+    /// A segment id this writer has not handed out before, until its 2^32 numbers wrap.
     pub fn next_seg_id(&self) -> SegId {
         SegId::new(self.id, self.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1))
     }

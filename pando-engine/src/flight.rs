@@ -1,9 +1,10 @@
 //! Single flight: one caller does a piece of work, the others wait for its outcome.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
@@ -26,13 +27,13 @@ impl Call {
 
     pub(crate) async fn wait(&self) -> Result<()> {
         let mut rx = self.done.subscribe();
-        let r = rx
-            .wait_for(Option::is_some)
-            .await
-            .expect("the call holds its sender");
-        match r.as_ref().expect("waited for an outcome") {
-            Ok(()) => Ok(()),
-            Err(e) => Err(Error::Shared(e.clone())),
+        let Ok(r) = rx.wait_for(Option::is_some).await else {
+            return Err(Error::Cancelled);
+        };
+        match &*r {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(Error::Shared(Arc::clone(e))),
+            None => Err(Error::Cancelled),
         }
     }
 }
@@ -62,19 +63,19 @@ impl<K: Eq + Hash + Clone> Flights<K> {
     /// Joins the work on `k`. A foreground caller takes over work that a background caller
     /// leads: it does the work again rather than wait behind a long background job.
     pub(crate) fn join(&self, k: &K, background: bool) -> Joined<'_, K> {
-        let mut calls = self.calls.lock().expect("flights lock");
+        let mut calls = self.calls.lock();
         if let Some(c) = calls.get(k)
             && (background || !c.background)
         {
             c.waiters.fetch_add(1, Ordering::AcqRel);
-            return Joined::Wait(c.clone());
+            return Joined::Wait(Arc::clone(c));
         }
         let call = Arc::new(Call {
             done: watch::Sender::new(None),
             background,
             waiters: AtomicU32::new(0),
         });
-        calls.insert(k.clone(), call.clone());
+        calls.insert(k.clone(), Arc::clone(&call));
         Joined::Lead(Claim {
             flights: self,
             key: k.clone(),
@@ -84,7 +85,7 @@ impl<K: Eq + Hash + Clone> Flights<K> {
     }
 
     pub(crate) fn in_flight(&self, k: &K) -> bool {
-        self.calls.lock().expect("flights lock").contains_key(k)
+        self.calls.lock().contains_key(k)
     }
 }
 
@@ -107,7 +108,19 @@ impl<K: Eq + Hash + Clone> Claim<'_, K> {
         self.finished = true;
         let outcome = r.map_err(|e| match e {
             Error::Shared(e) => e,
-            e => Arc::new(e),
+            e @ (Error::Fenced { .. }
+            | Error::ChunkLost { .. }
+            | Error::Store(_)
+            | Error::Format(_)
+            | Error::UnknownFormat { .. }
+            | Error::Io(_)
+            | Error::BeyondEnd
+            | Error::Shrink { .. }
+            | Error::Corrupt(_)
+            | Error::SegmentExists(_)
+            | Error::RefExists(_)
+            | Error::CheckpointExists(_)
+            | Error::Cancelled) => Arc::new(e),
         });
         self.settle(outcome.clone());
         outcome.map_err(Error::Shared)
@@ -115,7 +128,7 @@ impl<K: Eq + Hash + Clone> Claim<'_, K> {
 
     fn settle(&self, outcome: Result<(), Arc<Error>>) {
         {
-            let mut calls = self.flights.calls.lock().expect("flights lock");
+            let mut calls = self.flights.calls.lock();
             if calls.get(&self.key).is_some_and(|c| Arc::ptr_eq(c, &self.call)) {
                 calls.remove(&self.key);
             }

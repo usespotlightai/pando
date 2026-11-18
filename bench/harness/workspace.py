@@ -9,6 +9,8 @@ Built once per host into /data/work/workspace and reused by every measure:
 import json
 import os
 import shutil
+from pathlib import Path
+from typing import Any
 
 from common import TOOLS, WORK, fetch, log, run
 
@@ -23,18 +25,20 @@ IMAGE = DIR / "base.img"
 META = DIR / "meta.json"
 
 
-def node_bin():
-    """Node.js, from nodejs.org, checked against its published SHA-256."""
+def node_bin() -> Path:
+    """Return the bin directory of Node.js, installed from nodejs.org and checked against its SHA-256."""
     name = f"node-v{NODE_VERSION}-linux-x64"
     root = TOOLS / name
     if not (root / "bin" / "node").exists():
-        tar = fetch(f"https://nodejs.org/dist/v{NODE_VERSION}/{name}.tar.xz", TOOLS / f"{name}.tar.xz", NODE_SHA256)
+        tar = fetch(
+            f"https://nodejs.org/dist/v{NODE_VERSION}/{name}.tar.xz", TOOLS / f"{name}.tar.xz", NODE_SHA256
+        )
         run("tar", "-xJf", tar, "-C", TOOLS)
     return root / "bin"
 
 
-def prepare():
-    """Builds the workspace image unless this host already has it for the pinned commit."""
+def prepare() -> dict[str, Any]:
+    """Build the workspace image unless this host has it for the pinned commit; return its meta.json."""
     meta = json.loads(META.read_text()) if META.exists() else {}
     if meta.get("commit") == SPOTLIGHT_COMMIT and meta.get("node") == NODE_VERSION and IMAGE.exists():
         log(f"workspace ready: {meta['files']} files, {meta['bytes'] >> 20} MiB")
@@ -56,13 +60,19 @@ def prepare():
     for root, dirs, names in os.walk(SRC):
         files += len(names) + len(dirs)
         for n in names:
-            size += os.lstat(os.path.join(root, n)).st_size
+            size += (Path(root) / n).lstat().st_size
     # Room for the file system's own metadata and for the agent workload's writes.
     image_bytes = ((size * 2 + (2 << 30)) >> 30) << 30
     log(f"building the ext4 image: {files} entries, {size >> 20} MiB of data, {image_bytes >> 30} GiB image")
     run("truncate", "-s", image_bytes, IMAGE)
     run("mkfs.ext4", "-q", "-F", "-L", "workspace", "-d", SRC, IMAGE)
 
-    meta = dict(commit=SPOTLIGHT_COMMIT, node=NODE_VERSION, files=files, bytes=size, image_bytes=image_bytes)
+    meta = {
+        "commit": SPOTLIGHT_COMMIT,
+        "node": NODE_VERSION,
+        "files": files,
+        "bytes": size,
+        "image_bytes": image_bytes,
+    }
     META.write_text(json.dumps(meta, indent=2))
     return meta

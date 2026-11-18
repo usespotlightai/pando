@@ -4,13 +4,13 @@ use pando_engine::ports::{Cpu, CpuClass, CpuJob};
 
 /// Two thread pools, so background hashing never queues ahead of a read the device waits for.
 #[derive(Debug)]
-pub struct PoolCpu {
+pub(crate) struct PoolCpu {
     foreground: rayon::ThreadPool,
     background: rayon::ThreadPool,
 }
 
 impl PoolCpu {
-    pub fn new(threads: usize) -> io::Result<PoolCpu> {
+    pub(crate) fn new(threads: usize) -> io::Result<PoolCpu> {
         let pool = |n: usize, name: &'static str| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(n.max(1))
