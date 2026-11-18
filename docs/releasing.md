@@ -11,9 +11,9 @@
    ```
 
 3. The [release workflow](../.github/workflows/release.yml) builds `pando` for x86_64 and aarch64
-   Linux, fails if the tag does not match the workspace version, and publishes a GitHub release
-   with the two archives, `install.sh`, `SHA256SUMS` and a build provenance attestation for each
-   file.
+   Linux. It publishes nothing if the tag does not match the workspace version or its commit is
+   not on main; otherwise it publishes a GitHub release with the two archives, `install.sh`,
+   `SHA256SUMS` and a build provenance attestation for each file.
 
 Run the workflow by hand from the Actions tab to build the archives of any branch without
 publishing them; their version is the workspace version with `-dev.<commit>` appended.

@@ -21,8 +21,10 @@ sudo bash install.sh 0.1.0
 it to `/usr/local/lib/pando/<version>`. It points `/usr/local/bin/pando` at it, installs the
 unit, runs `systemctl daemon-reload`, and creates `/etc/pando/attach`. `--from DIR` takes the
 archive and `SHA256SUMS` from a directory instead, for host images built without network access.
-`gh attestation verify <archive> --repo usespotlightai/pando` checks that an archive was built
-by this repository's release workflow.
+`SHA256SUMS` comes from the same release as the files it covers, so it catches a corrupt
+download, not a release someone replaced. `gh attestation verify <file> --repo
+usespotlightai/pando` checks that a file, `install.sh` or an archive, was built by this
+repository's release workflow from a commit on main.
 
 | Path | Holds |
 |---|---|

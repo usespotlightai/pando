@@ -10,7 +10,8 @@
 # every process started after the rename runs the new one. Installs the systemd unit
 # pando-attach@.service and creates /etc/pando/attach, mode 0700.
 # --restart then restarts each running pando-attach@ unit, one at a time: its daemon drains and
-# the new binary takes its device over. It stops at the first unit that fails to come back.
+# the new binary takes its device over. It stops at the first unit that fails to come back, and
+# fails when systemd is not running.
 set -euo pipefail
 usage="usage: install.sh [--from DIR] [--restart] VERSION"
 from=
@@ -93,7 +94,13 @@ ln -sfn "${dir}/pando" "${bin}.new"
 mv -Tf "${bin}.new" "${bin}"
 echo "${bin} is ${running}"
 
-[[ -d /run/systemd/system ]] || exit 0
+if [[ ! -d /run/systemd/system ]]; then
+	if [[ -n ${restart} ]]; then
+		echo "--restart needs systemd, which is not running here: no daemon was restarted" >&2
+		exit 1
+	fi
+	exit 0
+fi
 systemctl daemon-reload
 [[ -n ${restart} ]] || exit 0
 units=$(systemctl list-units --type=service --state=active --plain --no-legend 'pando-attach@*' | awk '{print $1}')
