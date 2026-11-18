@@ -1,0 +1,105 @@
+name: deep
+
+# The slow checks. Each night: every fuzz target for ten minutes, growing a corpus kept in the
+# Actions cache. Each Sunday: mutation testing of the workspace in four shards. Start either by
+# hand from the Actions tab.
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      mutants:
+        description: Run mutation testing too
+        type: boolean
+        default: false
+
+concurrency:
+  group: deep-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '41 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+        with:
+          nightly: "true"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          key: fuzz
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Every fuzz target for ten minutes
+        run: tools/check.sh fuzz 600
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  mutants:
+    name: Mutation testing
+    if: github.event.schedule == '17 4 * * 0' || inputs.mutants
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/tools
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mutants
+
+      - name: Mutation testing, shard ${{ matrix.shard }} of 4
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          status=0
+          tools/check.sh mutants --shard "$SHARD/4" --test-tool nextest --no-shuffle --output "$RUNNER_TEMP" || status=$?
+          out=$RUNNER_TEMP/mutants.out
+          {
+            echo "### Shard $SHARD: $(wc -l < "$out/missed.txt") missed, $(wc -l < "$out/timeout.txt") timed out"
+            echo '```'
+            cat "$out/missed.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 2 and 3 mean missed or timed-out mutants: reported above, not a failed run.
+          case $status in 0 | 2 | 3) ;; *) exit "$status" ;; esac
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-${{ matrix.shard }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/mutants.out
+          if-no-files-found: warn

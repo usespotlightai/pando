@@ -1,16 +1,28 @@
+use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use pando_format::CHUNK_SIZE;
+use pando_format::{CHUNK_SIZE, u64_from, usize_from};
 use tokio::sync::oneshot;
 
-use super::read_file;
+use super::{read_file, take};
 use crate::ports::{LocalFile, LocalFs, Open};
 use crate::{Error, Result};
 
+/// What one journal record does to its chunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Record {
+    /// These bytes at an offset in the chunk.
+    Data(usize, Bytes),
+    /// The whole chunk becomes zeros.
+    ZeroChunk,
+}
+
 const HEADER: usize = 16;
 const SHARDS: usize = 16;
+/// Set in a record's length field: the record zeroes a whole chunk and carries no data.
+const ZERO_CHUNK: u32 = 1 << 31;
 
 /// Acknowledged writes that no flush has committed yet.
 ///
@@ -19,7 +31,8 @@ const SHARDS: usize = 16;
 /// it would lose a disk's volatile write cache. Each flush starts a new generation; a committed
 /// flush removes the generations below it. A generation has one file per shard of chunk
 /// indexes, so writes to different chunks append in parallel and one chunk's records stay in
-/// order. A record is `[chunk index u64][offset in chunk u32][length u32][data]`. Appends to one
+/// order. A record is `[chunk index u64][offset in chunk u32][length u32][data]`, or a length of
+/// [`ZERO_CHUNK`] and no data for a chunk that became zeros. Appends to one
 /// shard queue while a write is in flight and go out together in the next one, written on the
 /// calling thread: the page cache takes them without a wait, so a hop to the blocking pool
 /// would cost more than the write.
@@ -56,20 +69,20 @@ impl Shard {
     fn drain(&self) {
         loop {
             let (batch, waiters, at) = {
-                let mut q = self.queue.lock().expect("journal queue lock");
+                let mut q = self.queue.lock();
                 if q.records.is_empty() {
                     q.writing = false;
                     return;
                 }
                 (q.records.split().freeze(), std::mem::take(&mut q.waiters), q.end)
             };
-            let n = batch.len() as u64;
+            let n = u64_from(batch.len());
             let done = self
                 .file
                 .write_at_now(&batch, at)
                 .map_err(|e| Arc::new(Error::Io(e)));
             if done.is_ok() {
-                self.queue.lock().expect("journal queue lock").end += n;
+                self.queue.lock().end += n;
             }
             for w in waiters {
                 let _ = w.send(done.clone());
@@ -118,7 +131,7 @@ impl Journal {
     /// for each chunk; returns how many it applied. A record cut short ends its file.
     pub(crate) async fn replay<F>(&self, floor: u64, mut apply: F) -> Result<usize>
     where
-        F: FnMut(u64, usize, Bytes) -> Result<()>,
+        F: FnMut(u64, Record) -> Result<()>,
     {
         let mut n = 0;
         for g in self.gens().await?.into_iter().filter(|g| *g >= floor) {
@@ -126,19 +139,28 @@ impl Journal {
                 let Some(b) = read_file(self.fs.as_ref(), &self.path(g, s)).await? else {
                     continue;
                 };
-                let mut off = 0;
-                while off + HEADER <= b.len() {
-                    let idx = u64::from_le_bytes(b[off..off + 8].try_into().expect("8 bytes"));
-                    let inner =
-                        u32::from_le_bytes(b[off + 8..off + 12].try_into().expect("4 bytes")) as usize;
-                    let len = u32::from_le_bytes(b[off + 12..off + 16].try_into().expect("4 bytes")) as usize;
-                    let body = off + HEADER;
-                    if body + len > b.len() || inner + len > CHUNK_SIZE {
+                let mut rest: &[u8] = &b;
+                while let (Some(idx), Some(inner), Some(len)) =
+                    (take::<8>(&mut rest), take::<4>(&mut rest), take::<4>(&mut rest))
+                {
+                    let idx = u64::from_le_bytes(idx);
+                    let inner = u32::from_le_bytes(inner) as usize;
+                    let len = u32::from_le_bytes(len);
+                    if len == ZERO_CHUNK && inner == 0 {
+                        apply(idx, Record::ZeroChunk)?;
+                        n += 1;
+                        continue;
+                    }
+                    let len = len as usize;
+                    let Some((body, after)) = rest.split_at_checked(len) else {
+                        break;
+                    };
+                    if inner + len > CHUNK_SIZE {
                         break;
                     }
-                    apply(idx, inner, b.slice(body..body + len))?;
+                    apply(idx, Record::Data(inner, b.slice_ref(body)))?;
                     n += 1;
-                    off = body + len;
+                    rest = after;
                 }
             }
         }
@@ -159,37 +181,42 @@ impl Journal {
                 }),
             });
         }
-        *self.current.write().expect("journal lock") = Some(Arc::new(Generation { number, shards }));
+        *self.current.write() = Some(Arc::new(Generation { number, shards }));
         Ok(())
     }
 
     /// The generation that appends go to.
     pub(crate) fn generation(&self) -> u64 {
-        self.current
-            .read()
-            .expect("journal lock")
-            .as_ref()
-            .map_or(0, |g| g.number)
+        self.current.read().as_ref().map_or(0, |g| g.number)
     }
 
     /// Records one write. Callers keep appends for one chunk in order; no append may run while
     /// [`Self::rotate`] does.
     pub(crate) async fn append(&self, idx: u64, inner: usize, data: Bytes) -> Result<()> {
-        let g = self
-            .current
-            .read()
-            .expect("journal lock")
-            .clone()
-            .expect("journal started");
-        let shard = &g.shards[(idx % SHARDS as u64) as usize];
+        let too_far = || Error::Corrupt(format!("a journal record of chunk {idx} past the chunk"));
+        let inner = u32::try_from(inner).map_err(|_| too_far())?;
+        let len = u32::try_from(data.len()).map_err(|_| too_far())?;
+        self.push(idx, inner, len, &data).await
+    }
+
+    /// Records that chunk `idx` became zeros, as [`Self::append`] records a write.
+    pub(crate) async fn append_zero_chunk(&self, idx: u64) -> Result<()> {
+        self.push(idx, 0, ZERO_CHUNK, &[]).await
+    }
+
+    async fn push(&self, idx: u64, inner: u32, len: u32, data: &[u8]) -> Result<()> {
+        let Some(g) = self.current.read().clone() else {
+            return Err(Error::Corrupt("an append to a journal not started".into()));
+        };
+        let shard = &g.shards[usize_from(idx % u64_from(SHARDS))];
         let (tx, rx) = oneshot::channel();
         let lead = {
-            let mut q = shard.queue.lock().expect("journal queue lock");
+            let mut q = shard.queue.lock();
             q.records.reserve(HEADER + data.len());
             q.records.put_u64_le(idx);
-            q.records.put_u32_le(inner as u32);
-            q.records.put_u32_le(data.len() as u32);
-            q.records.put_slice(&data);
+            q.records.put_u32_le(inner);
+            q.records.put_u32_le(len);
+            q.records.put_slice(data);
             q.waiters.push(tx);
             !std::mem::replace(&mut q.writing, true)
         };
@@ -224,7 +251,7 @@ impl Journal {
 
     /// Removes every generation.
     pub(crate) async fn reset(&self) -> Result<()> {
-        *self.current.write().expect("journal lock") = None;
+        *self.current.write() = None;
         for e in self.fs.list(&self.dir).await? {
             self.fs.remove(&self.dir.join(&e.name)).await?;
         }
@@ -232,7 +259,8 @@ impl Journal {
     }
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use super::*;
 
@@ -249,6 +277,7 @@ mod tests {
         j.append(3, 1, Bytes::from_static(b"two")).await.unwrap();
         assert_eq!(j.rotate().await.unwrap(), 2);
         j.append(19, 5, Bytes::from_static(b"three")).await.unwrap();
+        j.append_zero_chunk(3).await.unwrap();
 
         let again = Journal::open(Arc::new(fs.clone()), Path::new("/j"))
             .await
@@ -256,19 +285,20 @@ mod tests {
         assert_eq!(again.last().await.unwrap(), 2);
         let mut seen = Vec::new();
         let n = again
-            .replay(1, |i, at, d| {
-                seen.push((i, at, d));
+            .replay(1, |i, r| {
+                seen.push((i, r));
                 Ok(())
             })
             .await
             .unwrap();
-        assert_eq!(n, 3);
-        assert_eq!(seen[0], (3, 0, Bytes::from_static(b"one")));
-        assert_eq!(seen[1], (3, 1, Bytes::from_static(b"two")));
-        assert_eq!(seen[2], (19, 5, Bytes::from_static(b"three")));
+        assert_eq!(n, 4);
+        assert_eq!(seen[0], (3, Record::Data(0, Bytes::from_static(b"one"))));
+        assert_eq!(seen[1], (3, Record::Data(1, Bytes::from_static(b"two"))));
+        assert_eq!(seen[2], (19, Record::Data(5, Bytes::from_static(b"three"))));
+        assert_eq!(seen[3], (3, Record::ZeroChunk));
 
         j.drop_below(2).await;
-        assert_eq!(again.replay(0, |_, _, _| Ok(())).await.unwrap(), 1);
+        assert_eq!(again.replay(0, |_, _| Ok(())).await.unwrap(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -282,10 +312,14 @@ mod tests {
         j.start(1).await.unwrap();
         let tasks: Vec<_> = (0..64u64)
             .map(|i| {
-                let j = j.clone();
+                let j = Arc::clone(&j);
                 tokio::spawn(async move {
-                    j.append(i * SHARDS as u64, 0, Bytes::from(vec![i as u8; 100]))
-                        .await
+                    j.append(
+                        i * u64_from(SHARDS),
+                        0,
+                        Bytes::from(vec![u8::try_from(i).unwrap(); 100]),
+                    )
+                    .await
                 })
             })
             .collect();
@@ -294,8 +328,11 @@ mod tests {
         }
         let mut seen = Vec::new();
         let n = j
-            .replay(0, |i, _, d| {
-                assert!(d.iter().all(|&b| u64::from(b) * SHARDS as u64 == i));
+            .replay(0, |i, r| {
+                let Record::Data(_, d) = r else {
+                    panic!("a data record")
+                };
+                assert!(d.iter().all(|&b| u64::from(b) * u64_from(SHARDS) == i));
                 seen.push(i);
                 Ok(())
             })
@@ -303,7 +340,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 64);
         seen.sort_unstable();
-        assert_eq!(seen, (0..64).map(|i| i * SHARDS as u64).collect::<Vec<_>>());
+        assert_eq!(seen, (0..64).map(|i| i * u64_from(SHARDS)).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -317,6 +354,6 @@ mod tests {
         let f = fs.open(&j.path(1, 0), Open::ReadWrite).await.unwrap();
         let end = f.size().await.unwrap();
         f.write_at(vec![Bytes::from(vec![1; 20])], end).await.unwrap();
-        assert_eq!(j.replay(0, |_, _, _| Ok(())).await.unwrap(), 1);
+        assert_eq!(j.replay(0, |_, _| Ok(())).await.unwrap(), 1);
     }
 }

@@ -2,13 +2,15 @@
 //! frame is served from memory. Their bytes are checked when that fetch decodes them, as any
 //! fetched bytes are.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use pando_format::SegId;
+use pando_format::{SegId, u64_from};
 
 use super::Cache;
 
@@ -27,34 +29,36 @@ pub(super) struct Kept {
 impl Kept {
     /// The kept frame at `off` of `seg`, when it is exactly `n` bytes; it is kept no longer.
     pub(super) fn take(&self, seg: SegId, off: u32, n: u32) -> Option<Bytes> {
-        let (_, b) = self.frames.lock().expect("kept lock").remove(&(seg, off))?;
-        self.bytes.fetch_sub(b.len() as u64, Ordering::Relaxed);
+        let (_, b) = self.frames.lock().remove(&(seg, off))?;
+        self.bytes.fetch_sub(u64_from(b.len()), Ordering::Relaxed);
         (b.len() == n as usize).then_some(b)
     }
 
     pub(super) fn has(&self, seg: SegId, off: u32) -> bool {
-        self.frames.lock().expect("kept lock").contains_key(&(seg, off))
+        self.frames.lock().contains_key(&(seg, off))
     }
 
     fn expire(&self, k: (SegId, u32), id: u64) {
-        let mut m = self.frames.lock().expect("kept lock");
-        if m.get(&k).is_some_and(|(i, _)| *i == id) {
-            let (_, b) = m.remove(&k).expect("checked above");
-            self.bytes.fetch_sub(b.len() as u64, Ordering::Relaxed);
+        let mut m = self.frames.lock();
+        if let Entry::Occupied(o) = m.entry(k)
+            && o.get().0 == id
+        {
+            let (_, b) = o.remove();
+            self.bytes.fetch_sub(u64_from(b.len()), Ordering::Relaxed);
         }
     }
 }
 
 impl Cache {
     pub(super) fn keep_frame(&self, seg: SegId, off: u32, z: &[u8]) {
-        let n = z.len() as u64;
+        let n = u64_from(z.len());
         if self.kept.bytes.fetch_add(n, Ordering::Relaxed) + n > KEPT_MAX {
             self.kept.bytes.fetch_sub(n, Ordering::Relaxed);
             return;
         }
         let id = self.kept.next.fetch_add(1, Ordering::Relaxed);
         {
-            let mut m = self.kept.frames.lock().expect("kept lock");
+            let mut m = self.kept.frames.lock();
             if m.contains_key(&(seg, off)) {
                 self.kept.bytes.fetch_sub(n, Ordering::Relaxed);
                 return;

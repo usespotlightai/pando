@@ -9,7 +9,9 @@ use crate::FormatError;
 /// ignores. Any other change to the encoding of a stored object takes a new major version.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StoreFormat {
+    /// Changes when old builds can no longer read the store.
     pub major: u32,
+    /// Changes when a store gains what old builds of the same major version ignore.
     pub minor: u32,
 }
 
@@ -20,7 +22,7 @@ impl StoreFormat {
     pub const UNMARKED: StoreFormat = StoreFormat { major: 1, minor: 0 };
 
     /// `pando-format <major>.<minor>\n`.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(self) -> Vec<u8> {
         format!("pando-format {self}\n").into_bytes()
     }
 
@@ -42,7 +44,7 @@ impl StoreFormat {
     }
 
     /// Whether this build can read and write a store in format `store`.
-    pub fn reads(&self, store: StoreFormat) -> bool {
+    pub fn reads(self, store: StoreFormat) -> bool {
         self.major == store.major
     }
 }

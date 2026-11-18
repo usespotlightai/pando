@@ -1,4 +1,4 @@
-use crate::{ENTRY_SIZE, Entry, FormatError};
+use crate::{ENTRY_SIZE, Entry, FormatError, u64_from};
 
 /// The tree's fanout: each level takes 8 bits of the chunk index.
 pub const FANOUT: usize = 256;
@@ -13,20 +13,24 @@ pub struct Node {
 }
 
 impl Node {
+    /// A node with every child empty.
     pub fn new() -> Node {
         Node {
             children: Box::new([Entry::EMPTY; FANOUT]),
         }
     }
 
+    /// The child in `slot`; [`Entry::EMPTY`] when there is none.
     pub fn child(&self, slot: u8) -> &Entry {
         &self.children[usize::from(slot)]
     }
 
+    /// Sets the child in `slot`; an empty `e` removes it.
     pub fn set(&mut self, slot: u8, e: Entry) {
         self.children[usize::from(slot)] = e;
     }
 
+    /// Whether every child is empty.
     pub fn is_empty(&self) -> bool {
         self.children.iter().all(Entry::is_empty)
     }
@@ -38,6 +42,7 @@ impl Node {
             .filter(|(_, e)| !e.is_empty())
     }
 
+    /// The encoding described on [`Node`]. Equal nodes encode, and so hash, the same.
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(2 + FANOUT * (1 + ENTRY_SIZE));
         b.extend_from_slice(&[0, 0]);
@@ -51,6 +56,8 @@ impl Node {
         b
     }
 
+    /// Decodes a node; its slots must ascend strictly, no child may be empty, and its length must
+    /// match its child count, so the only bytes that decode to a node are its encoding.
     pub fn decode(b: &[u8]) -> Result<Node, FormatError> {
         let bad = |why: &str| FormatError::malformed("node", why.to_string());
         let count = usize::from(u16::from_le_bytes([
@@ -62,13 +69,17 @@ impl Node {
         }
         let mut n = Node::new();
         let mut last: Option<u8> = None;
-        for rec in b[2..].as_chunks::<{ 1 + ENTRY_SIZE }>().0 {
-            let slot = rec[0];
+        for [slot, entry @ ..] in b[2..].as_chunks::<{ 1 + ENTRY_SIZE }>().0 {
+            let slot = *slot;
             if last.is_some_and(|l| l >= slot) {
                 return Err(bad("slots out of order"));
             }
             last = Some(slot);
-            n.set(slot, Entry::read(rec, 1).expect("record holds an entry"));
+            let e = Entry::from_bytes(entry);
+            if e.is_empty() {
+                return Err(bad("empty child"));
+            }
+            n.set(slot, e);
         }
         Ok(n)
     }
@@ -89,17 +100,17 @@ impl std::fmt::Debug for Node {
 /// The tree depth that addresses `chunks` chunks.
 pub fn depth_for(chunks: u64) -> usize {
     let mut d = 1;
-    let mut cap = FANOUT as u64;
+    let mut cap = u64_from(FANOUT);
     while cap < chunks {
         d += 1;
-        cap = cap.saturating_mul(FANOUT as u64);
+        cap = cap.saturating_mul(u64_from(FANOUT));
     }
     d
 }
 
-/// The slot of chunk `idx` in a node at `level` (0 = leaf level).
+/// The slot of chunk `idx` in a node at `level` (0 = leaf level); 0 above the top byte.
 pub fn digit(idx: u64, level: usize) -> u8 {
-    (idx >> (8 * level)) as u8
+    idx.to_le_bytes().get(level).copied().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -134,5 +145,6 @@ mod tests {
     fn digit_takes_eight_bits_per_level() {
         assert_eq!(digit(0x01_02_03, 0), 3);
         assert_eq!(digit(0x01_02_03, 2), 1);
+        assert_eq!(digit(u64::MAX, 8), 0);
     }
 }

@@ -1,0 +1,104 @@
+[package]
+name = "pando-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+arbitrary = { version = "=1.5.0", features = ["derive"] }
+bytes = "=1.12.1"
+libfuzzer-sys = "=0.4.13"
+pando-format = { path = "../pando-format" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_builder"
+path = "fuzz_targets/frame_builder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node"
+path = "fuzz_targets/node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "change_list"
+path = "fuzz_targets/change_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "change_list_encode"
+path = "fuzz_targets/change_list_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recording"
+path = "fuzz_targets/recording.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recipe"
+path = "fuzz_targets/recipe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recipe_encode"
+path = "fuzz_targets/recipe_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reference"
+path = "fuzz_targets/reference.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entry"
+path = "fuzz_targets/entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keys"
+path = "fuzz_targets/keys.rs"
+test = false
+doc = false
+bench = false

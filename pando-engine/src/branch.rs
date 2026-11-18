@@ -10,7 +10,7 @@ use crate::{Error, Ports, Result};
 /// name deleted segments.
 pub async fn copy(ports: &Ports, src: &str, dst: &str, max_age: Option<Duration>) -> Result<()> {
     let started = tokio::time::Instant::now();
-    let remote = Remote::new(ports.store.clone());
+    let remote = Remote::new(std::sync::Arc::clone(&ports.store));
     let (mut r, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
     r.generation = 0;
     r.from = Some(src.to_owned());
@@ -28,7 +28,7 @@ pub async fn copy(ports: &Ports, src: &str, dst: &str, max_age: Option<Duration>
 
 /// Moves branch `dst` to the published root of `src`, unless `dst` changed meanwhile.
 pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
-    let remote = Remote::new(ports.store.clone());
+    let remote = Remote::new(std::sync::Arc::clone(&ports.store));
     let (from, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
     let (mut to, version) = remote.get_ref(dst).await?.ok_or_else(|| no_branch(dst))?;
     if to.size != from.size {
@@ -43,12 +43,14 @@ pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
 
 /// Deletes branch `name`. Its segments go at the next GC that finds them unreached.
 pub async fn delete(ports: &Ports, name: &str) -> Result<()> {
-    Remote::new(ports.store.clone()).delete_ref(name).await
+    Remote::new(std::sync::Arc::clone(&ports.store))
+        .delete_ref(name)
+        .await
 }
 
 /// The names of every branch.
 pub async fn list(ports: &Ports) -> Result<Vec<String>> {
-    Remote::new(ports.store.clone()).list_refs().await
+    Remote::new(std::sync::Arc::clone(&ports.store)).list_refs().await
 }
 
 fn no_branch(name: &str) -> Error {

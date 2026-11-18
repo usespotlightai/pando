@@ -1,14 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-    "pando-format",
-    "pando-engine",
-    "pando-s3",
-    "pando-host",
-    "pando-linux",
-    "pando-dst",
-    "pando",
-]
+members = ["pando-format", "pando-engine", "pando-s3", "pando-host", "pando-linux", "pando-dst", "pando"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -33,6 +25,7 @@ futures = "0.3.34"
 hex = "0.4.3"
 io-uring = "0.7.16"
 libc = "0.2.186"
+parking_lot = "0.12.5"
 object_store = { version = "0.14.2", default-features = false }
 proptest = "1.12.0"
 rand = "0.10.4"
@@ -47,14 +40,75 @@ zstd = "0.14.4"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
+missing_docs = "warn"
 unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_extern_crates = "warn"
+unused_macro_rules = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+non_ascii_idents = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-undocumented_unsafe_blocks = "warn"
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
 dbg_macro = "warn"
+exit = "warn"
+expect_used = "warn"
+float_cmp_const = "warn"
+get_unwrap = "warn"
+infinite_loop = "warn"
+iter_over_hash_type = "warn"
+large_stack_frames = "warn"
+lossy_float_literal = "warn"
+mem_forget = "warn"
+mixed_read_write_in_expression = "warn"
+multiple_unsafe_ops_per_block = "warn"
+mutex_atomic = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+same_name_method = "warn"
+string_slice = "warn"
 todo = "warn"
+try_err = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unreachable = "warn"
+unused_result_ok = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+verbose_file_reads = "warn"
+wildcard_enum_match_arm = "warn"
+debug_assert_with_mut_call = "warn"
+significant_drop_in_scrutinee = "warn"
+redundant_clone = "warn"
+needless_collect = "warn"
+or_fun_call = "warn"
+path_buf_push_overwrite = "warn"
+read_zero_byte_vec = "warn"
+suspicious_operation_groupings = "warn"
+trait_duplication_in_bounds = "warn"
+type_repetition_in_bounds = "warn"
+useless_let_if_seq = "warn"
+future_not_send = "warn"
 
 [profile.release]
 debug = "line-tables-only"
+overflow-checks = true

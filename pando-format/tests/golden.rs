@@ -1,8 +1,9 @@
 //! Checks the codecs against the byte fixtures in `tests/fixtures`, so the encoding of every
-//! stored object stays fixed. With PANDO_RUST_OUT set, also writes the encodings there, so
+//! stored object stays fixed. With `PANDO_RUST_OUT` set, also writes the encodings there, so
 //! another decoder can check them.
 
-#![allow(clippy::disallowed_methods, reason = "the tests read the fixture files")]
+#![cfg(test)]
+#![expect(clippy::disallowed_methods, reason = "the tests read the fixture files")]
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -44,7 +45,11 @@ impl Golden {
 }
 
 fn golden_seg(n: u8) -> SegId {
-    SegId(std::array::from_fn(|i| n + i as u8))
+    let mut id = [0; 16];
+    for (b, v) in id.iter_mut().zip(n..) {
+        *b = v;
+    }
+    SegId(id)
 }
 
 fn rust_out(name: &str, b: &[u8]) {
@@ -106,8 +111,12 @@ fn nodes_and_depths_are_byte_exact() {
     assert_eq!(n.children().map(|(s, _)| s).collect::<Vec<_>>(), vec![0, 7, 255]);
     rust_out("node.bin", &n.encode());
     assert_eq!(Node::new().encode(), g.file("node_empty.bin"));
-    for (k, v) in g.manifest.iter().filter(|(k, _)| k.starts_with("depth_for.")) {
-        let chunks: u64 = k["depth_for.".len()..].parse().unwrap();
+    for (chunks, v) in g
+        .manifest
+        .iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix("depth_for.")?, v)))
+    {
+        let chunks: u64 = chunks.parse().unwrap();
         assert_eq!(depth_for(chunks).to_string(), *v, "depth for {chunks} chunks");
     }
     for name in g.get("tree_from.nodes").split(',') {
@@ -219,7 +228,7 @@ fn change_lists_are_byte_exact() {
     assert_eq!(cl.changes.len().to_string(), g.get("change_list.changes"));
     assert_eq!(
         cl.changes.iter().map(|c| c.idx).collect::<Vec<_>>(),
-        vec![1, 70000, 300000]
+        vec![1, 70000, 300_000]
     );
     assert!(cl.changes[0].keys.is_none() && cl.changes[1].entry.is_empty());
     assert_eq!(cl.changes[2].keys, Some(BlockKeys::of(&g.file("chunk_a.bin"))));

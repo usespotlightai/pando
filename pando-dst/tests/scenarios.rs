@@ -1,3 +1,5 @@
+//! The seeded scenarios, over many seeds.
+
 use pando_dst::scenario;
 
 #[tokio::test(start_paused = true)]

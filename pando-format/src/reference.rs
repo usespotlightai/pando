@@ -5,9 +5,13 @@ use crate::{Entry, FormatError};
 /// ref the branch was forked from, so hosts can follow it.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ref {
+    /// The branch's size in bytes.
     pub size: u64,
+    /// The root of the branch's tree; empty for a branch with no data.
     pub root: Entry,
+    /// The generation of the branch's current writer.
     pub generation: u64,
+    /// The name of the ref the branch was forked from.
     pub from: Option<String>,
 }
 
@@ -16,11 +20,14 @@ impl Ref {
     pub fn encode(&self) -> Vec<u8> {
         let mut s = format!("{} {} {}\n", self.size, self.generation, self.root);
         if let Some(from) = &self.from {
-            s += &format!("from {from}\n");
+            s.push_str("from ");
+            s.push_str(from);
+            s.push('\n');
         }
         s.into_bytes()
     }
 
+    /// Decodes the text form [`Ref::encode`] writes, ignoring surrounding whitespace.
     pub fn decode(b: &[u8]) -> Result<Ref, FormatError> {
         let bad = |why: &str| FormatError::malformed("ref", why.to_string());
         let s = std::str::from_utf8(b).map_err(|_| bad("not UTF-8"))?.trim();

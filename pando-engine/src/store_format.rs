@@ -10,7 +10,9 @@ use crate::{Error, Result};
 /// Whether a command may write to the store, and so may write its format marker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Access {
+    /// The command only reads the store.
     Read,
+    /// The command may write the store.
     Write,
 }
 

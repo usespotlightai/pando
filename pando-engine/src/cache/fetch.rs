@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use pando_format::{Entry, Hash, Recipe, SegId, SegmentIndex, decode_frame};
+use pando_format::{Entry, Hash, Recipe, SegId, SegmentIndex, decode_frame, u64_from};
 use tokio::time::Instant;
 
 use super::held::HeldId;
@@ -79,20 +79,22 @@ impl Cache {
         let r = self.fetch_frames(e.loc.seg, &[e.loc.frame], background).await;
         if !background {
             self.stats.stalls.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .stall_nanos
-                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.stats.stall_nanos.fetch_add(
+                u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         r.map(drop)
     }
 
     pub(super) fn has_index(&self, seg: &SegId) -> bool {
-        self.indexes.lock().expect("indexes lock").contains_key(seg)
+        self.indexes.lock().contains_key(seg)
     }
 
     pub(super) async fn seg_index(&self, seg: SegId) -> Result<Arc<SegmentIndex>> {
         for _ in 0..2 {
-            if let Some(i) = self.indexes.lock().expect("indexes lock").get(&seg).cloned() {
+            let known = self.indexes.lock().get(&seg).cloned();
+            if let Some(i) = known {
                 return Ok(i);
             }
             match self.index_flights.join(&seg, false) {
@@ -101,11 +103,11 @@ impl Cache {
                     return match self.remote.get_index(seg).await {
                         Ok(i) => {
                             let i = Arc::new(i);
-                            self.indexes.lock().expect("indexes lock").insert(seg, i.clone());
+                            self.indexes.lock().insert(seg, Arc::clone(&i));
                             claim.finish(Ok(()))?;
                             Ok(i)
                         }
-                        Err(e) => Err(claim.finish(Err(e)).expect_err("finished with an error")),
+                        Err(e) => claim.finish(Err(e)).and(Err(Error::Cancelled)),
                     };
                 }
             }
@@ -124,7 +126,7 @@ impl Cache {
         let idx = self.seg_index(seg).await?;
         let mut mine: BTreeMap<u32, Claim<'_, FrameKey>> = BTreeMap::new();
         let mut waits = Vec::new();
-        for f in frames.iter().copied().collect::<BTreeSet<_>>() {
+        for f in frames.iter().copied() {
             if f as usize >= idx.frames.len() {
                 return Err(Error::Corrupt(format!("frame {f} out of range in segment {seg}")));
             }
@@ -184,7 +186,7 @@ impl Cache {
             Err(e) => {
                 let e = shared(e);
                 for (_, c) in run {
-                    let _ = c.finish(Err(Error::Shared(e.clone())));
+                    let _ = c.finish(Err(Error::Shared(Arc::clone(&e))));
                 }
                 Err(Error::Shared(e))
             }
@@ -222,7 +224,7 @@ impl Cache {
             if let Err(e) = claim.finish(r) {
                 let e = shared(e);
                 for (_, c) in run {
-                    let _ = c.finish(Err(Error::Shared(e.clone())));
+                    let _ = c.finish(Err(Error::Shared(Arc::clone(&e))));
                 }
                 return RunDone {
                     result: Err(Error::Shared(e)),
@@ -245,10 +247,10 @@ impl Cache {
             self.stats.kept_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(b);
         }
-        let tail = self.tails.lock().expect("tails lock").get(&seg).cloned();
+        let tail = self.tails.lock().get(&seg).cloned();
         if let Some(t) = tail
             && off >= t.off
-            && u64::from(off) + u64::from(n) <= u64::from(t.off) + t.bytes.len() as u64
+            && u64::from(off) + u64::from(n) <= u64::from(t.off) + u64_from(t.bytes.len())
         {
             let at = (off - t.off) as usize;
             return Ok(t.bytes.slice(at..at + n as usize));
@@ -256,7 +258,7 @@ impl Cache {
         let b = self.remote.get_range(seg, off, n).await?;
         self.stats
             .bytes_fetched
-            .fetch_add(b.len() as u64, Ordering::Relaxed);
+            .fetch_add(u64_from(b.len()), Ordering::Relaxed);
         Ok(b)
     }
 
@@ -272,16 +274,21 @@ impl Cache {
         sources: &mut Vec<Entry>,
     ) -> Result<()> {
         let decoded = on_cpu(self.cpu.as_ref(), class(d.background), move || {
-            decode_frame(&z, keep.as_ref().map(|k| k.as_ref() as &dyn Fn(&Hash) -> bool))
+            let keep = keep.as_ref().map(|k| -> &dyn Fn(&Hash) -> bool { k.as_ref() });
+            decode_frame(&z, keep)
         })
         .await?;
-        for (h, v) in decoded.objects {
+        let mut objects: Vec<_> = decoded.objects.into_iter().collect();
+        objects.sort_unstable_by_key(|(h, _)| *h);
+        let mut recipes: Vec<_> = decoded.recipes.into_iter().collect();
+        recipes.sort_unstable_by_key(|(h, _)| *h);
+        for (h, v) in objects {
             let b = v.into_bytes();
             if !d.sink.is_some_and(|s| s.object(&h, &b)) {
                 self.log.put(h, b).await?;
             }
         }
-        for (h, enc) in decoded.recipes {
+        for (h, enc) in recipes {
             if d.sink.is_some_and(|s| s.recipe(&h, &enc)) || self.has(&h).await {
                 continue;
             }
@@ -323,9 +330,9 @@ impl Cache {
         let ((bytes, size), _) = (tail.ok()?, idx.ok()?);
         self.stats
             .bytes_fetched
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        let off = size - bytes.len() as u32;
-        let mut tails = self.tails.lock().expect("tails lock");
+            .fetch_add(u64_from(bytes.len()), Ordering::Relaxed);
+        let off = size.checked_sub(u32::try_from(bytes.len()).ok()?)?;
+        let mut tails = self.tails.lock();
         if tails.contains_key(&seg) {
             return None;
         }
@@ -362,7 +369,7 @@ impl Cache {
                 },
             )
             .await;
-        let mut tails = self.tails.lock().expect("tails lock");
+        let mut tails = self.tails.lock();
         for seg in mine {
             tails.remove(&seg);
         }

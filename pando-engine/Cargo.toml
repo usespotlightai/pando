@@ -17,9 +17,10 @@ futures.workspace = true
 pando-format.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+parking_lot.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

@@ -19,7 +19,7 @@ use crate::local::{read_file, write_atomic};
 use crate::tree::Tree;
 use crate::{Ports, Result};
 
-pub(crate) const FOLLOW_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+pub(crate) const FOLLOW_MAX_AGE: Duration = Duration::from_hours(168);
 
 fn escape(name: &str) -> String {
     name.replace('%', "%25").replace('/', "%2F")
@@ -123,7 +123,7 @@ impl Follower {
     /// how many it built.
     pub async fn once(&mut self) -> Result<usize> {
         let dir = self.bases.follow_dir();
-        let fs = self.bases.fs.clone();
+        let fs = Arc::clone(&self.bases.fs);
         let Ok(entries) = fs.list(&dir).await else {
             return Ok(0);
         };
@@ -159,7 +159,7 @@ impl Follower {
             if self.bases.has(&r.root.hash).await {
                 let _ = self.bases.touch(&path).await;
             } else {
-                let tree = Tree::new(self.cache.clone(), r.size.div_ceil(CHUNK_SIZE as u64));
+                let tree = Tree::new(Arc::clone(&self.cache), r.size.div_ceil(CHUNK_SIZE as u64));
                 let opts = BuildOptions {
                     parallel: self.parallel,
                     serve: false,

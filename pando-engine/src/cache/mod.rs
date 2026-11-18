@@ -11,13 +11,15 @@ mod kept;
 mod partial;
 mod recorder;
 mod sched;
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests;
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -31,15 +33,20 @@ use crate::ports::{Cpu, CpuClass, LocalFs};
 use crate::remote::Remote;
 use crate::{Error, Result};
 
+/// Counts of what a [`Cache`] served and fetched since it was opened.
 #[derive(Debug, Default)]
 pub struct CacheStats {
+    /// Reads and gets served from this host without a fetch.
     pub hits: AtomicU64,
     /// Range GETs of frames.
     pub runs: AtomicU64,
+    /// Frames fetched from the store and decoded.
     pub frames_fetched: AtomicU64,
+    /// The compressed bytes fetched from the store.
     pub bytes_fetched: AtomicU64,
-    /// Foreground reads that waited for the store, and how long in all.
+    /// Foreground reads that waited for the store.
     pub stalls: AtomicU64,
+    /// How long those reads waited in all, in nanoseconds.
     pub stall_nanos: AtomicU64,
     /// GETs served from a kept frame.
     pub kept_hits: AtomicU64,
@@ -74,7 +81,18 @@ pub struct Cache {
 fn shared(e: Error) -> Arc<Error> {
     match e {
         Error::Shared(e) => e,
-        e => Arc::new(e),
+        e @ (Error::Fenced { .. }
+        | Error::ChunkLost { .. }
+        | Error::Store(_)
+        | Error::Format(_)
+        | Error::UnknownFormat { .. }
+        | Error::Io(_)
+        | Error::BeyondEnd
+        | Error::Shrink { .. }
+        | Error::Corrupt(_)
+        | Error::SegmentExists(_)
+        | Error::RefExists(_)
+        | Error::Cancelled) => Arc::new(e),
     }
 }
 
@@ -97,9 +115,9 @@ impl Cache {
     /// Opens the cache of this host in `dir`, in front of the store of `ports`.
     pub async fn open(ports: &crate::Ports, dir: &Path) -> Result<Cache> {
         Cache::open_with(
-            ports.fs.clone(),
-            ports.cpu.clone(),
-            Remote::new(ports.store.clone()),
+            Arc::clone(&ports.fs),
+            Arc::clone(&ports.cpu),
+            Remote::new(Arc::clone(&ports.store)),
             dir,
         )
         .await
@@ -129,6 +147,7 @@ impl Cache {
         })
     }
 
+    /// The counters of this cache.
     pub fn stats(&self) -> &CacheStats {
         &self.stats
     }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use pando_format::{CHUNK_SIZE, Hash};
+use pando_format::{CHUNK_SIZE, Hash, u64_from, usize_from};
 
 use super::Cache;
 use crate::ports::LocalFile;
@@ -39,7 +39,7 @@ impl PartialBase {
                 (
                     h,
                     Place {
-                        off: idx * CHUNK_SIZE as u64,
+                        off: idx * u64_from(CHUNK_SIZE),
                         ready: AtomicU64::new(0),
                     },
                 )
@@ -51,7 +51,7 @@ impl PartialBase {
     /// Marks chunk `h` ready once its `n` bytes are at its first place.
     pub(crate) fn written(&self, h: &Hash, n: usize) {
         if let Some(p) = self.chunks.get(h) {
-            p.ready.store(n as u64 + 1, Ordering::Release);
+            p.ready.store(u64_from(n) + 1, Ordering::Release);
         }
     }
 
@@ -59,13 +59,13 @@ impl PartialBase {
     pub(crate) fn first_at(&self, h: &Hash, idx: u64) -> bool {
         self.chunks
             .get(h)
-            .is_some_and(|p| p.off == idx * CHUNK_SIZE as u64)
+            .is_some_and(|p| p.off == idx * u64_from(CHUNK_SIZE))
     }
 
     fn ready(&self, h: &Hash) -> Option<(u64, usize)> {
         let p = self.chunks.get(h)?;
         let n = p.ready.load(Ordering::Acquire);
-        (n > 0).then(|| (p.off, (n - 1) as usize))
+        (n > 0).then(|| (p.off, usize_from(n - 1)))
     }
 
     pub(crate) fn has(&self, h: &Hash) -> bool {
@@ -77,7 +77,7 @@ impl PartialBase {
         if inner + len > n {
             return None;
         }
-        let b = self.file.read_at(len, off + inner as u64).await.ok()?;
+        let b = self.file.read_at(len, off + u64_from(inner)).await.ok()?;
         (b.len() == len).then_some(b)
     }
 
@@ -91,7 +91,7 @@ impl PartialBase {
             return false;
         };
         inner + dst.len() <= n
-            && matches!(self.file.read_at_nowait(dst, off + inner as u64), Ok(Some(k)) if k == dst.len())
+            && matches!(self.file.read_at_nowait(dst, off + u64_from(inner)), Ok(Some(k)) if k == dst.len())
     }
 }
 
@@ -105,24 +105,24 @@ pub(crate) enum BaseKey {
 impl Cache {
     /// Lets reads take the chunks of `base` as they become ready.
     pub(crate) fn serve_base(&self, key: BaseKey, base: Arc<PartialBase>) {
-        self.bases.write().expect("bases lock").insert(key, base);
+        self.bases.write().insert(key, base);
     }
 
     /// Ends reads from base `key`. A read that already holds it finishes on the file it has.
     pub(crate) fn stop_serving_base(&self, key: BaseKey) {
-        self.bases.write().expect("bases lock").remove(&key);
+        self.bases.write().remove(&key);
     }
 
     pub(crate) fn serves_base(&self, key: BaseKey) -> bool {
-        self.bases.read().expect("bases lock").contains_key(&key)
+        self.bases.read().contains_key(&key)
     }
 
     fn served(&self) -> Vec<Arc<PartialBase>> {
-        self.bases.read().expect("bases lock").values().cloned().collect()
+        self.bases.read().values().cloned().collect()
     }
 
     pub(super) fn base_has(&self, h: &Hash) -> bool {
-        self.bases.read().expect("bases lock").values().any(|b| b.has(h))
+        self.bases.read().values().any(|b| b.has(h))
     }
 
     pub(super) async fn base_object(&self, h: &Hash) -> Option<Bytes> {
@@ -146,12 +146,7 @@ impl Cache {
     }
 
     pub(super) fn base_read_nowait(&self, h: &Hash, inner: usize, dst: &mut [u8]) -> bool {
-        let hit = self
-            .bases
-            .read()
-            .expect("bases lock")
-            .values()
-            .any(|b| b.read_nowait(h, inner, dst));
+        let hit = self.bases.read().values().any(|b| b.read_nowait(h, inner, dst));
         if hit {
             self.stats.base_hits.fetch_add(1, Ordering::Relaxed);
         }

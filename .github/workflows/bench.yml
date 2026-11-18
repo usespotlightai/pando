@@ -34,9 +34,7 @@ concurrency:
   group: bench
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'eu-north-1' }}
@@ -45,9 +43,13 @@ env:
 
 jobs:
   bench:
+    name: Bench
     runs-on: ubuntu-latest
     environment: bench
     timeout-minutes: 350
+    permissions:
+      contents: read # check out the repository
+      id-token: write # assume the bench AWS role through OIDC
     defaults:
       run:
         working-directory: bench/infra
@@ -109,7 +111,7 @@ jobs:
         run: |
           terraform output -json hosts | jq -r 'to_entries[] | "\(.key) \(.value)"' > "$RUNNER_TEMP/hosts"
           while read -r name ip; do
-            for i in $(seq 60); do
+            for _ in $(seq 60); do
               ssh -n "$ip" true 2>/dev/null && break
               sleep 5
             done
@@ -123,7 +125,7 @@ jobs:
           S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
           S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
         run: |
-          while read -r name ip; do
+          while read -r _ ip; do
             git -C "$GITHUB_WORKSPACE" archive --format=tar HEAD |
               ssh "$ip" 'rm -rf /data/pando && mkdir -p /data/pando && tar -x -C /data/pando'
             # Over stdin into a root-only file: never on a command line, in user data or in the log.
@@ -135,7 +137,7 @@ jobs:
         if: inputs.action == 'run'
         run: |
           status=0
-          while read -r name ip; do
+          while read -r _ ip; do
             ssh -n "$ip" 'cd /data/pando && sudo bench/run.sh smoke' || status=1
           done < "$RUNNER_TEMP/hosts"
           exit $status
@@ -177,7 +179,7 @@ jobs:
       - name: Delete EBS snapshots and volumes the harness made
         if: always()
         run: |
-          filters=(Name=tag:Project,Values=pando-bench Name=tag:Origin,Values=harness)
+          filters=("Name=tag:Project,Values=pando-bench" "Name=tag:Origin,Values=harness")
           for v in $(aws ec2 describe-volumes --filters "${filters[@]}" --query 'Volumes[].VolumeId' --output text); do
             aws ec2 delete-volume --volume-id "$v" || echo "could not delete volume $v"
           done

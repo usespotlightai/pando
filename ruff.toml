@@ -1,0 +1,17 @@
+line-length = 110
+target-version = "py312"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "COM812", # conflicts with the formatter
+    "CPY001", # no per-file copyright headers in this repository
+    "D203",   # conflicts with D211
+    "D213",   # conflicts with D212
+    "S603",   # the harness runs commands by design; arguments never come from a shell string
+    "S607",   # the harness runs tools from PATH on a bench host it set up
+    "T201",   # the harness is a command-line tool that reports on stdout
+]
+
+[format]
+quote-style = "double"

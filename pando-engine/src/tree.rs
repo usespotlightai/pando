@@ -4,8 +4,9 @@
 //! copies only the path from the changed leaves to the root. New nodes are pending: they live
 //! only in the local cache until an upload packs them.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -40,9 +41,9 @@ impl Tree {
     /// The tree of depth `depth` over the same cache, sharing the nodes this one loaded.
     pub(crate) fn at_depth(&self, depth: usize) -> Tree {
         Tree {
-            cache: self.cache.clone(),
+            cache: Arc::clone(&self.cache),
             depth,
-            nodes: self.nodes.clone(),
+            nodes: Arc::clone(&self.nodes),
         }
     }
 
@@ -71,11 +72,11 @@ impl Tree {
     }
 
     fn cached(&self, h: &Hash) -> Option<Arc<Node>> {
-        self.nodes.lock().expect("nodes lock").get(h).cloned()
+        self.nodes.lock().get(h).cloned()
     }
 
     pub(crate) fn has_node(&self, h: &Hash) -> bool {
-        self.nodes.lock().expect("nodes lock").contains_key(h)
+        self.nodes.lock().contains_key(h)
     }
 
     pub(crate) async fn load(&self, e: &Entry, background: bool) -> Result<Arc<Node>> {
@@ -90,7 +91,7 @@ impl Tree {
             b
         };
         let n = Arc::new(Node::decode(&b)?);
-        self.nodes.lock().expect("nodes lock").insert(e.hash, n.clone());
+        self.nodes.lock().insert(e.hash, Arc::clone(&n));
         Ok(n)
     }
 
@@ -107,7 +108,7 @@ impl Tree {
         let b = Bytes::from(n.encode());
         let h = Hash::of(&b);
         self.cache.put_local(h, b).await?;
-        self.nodes.lock().expect("nodes lock").insert(h, Arc::new(n));
+        self.nodes.lock().insert(h, Arc::new(n));
         Ok(Entry {
             hash: h,
             ..Entry::EMPTY
@@ -116,7 +117,7 @@ impl Tree {
 
     /// Records `n`, stored under `h` already, as a loaded node.
     pub(crate) fn keep(&self, h: Hash, n: Node) {
-        self.nodes.lock().expect("nodes lock").insert(h, Arc::new(n));
+        self.nodes.lock().insert(h, Arc::new(n));
     }
 
     /// The entry of chunk `idx` under `root`; empty when the chunk was never written.
@@ -133,7 +134,7 @@ impl Tree {
 
     /// [`Self::lookup`] with only the nodes in memory: `None` when it needs another.
     pub(crate) fn lookup_nowait(&self, root: &Entry, idx: u64) -> Option<Entry> {
-        let nodes = self.nodes.lock().expect("nodes lock");
+        let nodes = self.nodes.lock();
         let mut e = *root;
         for level in (0..self.depth).rev() {
             if e.is_empty() {
@@ -244,16 +245,15 @@ impl Tree {
                     continue;
                 }
                 let packed = if level == 0 {
-                    let loc = match p.lookup(&c.hash) {
-                        Some(l) => l,
-                        None => {
-                            let b = self
-                                .cache
-                                .local(&c.hash)
-                                .await?
-                                .ok_or(Error::ChunkLost { hash: c.hash })?;
-                            p.append_chunk(c.hash, b).await?
-                        }
+                    let loc = if let Some(l) = p.lookup(&c.hash) {
+                        l
+                    } else {
+                        let b = self
+                            .cache
+                            .local(&c.hash)
+                            .await?
+                            .ok_or(Error::ChunkLost { hash: c.hash })?;
+                        p.append_chunk(c.hash, b).await?
                     };
                     Entry { hash: c.hash, loc }
                 } else {
@@ -315,10 +315,9 @@ impl Tree {
                     visit(prefix << 8 | u64::from(slot), *c);
                 }
             } else {
-                let next: Vec<_> = children
-                    .map(|(slot, c)| (*c, level - 1, prefix << 8 | u64::from(slot)))
-                    .collect();
-                stack.extend(next.into_iter().rev());
+                let start = stack.len();
+                stack.extend(children.map(|(slot, c)| (*c, level - 1, prefix << 8 | u64::from(slot))));
+                stack[start..].reverse();
             }
         }
         Ok(())
@@ -354,7 +353,7 @@ impl Tree {
             }
         }
         let n = kept.len();
-        let mut m = self.nodes.lock().expect("nodes lock");
+        let mut m = self.nodes.lock();
         for (h, node) in kept {
             m.entry(h).or_insert(node);
         }
@@ -453,23 +452,25 @@ impl Tree {
         parallel: usize,
         keys_of: impl Fn(&Hash) -> Option<BlockKeys>,
     ) -> Result<ChangeList> {
+        let depth = u8::try_from(self.depth)
+            .map_err(|_| Error::Corrupt(format!("a tree of depth {}", self.depth)))?;
         let changes = self.changed_leaves(from, root, parallel).await?;
-        let mut seen: HashMap<NodeAt, ()> = HashMap::new();
+        let mut seen: HashSet<NodeAt> = HashSet::new();
         let mut nodes = Vec::new();
         for (idx, _) in &changes {
             let mut e = *root;
-            for level in (0..self.depth).rev() {
+            for level in (0..depth).rev() {
                 if e.is_empty() {
                     break;
                 }
                 let at = NodeAt {
-                    level: level as u8,
-                    prefix: idx.checked_shr(8 * (level as u32 + 1)).unwrap_or(0),
+                    level,
+                    prefix: idx.checked_shr(8 * (u32::from(level) + 1)).unwrap_or(0),
                 };
-                if seen.insert(at, ()).is_none() {
+                if seen.insert(at) {
                     nodes.push((at, e));
                 }
-                e = *self.load(&e, true).await?.child(digit(*idx, level));
+                e = *self.load(&e, true).await?.child(digit(*idx, usize::from(level)));
             }
         }
         let changes = changes
@@ -485,7 +486,7 @@ impl Tree {
             })
             .collect();
         Ok(ChangeList {
-            depth: self.depth as u8,
+            depth,
             nodes,
             changes,
         })
@@ -530,7 +531,8 @@ impl Tree {
     ) -> BoxFuture<'a, Result<Entry>> {
         Box::pin(async move {
             let at = NodeAt {
-                level: level as u8,
+                level: u8::try_from(level)
+                    .map_err(|_| Error::Corrupt(format!("a tree node at level {level}")))?,
                 prefix,
             };
             let want = nodes.get(&at).copied().unwrap_or(Entry::EMPTY);
@@ -576,7 +578,8 @@ impl Tree {
     }
 }
 
-#[cfg(all(test, feature = "sim"))]
+#[cfg(test)]
+#[cfg(feature = "sim")]
 mod tests {
     use std::path::Path;
 
@@ -594,9 +597,9 @@ mod tests {
     async fn tree(seed: u64) -> Tree {
         let (ports, _, _) = sim::ports(seed);
         let c = Cache::open_with(
-            ports.fs.clone(),
-            ports.cpu.clone(),
-            Remote::new(ports.store.clone()),
+            Arc::clone(&ports.fs),
+            Arc::clone(&ports.cpu),
+            Remote::new(Arc::clone(&ports.store)),
             Path::new("/c"),
         )
         .await
@@ -613,12 +616,12 @@ mod tests {
             .await
             .unwrap();
         let b = t
-            .update(&a, &[(1, leaf(2)), (70000, Entry::EMPTY), (300000, leaf(1))])
+            .update(&a, &[(1, leaf(2)), (70000, Entry::EMPTY), (300_000, leaf(1))])
             .await
             .unwrap();
         assert_eq!(t.lookup(&b, 0, false).await.unwrap(), leaf(1));
         assert_eq!(t.lookup(&b, 70000, false).await.unwrap(), Entry::EMPTY);
-        assert_eq!(t.lookup_nowait(&b, 300000), Some(leaf(1)));
+        assert_eq!(t.lookup_nowait(&b, 300_000), Some(leaf(1)));
         assert_eq!(
             t.lookup(&a, 70000, false).await.unwrap(),
             leaf(2),
@@ -635,7 +638,10 @@ mod tests {
         assert_eq!(leaves, 4);
 
         let diff = t.changed_leaves(&a, &b, 4).await.unwrap();
-        assert_eq!(diff, vec![(1, leaf(2)), (70000, Entry::EMPTY), (300000, leaf(1))]);
+        assert_eq!(
+            diff,
+            vec![(1, leaf(2)), (70000, Entry::EMPTY), (300_000, leaf(1))]
+        );
         assert_eq!(
             t.update(
                 &b,
@@ -643,7 +649,7 @@ mod tests {
                     (0, Entry::EMPTY),
                     (1, Entry::EMPTY),
                     (70001, Entry::EMPTY),
-                    (300000, Entry::EMPTY)
+                    (300_000, Entry::EMPTY)
                 ]
             )
             .await
@@ -683,10 +689,10 @@ mod tests {
         use pando_format::{CHUNK_SIZE, Writer, WriterId};
 
         let (ports, _, _) = sim::ports(5);
-        let remote = Remote::new(ports.store.clone());
+        let remote = Remote::new(Arc::clone(&ports.store));
         let c = Cache::open_with(
-            ports.fs.clone(),
-            ports.cpu.clone(),
+            Arc::clone(&ports.fs),
+            Arc::clone(&ports.cpu),
             remote.clone(),
             Path::new("/a"),
         )
@@ -694,8 +700,8 @@ mod tests {
         .unwrap();
         let t = Tree::new(Arc::new(c), 1 << 20);
         let mut ups = Vec::new();
-        for i in [3u64, 9, 70000, 900000] {
-            let b = Bytes::from(vec![i as u8 + 1; CHUNK_SIZE]);
+        for i in [3u64, 9, 70000, 900_000] {
+            let b = Bytes::from(vec![i.to_le_bytes()[0] + 1; CHUNK_SIZE]);
             let h = Hash::of(&b);
             t.cache().put_local(h, b).await.unwrap();
             ups.push((
@@ -710,7 +716,7 @@ mod tests {
         let writer = Arc::new(Writer::new(WriterId::new("main", 1), 0));
         let mut p = Packer::new(
             remote.clone(),
-            ports.cpu.clone(),
+            Arc::clone(&ports.cpu),
             writer,
             crate::packer::SEG_MAX,
             Arc::default(),
@@ -724,9 +730,14 @@ mod tests {
             "chunks, the root, and two nodes per lower level"
         );
 
-        let c2 = Cache::open_with(ports.fs.clone(), ports.cpu.clone(), remote, Path::new("/b"))
-            .await
-            .unwrap();
+        let c2 = Cache::open_with(
+            Arc::clone(&ports.fs),
+            Arc::clone(&ports.cpu),
+            remote,
+            Path::new("/b"),
+        )
+        .await
+        .unwrap();
         let t2 = Tree::new(Arc::new(c2), 1 << 20);
         assert_eq!(
             t2.prefetch_nodes(&packed, 4).await.unwrap(),
@@ -736,12 +747,12 @@ mod tests {
         let e = t2.lookup(&packed, 70000, false).await.unwrap();
         assert_eq!(
             t2.cache().get(&e).await.unwrap(),
-            Bytes::from(vec![70000u64 as u8 + 1; CHUNK_SIZE])
+            Bytes::from(vec![70000u64.to_le_bytes()[0] + 1; CHUNK_SIZE])
         );
 
         let c3 = Cache::open_with(
-            ports.fs.clone(),
-            ports.cpu.clone(),
+            Arc::clone(&ports.fs),
+            Arc::clone(&ports.cpu),
             t2.cache().remote().clone(),
             Path::new("/c"),
         )

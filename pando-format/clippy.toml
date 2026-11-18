@@ -1,3 +1,9 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true
+avoid-breaking-exported-api = false
 disallowed-methods = [
     { path = "std::time::Instant::now", reason = "the format has no clock" },
     { path = "std::time::SystemTime::now", reason = "the format has no clock" },
