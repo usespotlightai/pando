@@ -201,8 +201,10 @@ The benchmarks use one AWS host in eu-north-1 and a bucket in the same region:
   gp3 EBS volume serves the EBS rows. A second, identical host is started only for the cross-host
   `cold` and `save` measures.
 - **OS**: Ubuntu 26.04 with `ublk_drv`, `nbd` and `dm-mod` loaded, with no other tenants.
-- **cost**: a full run should take 4-6 hours on one host and about 1 hour on the second. Compute
-  should cost under $15, plus S3 and ECR requests.
+- **cost**: a full run should take 6-8 hours on one host and about 1 hour on the second: SOCI,
+  Nydus, ZeroFS and Amazon S3 Files alone took 5.5 hours, most of it S3 Files, which copies and
+  deletes all 129k files over NFS for every branch. Compute should cost under $15, plus S3, S3
+  Files and ECR requests.
 
 ### Creating the hosts
 

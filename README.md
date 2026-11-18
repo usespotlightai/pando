@@ -100,10 +100,9 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** Every system has every result, except that Amazon S3 Files has two of its
-> three agent workload runs so far. Pando's rows are from an earlier run than the others, on the
-> same bench VM (AWS `m8id.4xlarge`, eu-north-1; see [bench/README.md](bench/README.md)). Run
-> `python3 bench/plot.py` to redraw the charts from `bench/results/`.
+> **Pando's rows are from an earlier run** than those of SOCI, Nydus, ZeroFS and Amazon S3 Files,
+> on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see [bench/README.md](bench/README.md)).
+> Run `python3 bench/plot.py` to redraw the charts from `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
 1.4 GB and 129k files. All systems use the same VM and bucket. Results show medians of 5 runs,
@@ -241,8 +240,8 @@ Each system ran the replay 3 times on a fresh branch of a warm host, page cache 
 took 70.5 s. Most of JuiceFS's time is `npm ci`, about 9.5 min against 7.6 s; in its first
 repetition one `vitest` run failed, and it passed in the other two. SOCI, Nydus, ZeroFS and S3
 Files ran in a later run, against a native run of their own (70.3 s). On S3 Files, where every
-file operation is an NFS round trip, `npm ci` takes about 9.6 min, the first `git status` 43 s
-and the control-plane `tsc` and `vitest` about 75 s each.
+file operation is an NFS round trip, `npm ci` takes about 9.7 min, the first `git status` 44 s
+and the control-plane `tsc` and `vitest` 74 s and 83 s.
 
 <!-- bench:replay -->
 <picture>
@@ -265,7 +264,7 @@ and the control-plane `tsc` and `vitest` about 75 s each.
 | EBS snapshot to volume | 1.17x | 1.16x to 1.23x |
 | JuiceFS | 9.96x | 9.90x to 12.07x |
 | ZeroFS (NBD) | 1.16x | 1.12x to 1.17x |
-| Amazon S3 Files | 11.79x | 11.75x to 11.82x |
+| Amazon S3 Files | 11.82x | 11.75x to 11.84x |
 
 </details>
 <!-- /bench:replay -->

@@ -47,7 +47,7 @@
   <path d="M212,302.0 h365.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-365.8 z" fill="#656c76"><title>JuiceFS: 9.96x (range 9.90x to 12.07x)</title></path>
   <text x="587.8" y="313.0" font-size="12" fill="#9198a1">9.96x</text>
   <text x="202" y="339.0" font-size="12" fill="#f0f6fc" text-anchor="end">Amazon S3 Files</text>
-  <path d="M212,328.0 h433.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-433.5 z" fill="#656c76"><title>Amazon S3 Files: 11.79x (range 11.75x to 11.82x)</title></path>
-  <text x="655.5" y="339.0" font-size="12" fill="#9198a1">11.79x</text>
+  <path d="M212,328.0 h434.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-434.8 z" fill="#656c76"><title>Amazon S3 Files: 11.82x (range 11.75x to 11.84x)</title></path>
+  <text x="656.8" y="339.0" font-size="12" fill="#9198a1">11.82x</text>
   <line x1="249.1" y1="58" x2="249.1" y2="348" stroke="#9198a1" stroke-width="1.5"/>
 </svg>
