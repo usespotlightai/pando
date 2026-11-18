@@ -1,2 +1,7 @@
 bench/** linguist-detectable=false
 tools/** linguist-detectable=false
+tests/** linguist-detectable=false
+packaging/** linguist-detectable=false
+.tflint.hcl linguist-detectable=false
+bench/results/** linguist-generated=true
+docs/bench/** linguist-generated=true
