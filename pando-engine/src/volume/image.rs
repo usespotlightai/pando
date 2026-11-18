@@ -214,7 +214,7 @@ impl Volume {
         let _g = self.inner.stripe(idx).write().await;
         let mut m = self.inner.mem.lock();
         m.dirty_ref.remove(&idx);
-        m.dirty.remove(&idx).is_some()
+        m.dirty.remove(idx).is_some()
     }
 
     async fn take_write(&self, idx: u64, buf: Vec<u8>, r: Option<ChunkRef>) {

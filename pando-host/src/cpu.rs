@@ -10,11 +10,16 @@ pub(crate) struct PoolCpu {
 }
 
 impl PoolCpu {
-    pub(crate) fn new(threads: usize) -> io::Result<PoolCpu> {
+    pub(crate) fn new(threads: usize, flushers: bool) -> io::Result<PoolCpu> {
         let pool = |n: usize, name: &'static str| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(n.max(1))
                 .thread_name(move |i| format!("{name}-{i}"))
+                .start_handler(move |_| {
+                    if flushers {
+                        let _ = crate::io_flusher();
+                    }
+                })
                 .build()
                 .map_err(io::Error::other)
         };

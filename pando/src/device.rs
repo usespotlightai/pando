@@ -1,10 +1,14 @@
-//! The `attach`, `resize` and `detach` commands: a branch served as a block device. An attach
-//! listens on a control socket, `/run/pando/ublkbN.sock`, that `resize` asks to grow it. A
-//! request is one line, `grow <bytes>`; the answer is `ok <bytes>` or `error <why>`.
+//! The `attach`, `resize` and `detach` commands: a branch served as a block device, either a
+//! ublk device or, with `--fuse`, a loop device over a file in a FUSE mount. An attach listens
+//! on a control socket, `/run/pando/ublkbN.sock` or `/run/pando/fuse-<hash of the mount>.sock`,
+//! that `resize` asks to grow it. A request is one line, `grow <bytes>`; the answer is
+//! `ok <bytes>` or `error <why>`. The daemon of a FUSE mount also takes `detach` and
+//! `detach force`, and answers `ok` once the branch is published.
 //!
 //! On SIGTERM or SIGINT an attach drains: it publishes what the branch holds, for at most
-//! `--drain-wait`, and exits with [`DRAINED`] without stopping the device. The kernel holds the
-//! device's I/O until `attach --recover` takes it over.
+//! `--drain-wait`, and exits with [`DRAINED`] without stopping the device. The kernel holds a
+//! ublk device's I/O until `attach --recover` takes it over; a FUSE mount ends with its daemon,
+//! and the next `attach` of the branch on this host publishes the writes it left.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,7 +35,19 @@ pub(crate) enum Ended {
 #[derive(Debug)]
 pub(crate) struct Held {
     #[cfg(target_os = "linux")]
-    _frontend: pando_linux::Frontend,
+    _frontend: Served,
+}
+
+/// The frontend a daemon serves its branch through.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "a drained daemon only holds its frontend open until the process exits"
+)]
+enum Served {
+    Ublk(pando_linux::Frontend),
+    Fuse(std::sync::Arc<pando_linux::FuseFrontend>),
 }
 
 /// When `attach` takes over a device whose daemon died.
@@ -55,8 +71,15 @@ pub(crate) enum Recover {
 pub(crate) struct AttachArgs {
     pub(crate) name: String,
     /// The ublk device to serve the branch as, /dev/ublkbN.
+    #[arg(long, required_unless_present = "fuse", conflicts_with = "fuse")]
+    pub(crate) device: Option<PathBuf>,
+    /// Serve the branch as the file disk.img in a FUSE mount at this directory, bound to a
+    /// free loop device, for a kernel without ublk. The attach prints the loop device; make
+    /// and mount the file system on it. Works without --dm and --images; unmount it, then
+    /// `detach --fuse` publishes the branch. A signal syncs the file system and publishes,
+    /// but the mount ends with the daemon, so unmount first.
     #[arg(long)]
-    pub(crate) device: PathBuf,
+    pub(crate) fuse: Option<PathBuf>,
     /// Mount through this device-mapper device, /dev/mapper/<NAME>, over the ublk device.
     #[expect(
         rustdoc::invalid_html_tags,
@@ -113,7 +136,8 @@ pub(crate) struct AttachArgs {
     /// so far before the daemon exits; the writes stay on this host either way.
     #[arg(long, value_parser = crate::parse_duration, default_value = "60s")]
     pub(crate) drain_wait: Duration,
-    /// Hardware queues of a new device, one thread each.
+    /// Hardware queues of a new ublk device, or threads that read FUSE requests, one thread
+    /// each.
     #[arg(long, default_value_t = 2)]
     pub(crate) queues: u16,
     /// Cap the page cache's dirty data on the device the file system sits on at this many
@@ -154,8 +178,12 @@ impl From<Log> for pando_engine::LogMode {
 #[derive(Args, Debug)]
 pub(crate) struct DetachArgs {
     /// The ublk device the branch is served as, /dev/ublkbN.
-    #[arg(long)]
-    pub(crate) device: PathBuf,
+    #[arg(long, required_unless_present = "fuse", conflicts_with = "fuse")]
+    pub(crate) device: Option<PathBuf>,
+    /// The FUSE mount directory the branch is served in (`attach --fuse`). The daemon lets go
+    /// of its loop device, unmounts and publishes.
+    #[arg(long, conflicts_with = "dm")]
+    pub(crate) fuse: Option<PathBuf>,
     /// The device-mapper device over it, removed first.
     #[arg(long)]
     pub(crate) dm: Option<String>,
@@ -172,8 +200,11 @@ pub(crate) struct DetachArgs {
 #[derive(Args, Debug)]
 pub(crate) struct ResizeArgs {
     /// The ublk device the branch is served as, /dev/ublkbN.
+    #[arg(long, required_unless_present = "fuse", conflicts_with = "fuse")]
+    pub(crate) device: Option<PathBuf>,
+    /// The FUSE mount directory the branch is served in (`attach --fuse`).
     #[arg(long)]
-    pub(crate) device: PathBuf,
+    pub(crate) fuse: Option<PathBuf>,
     /// The new size: bytes, or a number with K, M, G or T (powers of 1024). Branches only grow.
     #[arg(value_parser = crate::parse_size)]
     pub(crate) size: u64,
@@ -221,15 +252,16 @@ mod linux {
     use pando_engine::ports::DeviceSwitch;
     use pando_engine::{AttachOptions, Attachment, Cache, Ports, Volume};
     use pando_format::Hash;
-    use pando_linux::{Daemon, DmSwitch, Frontend, FrontendOptions};
+    use pando_linux::{Daemon, DmSwitch, Frontend, FrontendOptions, FuseFrontend, FuseOptions};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::unix::OwnedWriteHalf;
     use tokio::net::{UnixListener, UnixStream};
     use tokio::runtime::Handle;
     use tokio::signal::unix::{Signal, SignalKind, signal};
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
-    use super::{AttachArgs, DetachArgs, Ended, Recover, ResizeArgs};
+    use super::{AttachArgs, DetachArgs, Ended, Recover, ResizeArgs, Served};
     use crate::Out;
 
     const CONTROL_DIR: &str = "/run/pando";
@@ -253,11 +285,15 @@ mod linux {
         store: String,
         out: &Out,
     ) -> Result<Ended> {
-        let id = pando_linux::device_id(&a.device)?;
+        if let Some(dir) = a.fuse.clone() {
+            return attach_fuse(ports, cache, a, dir, store, out).await;
+        }
+        let device = a.device.clone().context("attach needs --device or --fuse")?;
+        let id = pando_linux::device_id(&device)?;
         if a.images.is_some() && a.dm.is_none() {
             bail!("--images needs --dm");
         }
-        let recover = takes_over(&a, id).await?;
+        let recover = takes_over(&a, id, &device).await?;
         clear_publish_error(id)?;
         let t0 = Instant::now();
         let switch: Arc<dyn DeviceSwitch> = Arc::new(DmSwitch::new());
@@ -275,25 +311,28 @@ mod linux {
                 if let Err(fe) = finish(att, &a.name, out).await {
                     out.err(format!("{fe:#}"));
                 }
-                return Err(e).with_context(|| format!("start {}", a.device.display()));
+                return Err(e).with_context(|| format!("start {}", device.display()));
             }
         };
         if let Some(dm) = a.dm.as_deref().filter(|_| !recover)
-            && let Err(e) = switch.create(dm, &a.device, att.volume().size()).await
+            && let Err(e) = switch.create(dm, &device, att.volume().size()).await
         {
             if let Err(ae) = fe.abort().await {
-                out.err(format!("stop {}: {ae}", a.device.display()));
+                out.err(format!("stop {}: {ae}", device.display()));
             }
             if let Err(fe) = finish(att, &a.name, out).await {
                 out.err(format!("{fe:#}"));
             }
-            return Err(e).with_context(|| format!("device-mapper {dm} over {}", a.device.display()));
+            return Err(e).with_context(|| format!("device-mapper {dm} over {}", device.display()));
         }
-        limit_dirty(&a, out).await;
+        let mounted =
+            a.dm.as_deref()
+                .map_or_else(|| device.clone(), pando_linux::mapper_path);
+        limit_dirty(&mounted, a.dirty_limit, out).await;
         out.line(format!(
             "attached {} as {} in {:.1?}{}",
             a.name,
-            a.device.display(),
+            device.display(),
             t0.elapsed(),
             if att.rejoined() {
                 ", rejoined its image"
@@ -306,7 +345,7 @@ mod linux {
             notify("READY=1");
         }
         let (stop, stopping) = watch::channel(false);
-        let control = control(&att, id, &a.name, stopping, out);
+        let control = control(&att, &Front::Ublk(id), &a.name, stopping, None, out);
         let background = (!att.rejoined()).then(|| {
             tokio::spawn(warm(
                 Arc::clone(&att),
@@ -319,28 +358,21 @@ mod linux {
         let drained = tokio::select! {
             r = fe.stopped() => {
                 if let Err(e) = r {
-                    out.err(format!("{}: {e}", a.device.display()));
+                    out.err(format!("{}: {e}", device.display()));
                 }
                 false
             }
             () = signals.next() => true,
         };
-        uploads.abort();
-        stop.send_replace(true);
-        if let Some(b) = background {
-            b.abort();
-            let _ = b.await;
-        }
-        if let Some(c) = control {
-            let _ = c.await;
-            let _ = std::fs::remove_file(control_path(id));
-        }
+        wind_down(uploads, &stop, background, control, &Front::Ublk(id)).await;
         if drained {
             if out.is_stdio() {
                 notify("STOPPING=1");
             }
-            let drained = drain(&att, &a.name, a.drain_wait, &mut signals, out).await;
-            let held = super::Held { _frontend: fe };
+            let drained = drain(&att, &a.name, a.drain_wait, &mut signals, "attach --recover", out).await;
+            let held = super::Held {
+                _frontend: Served::Ublk(fe),
+            };
             return Ok(match drained {
                 Ok(()) => Ended::Drained(held),
                 Err(e) => Ended::DrainFailed(e, held),
@@ -349,6 +381,131 @@ mod linux {
         finish_for_detach(att, &a.name, id, out).await?;
         drop(fe);
         Ok(Ended::Detached)
+    }
+
+    /// Serves branch `a.name` as a file in the FUSE mount at `dir`, bound to a loop device,
+    /// until `detach --fuse` or an unmount ends the mount, then publishes it; or until a signal
+    /// drains it.
+    async fn attach_fuse(
+        ports: &Ports,
+        cache: Arc<Cache>,
+        a: AttachArgs,
+        dir: PathBuf,
+        store: String,
+        out: &Out,
+    ) -> Result<Ended> {
+        if a.dm.is_some() || a.images.is_some() {
+            bail!("--fuse serves the branch without device-mapper; leave out --dm and --images");
+        }
+        if a.recover != Recover::Never {
+            bail!(
+                "--fuse cannot take over a mount: a FUSE mount ends with its daemon, and a new \
+                 attach of the branch publishes what the last one left on this host"
+            );
+        }
+        let t0 = Instant::now();
+        let switch: Arc<dyn DeviceSwitch> = Arc::new(DmSwitch::new());
+        let opts = options(&a, &store, false);
+        let att = Arc::new(Attachment::open(ports, Some(switch), cache, &a.state, &a.name, opts).await?);
+        let fopts = FuseOptions { threads: a.queues };
+        let fe = match FuseFrontend::start(Handle::current(), Arc::clone(att.volume()), &dir, fopts).await {
+            Ok(fe) => Arc::new(fe),
+            Err(e) => {
+                if let Err(fe) = finish(att, &a.name, out).await {
+                    out.err(format!("{fe:#}"));
+                }
+                return Err(e).with_context(|| format!("serve {} over FUSE", dir.display()));
+            }
+        };
+        limit_dirty(fe.device(), a.dirty_limit, out).await;
+        out.line(format!(
+            "attached {} as {} in {:.1?}: {}, {}",
+            a.name,
+            fe.device().display(),
+            t0.elapsed(),
+            fe.file().display(),
+            if fe.direct_io() {
+                "direct I/O"
+            } else {
+                "buffered: the loop device refused direct I/O"
+            }
+        ));
+        let mut signals = Signals::new()?;
+        if out.is_stdio() {
+            notify("READY=1");
+        }
+        let front = Front::Fuse(dir.clone(), Arc::clone(&fe));
+        let (stop, stopping) = watch::channel(false);
+        let waiting = Waiting::default();
+        let control = control(&att, &front, &a.name, stopping, Some(Arc::clone(&waiting)), out);
+        let background = (!att.rejoined())
+            .then(|| tokio::spawn(warm(Arc::clone(&att), a.name.clone(), false, out.clone())));
+        let uploads = watch_uploads(&att, &a.name, out);
+        let drained = tokio::select! {
+            r = fe.stopped() => {
+                if let Err(e) = r {
+                    out.err(format!("{}: {e}", dir.display()));
+                }
+                false
+            }
+            () = signals.next() => true,
+        };
+        if drained {
+            sync_users(&fe, a.drain_wait, out).await;
+        }
+        wind_down(uploads, &stop, background, control, &front).await;
+        drop(front);
+        if drained {
+            if out.is_stdio() {
+                notify("STOPPING=1");
+            }
+            let drained = drain(&att, &a.name, a.drain_wait, &mut signals, "attach", out).await;
+            let held = super::Held {
+                _frontend: Served::Fuse(fe),
+            };
+            return Ok(match drained {
+                Ok(()) => Ended::Drained(held),
+                Err(e) => Ended::DrainFailed(e, held),
+            });
+        }
+        drop(fe);
+        let finished = finish(att, &a.name, out).await;
+        let waiter = waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut w) = waiter {
+            let reply = match &finished {
+                Ok(()) => "ok\n".to_owned(),
+                Err(e) => format!("error {}\n", one_line(&format!("{e:#}"))),
+            };
+            if let Err(e) = w.write_all(reply.as_bytes()).await {
+                out.err(format!("answer the detach of {}: {e}", a.name));
+            }
+        }
+        finished?;
+        Ok(Ended::Detached)
+    }
+
+    /// Stops the tasks an attach ran beside its frontend once the frontend stopped or a signal
+    /// came: the upload watch, the warming and the control socket of `front`.
+    async fn wind_down(
+        uploads: JoinHandle<()>,
+        stop: &watch::Sender<bool>,
+        background: Option<JoinHandle<()>>,
+        control: Option<JoinHandle<()>>,
+        front: &Front,
+    ) {
+        uploads.abort();
+        stop.send_replace(true);
+        if let Some(b) = background {
+            b.abort();
+            let _ = b.await;
+        }
+        if let Some(c) = control {
+            let _ = c.await;
+            let _ = std::fs::remove_file(front.control_path());
+        }
     }
 
     /// Reports why the uploads of branch `name` stopped, once they stop for good.
@@ -442,45 +599,82 @@ mod linux {
         }
     }
 
-    /// Serves the control socket of device `id` until `stopping`; `None` when it cannot listen.
+    /// The frontend a daemon serves, as its control socket knows it.
+    #[derive(Clone, Debug)]
+    enum Front {
+        Ublk(u32),
+        Fuse(PathBuf, Arc<FuseFrontend>),
+    }
+
+    impl Front {
+        /// The control socket of the daemon.
+        fn control_path(&self) -> PathBuf {
+            match self {
+                Front::Ublk(id) => control_path(*id),
+                Front::Fuse(dir, _) => fuse_control_path(dir),
+            }
+        }
+
+        /// Makes the device see the volume's new size `size`.
+        async fn resize(&self, size: u64) -> std::io::Result<()> {
+            match self {
+                Front::Ublk(id) => pando_linux::resize(*id, size).await,
+                Front::Fuse(_, fe) => fe.resize().await,
+            }
+        }
+    }
+
+    /// Where a `detach` of a FUSE mount waits for the daemon's answer.
+    type Waiting = Arc<std::sync::Mutex<Option<OwnedWriteHalf>>>;
+
+    /// Serves the control socket of `front` until `stopping`, or until a `detach` of a FUSE
+    /// mount leaves its connection in `waiting`; `None` when it cannot listen.
     fn control(
         att: &Arc<Attachment>,
-        id: u32,
+        front: &Front,
         name: &str,
         stopping: watch::Receiver<bool>,
+        waiting: Option<Waiting>,
         out: &Out,
     ) -> Option<JoinHandle<()>> {
-        match listen(id) {
+        let path = front.control_path();
+        match listen(&path) {
             Ok(l) => Some(tokio::spawn(serve(
                 l,
                 Arc::clone(att),
-                id,
+                front.clone(),
                 name.to_owned(),
                 stopping,
+                waiting,
                 out.clone(),
             ))),
             Err(e) => {
-                out.err(format!("{}: resize is off: {e}", control_path(id).display()));
+                let off = if waiting.is_some() {
+                    "resize and `detach --fuse` are off; let go of the loop device and unmount the directory to detach"
+                } else {
+                    "resize is off"
+                };
+                out.err(format!("{}: {off}: {e}", path.display()));
                 None
             }
         }
     }
 
-    /// Whether this attach takes over the device of a daemon that died; it fails while a
-    /// daemon still serves the device.
-    async fn takes_over(a: &AttachArgs, id: u32) -> Result<bool> {
+    /// Whether this attach takes over ublk device `device`, number `id`, of a daemon that
+    /// died; it fails while a daemon still serves the device.
+    async fn takes_over(a: &AttachArgs, id: u32, device: &Path) -> Result<bool> {
         let recover = match a.recover {
             Recover::Never => false,
             Recover::Always => true,
             Recover::Auto => {
                 pando_linux::daemon(id)
                     .await
-                    .with_context(|| format!("state of {}", a.device.display()))?
+                    .with_context(|| format!("state of {}", device.display()))?
                     != Daemon::NoDevice
             }
         };
         if recover {
-            dead_daemon(id, &a.device).await?;
+            dead_daemon(id, device).await?;
         }
         Ok(recover)
     }
@@ -542,6 +736,7 @@ mod linux {
         name: &str,
         wait: Duration,
         signals: &mut Signals,
+        publisher: &str,
         out: &Out,
     ) -> Result<()> {
         let t0 = Instant::now();
@@ -568,7 +763,7 @@ mod linux {
             ));
         } else {
             out.line(format!(
-                "drained {name} in {:.1?}: the writes are on this host; `attach --recover` publishes them",
+                "drained {name} in {:.1?}: the writes are on this host; `{publisher}` publishes them",
                 t0.elapsed()
             ));
         }
@@ -597,16 +792,13 @@ mod linux {
         Ok(())
     }
 
-    /// Caps the dirty page cache of the device `a` mounts at `a.dirty_limit` bytes, unless it
-    /// is 0. A failure leaves the kernel's limits in force.
-    async fn limit_dirty(a: &AttachArgs, out: &Out) {
-        if a.dirty_limit == 0 {
+    /// Caps the dirty page cache of device `mounted` at `bytes`, unless it is 0. A failure
+    /// leaves the kernel's limits in force.
+    async fn limit_dirty(mounted: &Path, bytes: u64, out: &Out) {
+        if bytes == 0 {
             return;
         }
-        let mounted =
-            a.dm.as_deref()
-                .map_or_else(|| a.device.clone(), pando_linux::mapper_path);
-        if let Err(e) = pando_linux::limit_dirty(&mounted, a.dirty_limit).await {
+        if let Err(e) = pando_linux::limit_dirty(mounted, bytes).await {
             out.err(format!("{}: the dirty limit is off: {e}", mounted.display()));
         }
     }
@@ -630,28 +822,50 @@ mod linux {
         Path::new(CONTROL_DIR).join(format!("ublkb{id}.sock"))
     }
 
-    /// Listens on the control socket of device `id`, in a directory only root may enter.
-    fn listen(id: u32) -> std::io::Result<UnixListener> {
+    /// Writes out the file systems on a FUSE attach's loop device before a signal ends the
+    /// daemon, which ends the FUSE mount under them.
+    async fn sync_users(fe: &FuseFrontend, wait: Duration, out: &Out) {
+        match tokio::time::timeout(wait, fe.sync_users()).await {
+            Ok(Ok(n)) => out.line(format!("synced {n} file systems on {}", fe.device().display())),
+            Ok(Err(e)) => out.err(format!("sync the file systems on {}: {e}", fe.device().display())),
+            Err(_) => out.err(format!(
+                "sync the file systems on {}: not done in {wait:?}",
+                fe.device().display()
+            )),
+        }
+    }
+
+    /// The control socket of the daemon that serves a branch in the FUSE mount at `dir`, the
+    /// same for every spelling of the path.
+    fn fuse_control_path(dir: &Path) -> PathBuf {
+        let dir: PathBuf = dir.components().collect();
+        let h = Hash::of(dir.as_os_str().as_encoded_bytes()).short();
+        Path::new(CONTROL_DIR).join(format!("fuse-{h}.sock"))
+    }
+
+    /// Listens on control socket `p`, in a directory only root may enter.
+    fn listen(p: &Path) -> std::io::Result<UnixListener> {
         std::fs::create_dir_all(CONTROL_DIR)?;
         std::fs::set_permissions(CONTROL_DIR, Permissions::from_mode(0o700))?;
-        let p = control_path(id);
-        match std::fs::remove_file(&p) {
+        match std::fs::remove_file(p) {
             Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
             _ => {}
         }
-        let l = UnixListener::bind(&p)?;
-        std::fs::set_permissions(&p, Permissions::from_mode(0o600))?;
+        let l = UnixListener::bind(p)?;
+        std::fs::set_permissions(p, Permissions::from_mode(0o600))?;
         Ok(l)
     }
 
-    /// Answers requests on `l` one at a time until `stop`. A request in progress finishes
-    /// first, so a grow never stops between suspending the device and resuming it.
+    /// Answers requests on `l` one at a time until `stop`, or until a `detach` leaves its
+    /// connection in `waiting`. A request in progress finishes first, so a grow never stops
+    /// between suspending the device and resuming it.
     async fn serve(
         l: UnixListener,
         att: Arc<Attachment>,
-        id: u32,
+        front: Front,
         name: String,
         mut stop: watch::Receiver<bool>,
+        waiting: Option<Waiting>,
         out: Out,
     ) {
         loop {
@@ -660,58 +874,112 @@ mod linux {
                 c = l.accept() => c,
             };
             match conn {
-                Ok((c, _)) => {
-                    if let Err(e) = answer(c, &att, id, &name, &out).await {
-                        out.err(format!("resize {name}: {e:#}"));
-                    }
-                }
+                Ok((c, _)) => match answer(c, &att, &front, &name, waiting.as_ref(), &out).await {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(e) => out.err(format!("control {name}: {e:#}")),
+                },
                 Err(e) => {
-                    out.err(format!("{}: {e}; resize is off", control_path(id).display()));
+                    let p = front.control_path();
+                    out.err(format!("{}: {e}; resize is off", p.display()));
                     return;
                 }
             }
         }
     }
 
-    async fn answer(conn: UnixStream, att: &Attachment, id: u32, name: &str, out: &Out) -> Result<()> {
+    /// Answers one request; `true` when it was a `detach` that now waits in `waiting`.
+    async fn answer(
+        conn: UnixStream,
+        att: &Attachment,
+        front: &Front,
+        name: &str,
+        waiting: Option<&Waiting>,
+        out: &Out,
+    ) -> Result<bool> {
         let (r, mut w) = conn.into_split();
         let mut line = String::new();
         tokio::time::timeout(REQUEST_WAIT, BufReader::new(r).read_line(&mut line))
             .await
             .context("no request")??;
-        let reply = match parse_request(&line) {
-            Ok(size) => match att.grow(size, pando_linux::resize(id, size)).await {
+        let reply = match (parse_request(&line), front, waiting) {
+            (Ok(Request::Grow(size)), ..) => match att.grow(size, front.resize(size)).await {
                 Ok(()) => {
                     out.line(format!("grew {name} to {size} bytes"));
                     format!("ok {size}\n")
                 }
                 Err(e) => format!("error {}\n", one_line(&e.to_string())),
             },
-            Err(e) => format!("error {}\n", one_line(&format!("{e:#}"))),
+            (Ok(Request::Detach { force }), Front::Fuse(_, fe), Some(waiting)) => {
+                match stop_fuse(fe, force).await {
+                    Ok(()) => {
+                        out.line(format!("detaching {name}: publishing it"));
+                        *waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(w);
+                        return Ok(true);
+                    }
+                    Err(e) => format!("error {}\n", one_line(&format!("{e:#}"))),
+                }
+            }
+            (Ok(Request::Detach { .. }), ..) => {
+                "error detach a ublk device with `detach --device`\n".to_owned()
+            }
+            (Err(e), ..) => format!("error {}\n", one_line(&format!("{e:#}"))),
         };
         w.write_all(reply.as_bytes()).await?;
-        Ok(())
+        Ok(false)
     }
 
-    fn parse_request(line: &str) -> Result<u64> {
+    /// A request on the control socket.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Request {
+        Grow(u64),
+        Detach { force: bool },
+    }
+
+    fn parse_request(line: &str) -> Result<Request> {
         match line.trim_end().split_once(' ') {
-            Some(("grow", n)) => n.parse().with_context(|| format!("size {n:?}")),
+            Some(("grow", n)) => Ok(Request::Grow(n.parse().with_context(|| format!("size {n:?}"))?)),
+            Some(("detach", "force")) => Ok(Request::Detach { force: true }),
+            None if line.trim_end() == "detach" => Ok(Request::Detach { force: false }),
             _ => bail!("unknown request {:?}", line.trim_end()),
         }
+    }
+
+    /// Lets go of the loop device of a FUSE mount and unmounts it, unless, without `force`,
+    /// something still uses the loop device.
+    async fn stop_fuse(fe: &FuseFrontend, force: bool) -> Result<()> {
+        if !force {
+            let users = pando_linux::users(fe.device(), None)
+                .await
+                .with_context(|| format!("users of {}", fe.device().display()))?;
+            in_use(&fe.device().display().to_string(), &users)?;
+        }
+        fe.unmount(force)
+            .await
+            .with_context(|| format!("unmount {}", fe.file().display()))
     }
 
     fn one_line(s: &str) -> String {
         s.replace('\n', " ")
     }
 
+    /// The control socket of the daemon that serves `device` or the FUSE mount `fuse`, and
+    /// the name of what it serves.
+    fn socket_of(device: Option<&Path>, fuse: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
+        match (device, fuse) {
+            (_, Some(dir)) => Ok((fuse_control_path(dir), dir.to_owned())),
+            (Some(dev), None) => Ok((control_path(pando_linux::device_id(dev)?), dev.to_owned())),
+            (None, None) => bail!("name the branch's device with --device or --fuse"),
+        }
+    }
+
     /// Asks the daemon that serves `r.device` to grow its branch and the devices over it.
     pub(crate) async fn resize(r: ResizeArgs, out: &Out) -> Result<()> {
-        let id = pando_linux::device_id(&r.device)?;
-        let p = control_path(id);
+        let (p, served) = socket_of(r.device.as_deref(), r.fuse.as_deref())?;
         let conn = UnixStream::connect(&p).await.with_context(|| {
             format!(
                 "connect to the daemon of {} at {}; is it attached?",
-                r.device.display(),
+                served.display(),
                 p.display()
             )
         })?;
@@ -724,15 +992,15 @@ mod linux {
             Some(("ok", _)) => {
                 out.line(format!(
                     "{} is {} bytes; grow the file system on it to use them (resize2fs for ext4)",
-                    r.device.display(),
+                    served.display(),
                     r.size
                 ));
                 Ok(())
             }
-            Some(("error", why)) => bail!("resize {}: {why}", r.device.display()),
+            Some(("error", why)) => bail!("resize {}: {why}", served.display()),
             _ => bail!(
                 "resize {}: the daemon answered {:?}",
-                r.device.display(),
+                served.display(),
                 line.trim_end()
             ),
         }
@@ -802,10 +1070,60 @@ mod linux {
     /// deleted, so this returns once the branch is in the store, or fails with why the daemon
     /// could not publish it. A device an earlier detach stopped is only waited for again.
     pub(crate) async fn detach(d: DetachArgs) -> Result<()> {
-        let id = pando_linux::device_id(&d.device)?;
-        if !d.device.exists() && Path::new(&format!("/dev/ublkc{id}")).exists() {
+        if let Some(dir) = &d.fuse {
+            return detach_fuse(dir, d.force, d.publish_wait).await;
+        }
+        let device = d.device.clone().context("detach needs --device or --fuse")?;
+        detach_ublk(&d, &device).await
+    }
+
+    /// Asks the daemon of the FUSE mount at `dir` to let go of its loop device, unmount and
+    /// publish; returns once it answers, or after `wait`.
+    async fn detach_fuse(dir: &Path, force: bool, wait: Duration) -> Result<()> {
+        let p = fuse_control_path(dir);
+        let conn = UnixStream::connect(&p).await.with_context(|| {
+            format!(
+                "connect to the daemon of {} at {}; is it attached?",
+                dir.display(),
+                p.display()
+            )
+        })?;
+        let (rd, mut w) = conn.into_split();
+        let req = if force { "detach force\n" } else { "detach\n" };
+        w.write_all(req.as_bytes()).await?;
+        w.shutdown().await?;
+        let mut line = String::new();
+        let n = tokio::time::timeout(wait, BufReader::new(rd).read_line(&mut line))
+            .await
+            .with_context(|| {
+                format!(
+                    "the daemon of {} did not answer within {wait:?}; it may still be publishing \
+                     its branch, or something still holds its loop device",
+                    dir.display()
+                )
+            })??;
+        match line.trim_end().split_once(' ') {
+            _ if n == 0 => bail!(
+                "the daemon of {} ended without answering; the writes it took are on this host, \
+                 and the next attach of the branch publishes them",
+                dir.display()
+            ),
+            None if line.trim_end() == "ok" => Ok(()),
+            Some(("error", why)) => bail!("detach {}: {why}", dir.display()),
+            _ => bail!(
+                "detach {}: the daemon answered {:?}",
+                dir.display(),
+                line.trim_end()
+            ),
+        }
+    }
+
+    /// Stops ublk device `device`, as [`detach`] does.
+    async fn detach_ublk(d: &DetachArgs, device: &Path) -> Result<()> {
+        let id = pando_linux::device_id(device)?;
+        if !device.exists() && Path::new(&format!("/dev/ublkc{id}")).exists() {
             pando_linux::delete(id, d.publish_wait).await?;
-            return published(Path::new(CONTROL_DIR), id, &d.device);
+            return published(Path::new(CONTROL_DIR), id, device);
         }
         let switch = DmSwitch::new();
         if !d.force {
@@ -816,10 +1134,10 @@ mod linux {
                     .with_context(|| format!("users of /dev/mapper/{dm}"))?;
                 in_use(&format!("/dev/mapper/{dm}"), &users)?;
             }
-            let users = pando_linux::users(&d.device, d.dm.as_deref())
+            let users = pando_linux::users(device, d.dm.as_deref())
                 .await
-                .with_context(|| format!("users of {}", d.device.display()))?;
-            in_use(&d.device.display().to_string(), &users)?;
+                .with_context(|| format!("users of {}", device.display()))?;
+            in_use(&device.display().to_string(), &users)?;
         }
         if let Some(dm) = &d.dm {
             if pando_linux::daemon_dead(id).await? {
@@ -830,21 +1148,21 @@ mod linux {
                 }
                 switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
                 pando_linux::delete(id, d.publish_wait).await?;
-                return published(Path::new(CONTROL_DIR), id, &d.device);
+                return published(Path::new(CONTROL_DIR), id, device);
             }
             switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
         }
         let lock = if d.force || pando_linux::daemon_dead(id).await? {
             None
         } else {
-            pando_linux::lock(&d.device, Duration::from_secs(10))
+            pando_linux::lock(device, Duration::from_secs(10))
                 .await
-                .with_context(|| format!("lock {}", d.device.display()))?
+                .with_context(|| format!("lock {}", device.display()))?
         };
         pando_linux::stop(id).await?;
         drop(lock);
         pando_linux::delete(id, d.publish_wait).await?;
-        published(Path::new(CONTROL_DIR), id, &d.device)
+        published(Path::new(CONTROL_DIR), id, device)
     }
 
     /// Fails while `users` hold device `dev`, so a stop cannot cut a mounted file system off.
@@ -864,8 +1182,28 @@ mod linux {
         use super::*;
 
         #[test]
+        fn every_spelling_of_a_fuse_directory_names_one_socket() {
+            let want = fuse_control_path(Path::new("/mnt/x"));
+            assert_eq!(fuse_control_path(Path::new("/mnt/x/")), want);
+            assert_eq!(fuse_control_path(Path::new("/mnt/./x")), want);
+            assert_ne!(fuse_control_path(Path::new("/mnt/y")), want);
+        }
+
+        #[test]
         fn a_grow_request_names_its_size() {
-            assert_eq!(parse_request("grow 8589934592\n").unwrap(), 8 << 30);
+            assert_eq!(
+                parse_request("grow 8589934592\n").unwrap(),
+                Request::Grow(8 << 30)
+            );
+            assert_eq!(
+                parse_request("detach\n").unwrap(),
+                Request::Detach { force: false }
+            );
+            assert_eq!(
+                parse_request("detach force\n").unwrap(),
+                Request::Detach { force: true }
+            );
+            assert!(parse_request("detach now\n").is_err());
             assert!(parse_request("grow\n").is_err());
             assert!(parse_request("shrink 4096\n").is_err());
             assert!(parse_request("grow -1\n").is_err());

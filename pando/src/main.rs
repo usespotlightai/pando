@@ -188,14 +188,27 @@ impl Cli {
             Command::Import { image, .. } => abs(image),
             Command::Base { dir, .. } | Command::Follow { dir, .. } => abs(dir),
             Command::Attach(a) => {
-                abs(&mut a.device);
+                if let Some(d) = &mut a.device {
+                    abs(d);
+                }
+                if let Some(f) = &mut a.fuse {
+                    abs(f);
+                }
                 abs(&mut a.state);
                 if let Some(i) = &mut a.images {
                     abs(i);
                 }
             }
-            Command::Detach(d) => abs(&mut d.device),
-            Command::Resize(r) => abs(&mut r.device),
+            Command::Detach(d) => {
+                for p in [&mut d.device, &mut d.fuse].into_iter().flatten() {
+                    abs(p);
+                }
+            }
+            Command::Resize(r) => {
+                for p in [&mut r.device, &mut r.fuse].into_iter().flatten() {
+                    abs(p);
+                }
+            }
             Command::Refs
             | Command::Init { .. }
             | Command::Branch { .. }
@@ -382,9 +395,35 @@ enum Exit {
     Held { status: i32, host: Arc<Host> },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match start(Cli::parse()).await {
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let flushers = matches!(cli.command, Command::Attach(_) | Command::Serve);
+    if flushers {
+        pando_host::tune_malloc();
+    }
+    if flushers && let Err(e) = pando_host::io_flusher() {
+        eprintln!(
+            "warning: the threads that serve the device are not I/O flushers ({e}); with much \
+             dirty data and little free memory, writes to the device can stall, so set \
+             --dirty-limit"
+        );
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || {
+            if flushers {
+                let _ = pando_host::io_flusher();
+            }
+        })
+        .build();
+    let rt = match rt {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(start(cli)) {
         Ok(Exit::Code(code)) => code,
         Ok(Exit::Held { status, host }) => {
             let _held = host;
@@ -405,7 +444,11 @@ async fn start(cli: Cli) -> Result<Exit> {
             .map(Exit::Code);
     }
     let host = Arc::new(Host {
-        ports: pando_host::ports(cli.store.open()?, cli.cpu_threads)?,
+        ports: pando_host::ports(
+            cli.store.open()?,
+            cli.cpu_threads,
+            matches!(cli.command, Command::Attach(_) | Command::Serve),
+        )?,
         cache_dir: cli.cache.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE)),
         cache: OnceCell::new(),
         readable: OnceCell::new(),

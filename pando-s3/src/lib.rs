@@ -33,8 +33,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// fails each try quickly and the engine's retries and waits apply.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where the store is and how to sign in. Credentials come from the caller, never from a file
-/// this crate reads.
+/// Where the store is and how to sign in. Credentials come from the caller or the instance
+/// metadata service, never from a file this crate reads.
 #[derive(Clone, Default)]
 pub struct S3Config {
     /// The bucket the store lives in.
@@ -45,10 +45,8 @@ pub struct S3Config {
     pub endpoint: Option<String>,
     /// The region requests are signed for.
     pub region: String,
-    /// The access key ID requests are signed with.
-    pub access_key_id: String,
-    /// The secret for `access_key_id`. [`S3Config`]'s `Debug` leaves it out.
-    pub secret_access_key: String,
+    /// What requests are signed with. [`S3Config`]'s `Debug` leaves it out.
+    pub credentials: Credentials,
     /// Allows a plain-HTTP endpoint, for a local `MinIO`.
     pub allow_http: bool,
 }
@@ -60,7 +58,54 @@ impl std::fmt::Debug for S3Config {
             .field("prefix", &self.prefix)
             .field("endpoint", &self.endpoint)
             .field("region", &self.region)
+            .field("credentials", &self.credentials)
             .finish_non_exhaustive()
+    }
+}
+
+/// What requests to the store are signed with.
+#[derive(Clone)]
+pub enum Credentials {
+    /// An access key, with the session token of a temporary key.
+    Keys {
+        /// The access key ID.
+        access_key_id: String,
+        /// The secret for `access_key_id`.
+        secret_access_key: String,
+        /// The session token of a temporary key.
+        session_token: Option<String>,
+    },
+    /// The role of this instance, or of an `AgentCore` microVM, from the instance metadata
+    /// service. Requests take a session token first (`IMDSv2`; `IMDSv1` is never tried), and the
+    /// credentials are fetched again five minutes before they expire, on the next request.
+    Instance {
+        /// The metadata service, `http://169.254.169.254` when `None`.
+        endpoint: Option<String>,
+    },
+}
+
+impl Default for Credentials {
+    fn default() -> Credentials {
+        Credentials::Keys {
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            session_token: None,
+        }
+    }
+}
+
+/// Names the source only: no key, secret or token.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credentials::Keys { session_token, .. } => f
+                .debug_struct("Keys")
+                .field("temporary", &session_token.is_some())
+                .finish_non_exhaustive(),
+            Credentials::Instance { endpoint } => {
+                f.debug_struct("Instance").field("endpoint", endpoint).finish()
+            }
+        }
     }
 }
 
@@ -111,8 +156,6 @@ impl S3Store {
         let mut b = AmazonS3Builder::new()
             .with_bucket_name(&c.bucket)
             .with_region(&c.region)
-            .with_access_key_id(&c.access_key_id)
-            .with_secret_access_key(&c.secret_access_key)
             .with_client_options(
                 ClientOptions::new()
                     .with_timeout(REQUEST_TIMEOUT)
@@ -123,6 +166,25 @@ impl S3Store {
             .with_conditional_put(S3ConditionalPut::ETagMatch);
         if let Some(e) = &c.endpoint {
             b = b.with_endpoint(e);
+        }
+        match &c.credentials {
+            Credentials::Keys {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                b = b
+                    .with_access_key_id(access_key_id)
+                    .with_secret_access_key(secret_access_key);
+                if let Some(t) = session_token {
+                    b = b.with_token(t);
+                }
+            }
+            Credentials::Instance { endpoint } => {
+                if let Some(e) = endpoint {
+                    b = b.with_metadata_endpoint(e);
+                }
+            }
         }
         let (tx, rx) = oneshot::channel();
         let bucket = c.bucket.clone();
@@ -470,8 +532,11 @@ mod tests {
             bucket: "b".into(),
             endpoint: Some(format!("http://{addr}")),
             region: "us-east-1".into(),
-            access_key_id: "id".into(),
-            secret_access_key: "secret".into(),
+            credentials: Credentials::Keys {
+                access_key_id: "id".into(),
+                secret_access_key: "secret".into(),
+                session_token: None,
+            },
             allow_http: true,
             ..S3Config::default()
         })
@@ -540,6 +605,105 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, StoreError::PreconditionFailed { .. }), "{e}");
+    }
+
+    async fn read_head(c: &mut TcpStream) -> String {
+        let mut req = Vec::new();
+        let mut buf = [0; 4096];
+        loop {
+            let n = c.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the request ended early");
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                return String::from_utf8_lossy(&req).to_ascii_lowercase();
+            }
+        }
+    }
+
+    async fn metadata_and_store(mut c: TcpStream, heads: Arc<std::sync::Mutex<Vec<String>>>) {
+        let head = read_head(&mut c).await;
+        heads.lock().unwrap().push(head.clone());
+        let token = head.contains("x-aws-ec2-metadata-token: tok\r\n");
+        let (status, body) = match head.split_whitespace().take(2).collect::<Vec<_>>()[..] {
+            ["put", "/latest/api/token"] if head.contains("x-aws-ec2-metadata-token-ttl-seconds:") => {
+                ("200 OK", "tok")
+            }
+            ["get", "/latest/meta-data/iam/security-credentials/"] if token => ("200 OK", "role"),
+            ["get", "/latest/meta-data/iam/security-credentials/role"] if token => (
+                "200 OK",
+                r#"{"Code":"Success","AccessKeyId":"ASIAEXAMPLE","SecretAccessKey":"s3cr3t","Token":"session","Expiration":"2099-01-01T00:00:00Z"}"#,
+            ),
+            ["get", "/b/k"] => ("200 OK", "v"),
+            _ => ("401 Unauthorized", ""),
+        };
+        let reply = format!(
+            "HTTP/1.1 {status}\r\netag: \"e\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        if c.write_all(reply.as_bytes()).await.is_ok() {
+            let _ = c.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_credentials_take_a_metadata_token_and_sign_with_the_session() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let h = Arc::clone(&heads);
+        tokio::spawn(async move {
+            loop {
+                let (c, _) = l.accept().await.unwrap();
+                tokio::spawn(metadata_and_store(c, Arc::clone(&h)));
+            }
+        });
+        let config = S3Config {
+            bucket: "b".into(),
+            endpoint: Some(format!("http://{addr}")),
+            region: "us-east-1".into(),
+            credentials: Credentials::Instance {
+                endpoint: Some(format!("http://{addr}")),
+            },
+            allow_http: true,
+            ..S3Config::default()
+        };
+        assert!(!format!("{config:?}").contains("s3cr3t"));
+        let s = S3Store::new(&config).unwrap();
+        assert_eq!(&s.get("k").await.unwrap().body[..], b"v");
+        assert_eq!(&s.get("k").await.unwrap().body[..], b"v");
+        let heads = heads.lock().unwrap();
+        let paths: Vec<&str> = heads.iter().filter_map(|h| h.split_whitespace().nth(1)).collect();
+        assert_eq!(
+            paths,
+            [
+                "/latest/api/token",
+                "/latest/meta-data/iam/security-credentials/",
+                "/latest/meta-data/iam/security-credentials/role",
+                "/b/k",
+                "/b/k"
+            ]
+        );
+        for get in &heads[3..] {
+            assert!(get.contains("x-amz-security-token: session\r\n"), "{get}");
+            assert!(get.contains("credential=asiaexample/"), "{get}");
+        }
+    }
+
+    #[test]
+    fn debug_shows_no_credential() {
+        let c = S3Config {
+            credentials: Credentials::Keys {
+                access_key_id: "AKIDEXAMPLE".into(),
+                secret_access_key: "s3cr3t".into(),
+                session_token: Some("session".into()),
+            },
+            ..S3Config::default()
+        };
+        let d = format!("{c:?}");
+        for secret in ["AKIDEXAMPLE", "s3cr3t", "session"] {
+            assert!(!d.contains(secret), "{d}");
+        }
+        assert!(d.contains("temporary: true"), "{d}");
     }
 
     #[test]

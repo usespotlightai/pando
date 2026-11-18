@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!pando
+!pando-dst
+!pando-engine
+!pando-format
+!pando-host
+!pando-linux
+!pando-s3
+!bench/agentcore/probe.py
+**/target

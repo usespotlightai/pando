@@ -226,9 +226,10 @@ Things to know:
   host stops billing compute but keeps its EBS volumes, and its `/data` is empty after the next
   start, so copy results to the bucket as they are produced. `terraform destroy` removes
   everything, including the bucket's contents.
-- **Pando's credentials.** Pando reads `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` and cannot
-  use the instance role yet. Until it can, pass keys through `PANDO_ENV_FILE`; Terraform does not
-  create long-lived keys, so none end up in its state or in the instance user data.
+- **Pando's credentials.** Pando reads `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`, or, with
+  `S3_CREDENTIALS=instance`, the instance role from the metadata service. The bench passes keys
+  through `PANDO_ENV_FILE`; Terraform does not create long-lived keys, so none end up in its
+  state or in the instance user data.
 - **Not created here.** Amazon S3 Files is set up in its own console, against the bench bucket.
 - **Fast Snapshot Restore** is billed per snapshot and availability zone for every hour it is
   on. The harness should turn it on only for its own rows and off again afterwards.

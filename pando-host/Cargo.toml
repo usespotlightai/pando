@@ -10,8 +10,8 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+getrandom.workspace = true
 pando-engine.workspace = true
-rand.workspace = true
 rayon.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
@@ -20,6 +20,7 @@ rustix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tempfile.workspace = true

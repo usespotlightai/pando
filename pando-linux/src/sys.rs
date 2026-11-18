@@ -134,6 +134,88 @@ impl Drop for Mapping {
     }
 }
 
+fn cstring(p: &Path) -> io::Result<CString> {
+    CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other)
+}
+
+/// Mounts a file system of type `fstype` from `source` at `target` with `flags` and the
+/// file system's own options `data`.
+pub(crate) fn mount(
+    source: &str,
+    target: &Path,
+    fstype: &str,
+    flags: libc::c_ulong,
+    data: &str,
+) -> io::Result<()> {
+    let s = CString::new(source).map_err(io::Error::other)?;
+    let t = cstring(target)?;
+    let f = CString::new(fstype).map_err(io::Error::other)?;
+    let d = CString::new(data).map_err(io::Error::other)?;
+    // SAFETY: every pointer is a valid C string for the duration of the call.
+    check(unsafe { libc::mount(s.as_ptr(), t.as_ptr(), f.as_ptr(), flags, d.as_ptr().cast()) }).map(drop)
+}
+
+/// Unmounts the file system at `target` with `flags` such as `MNT_DETACH`.
+pub(crate) fn umount(target: &Path, flags: libc::c_int) -> io::Result<()> {
+    let t = cstring(target)?;
+    // SAFETY: `t` is a valid C string for the duration of the call.
+    check(unsafe { libc::umount2(t.as_ptr(), flags) }).map(drop)
+}
+
+/// Reads from `fd` into `buf`.
+pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    usize::try_from(n).map_err(|_| io::Error::last_os_error())
+}
+
+/// Writes the buffers in `bufs` to `fd` in one call.
+pub(crate) fn writev(fd: RawFd, bufs: &[&[u8]]) -> io::Result<usize> {
+    let iov: Vec<libc::iovec> = bufs
+        .iter()
+        .map(|b| libc::iovec {
+            iov_base: b.as_ptr().cast_mut().cast(),
+            iov_len: b.len(),
+        })
+        .collect();
+    let n = libc::c_int::try_from(iov.len()).map_err(io::Error::other)?;
+    // SAFETY: each iovec points into a slice of `bufs`, which outlive the call; the kernel only
+    // reads them.
+    let r = unsafe { libc::writev(fd, iov.as_ptr(), n) };
+    usize::try_from(r).map_err(|_| io::Error::last_os_error())
+}
+
+/// Waits until one of `fds` is readable; which ones are.
+pub(crate) fn poll_readable(fds: &[RawFd]) -> io::Result<Vec<bool>> {
+    let mut p: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let n = libc::nfds_t::try_from(p.len()).map_err(io::Error::other)?;
+    // SAFETY: `p` holds `n` pollfd entries the kernel may write.
+    check(unsafe { libc::poll(p.as_mut_ptr(), n, -1) })?;
+    Ok(p.iter().map(|e| e.revents != 0).collect())
+}
+
+/// The effective user and group of this process.
+pub(crate) fn ids() -> (u32, u32) {
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    // SAFETY: getegid takes no argument and cannot fail.
+    let gid = unsafe { libc::getegid() };
+    (uid, gid)
+}
+
+/// Writes out the dirty data of the file system that `fd` is in.
+pub(crate) fn syncfs(fd: RawFd) -> io::Result<()> {
+    // SAFETY: syncfs takes a descriptor only.
+    check(unsafe { libc::syncfs(fd) }).map(drop)
+}
+
 pub(crate) fn page_size() -> usize {
     // SAFETY: sysconf takes no pointer.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

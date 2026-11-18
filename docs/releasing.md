@@ -24,3 +24,16 @@ publishing them; their version is the workspace version with `-dev.<commit>` app
 requests that change the packaging build them too.
 
 [docs/hosts.md](hosts.md) says how to install a release and upgrade a host to it.
+
+## Using a release from another repository
+
+A runner image or a Terraform module pins one release and downloads the archive for its
+architecture, `pando-<version>-<arch>-linux.tar.gz` with `<arch>` `x86_64` or `aarch64`, from
+`https://github.com/usespotlightai/pando/releases/download/v<version>/`. Check it against that
+release's `SHA256SUMS` (`sha256sum -c --ignore-missing SHA256SUMS`), or its provenance with
+`gh attestation verify <archive> --repo usespotlightai/pando`. The archive holds `pando` and the
+systemd unit under `pando-<version>-<arch>-linux/`.
+
+The aarch64 binary is built for generic aarch64, so it runs on every Graviton generation and on
+AgentCore Runtime. Both binaries need glibc 2.39 or newer: Debian 13, Ubuntu 24.04 or later, not
+Amazon Linux 2023, which has glibc 2.34.

@@ -90,13 +90,14 @@ check_hadolint() {
 }
 check_terraform() {
 	local d
-	run terraform fmt -check -recursive -diff bench/infra
-	for d in bench/infra bench/infra/bootstrap; do
+	run terraform fmt -check -recursive -diff bench/infra bench/agentcore
+	for d in bench/infra bench/infra/bootstrap bench/agentcore; do
 		run terraform -chdir="$d" init -backend=false -input=false -lockfile=readonly -no-color >/dev/null
 		run terraform -chdir="$d" validate -no-color
 	done
 	run tflint --chdir=bench/infra --init --config="${root}/.tflint.hcl"
 	run tflint --chdir=bench/infra --recursive --config="$root/.tflint.hcl"
+	run tflint --chdir=bench/agentcore --config="$root/.tflint.hcl"
 }
 
 check_deny() { run cargo deny --all-features --locked check; }
