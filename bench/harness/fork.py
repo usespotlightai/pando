@@ -12,11 +12,11 @@ A system that cannot make N branches in reasonable time or money makes fewer; th
 says how many.
 """
 
+import contextlib
 import json
 import os
 import secrets
 import shutil
-import signal
 import socket
 import subprocess
 import time
@@ -528,6 +528,11 @@ def wait_port(port: int, proc: subprocess.Popen[bytes], what: str) -> None:
     raise SystemExit(msg)
 
 
+def mounted(path: Path) -> bool:
+    """Return whether path is a mount point, from the mount table, without touching the file system."""
+    return any(line.split()[1] == str(path) for line in Path("/proc/self/mounts").read_text().splitlines())
+
+
 class ZeroFSServer:
     """A ZeroFS server on this host over a prefix of the bench bucket, with the host role's credentials.
 
@@ -563,7 +568,7 @@ class ZeroFSServer:
     def start(self, cache: Path | None = None) -> None:
         """Start the server with its cache in cache (default dir/cache) and mount its file system.
 
-        Raises SystemExit when it does not come up.
+        Raises SystemExit when another process holds its ports or it does not come up.
         """
         self.dir.mkdir(parents=True, exist_ok=True)
         password = self.dir / "password"
@@ -580,6 +585,11 @@ class ZeroFSServer:
             f'[servers.nbd]\naddresses = ["127.0.0.1:{self.NBD_PORT}"]\n'
         )
         config.chmod(0o600)
+        for port in (self.NINEP_PORT, self.NBD_PORT):
+            with contextlib.suppress(OSError):
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                msg = f"another process listens on port {port}"
+                raise SystemExit(msg)
         with (self.dir / "zerofs.log").open("ab") as out:
             self.proc = subprocess.Popen(
                 [str(self.install()), "run", "-c", str(config)], stdout=out, stderr=subprocess.STDOUT
@@ -598,18 +608,26 @@ class ZeroFSServer:
         )
         (self.mnt / ".nbd").mkdir(exist_ok=True)
 
-    def stop(self, *, kill: bool = False) -> None:
-        """Unmount the file system and stop the server: SIGTERM, which flushes, or SIGKILL with kill."""
-        if self.mnt.is_mount() and run("umount", self.mnt, check=False) != 0:
+    def stop(self, *, kill: bool = False) -> float:
+        """Unmount the file system and stop the server: SIGTERM, which flushes, or SIGKILL with kill.
+
+        Returns the time.monotonic() of the SIGKILL, or of the stop.
+        """
+        if kill and self.proc:
+            self.proc.kill()
+        stopped = time.monotonic()
+        if mounted(self.mnt) and (kill or run("umount", self.mnt, check=False) != 0):
             run("umount", "-l", self.mnt, check=False)
         if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGKILL if kill else signal.SIGTERM)
+            self.proc.terminate()
             try:
                 self.proc.wait(timeout=SERVER_TIMEOUT)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
-                self.proc.wait()
+        if self.proc:
+            self.proc.wait()
         self.proc = None
+        return stopped
 
     def put(self, name: str, image: Path) -> None:
         """Store image as the export name and flush it to the bucket."""
@@ -803,8 +821,7 @@ class S3FilesMount:
     def load_base(self) -> None:
         """Copy the workspace into base through the mount and wait until the bucket holds all of it."""
         self.ensure_mounted()
-        self.path("base").mkdir(parents=True, exist_ok=True)
-        run("cp", "-a", f"{workspace.SRC}/.", self.path("base"))
+        parallel_copy(workspace.SRC, self.path("base"))
         run("sync", "-f", self.path("base"))
         log("waiting for S3 Files to export the base to its bucket")
         settled_bytes(self.bucket, f"{self.prefix}/base")
@@ -849,6 +866,19 @@ class S3FilesMount:
     def used(self) -> int:
         """Return the bytes under prefix/ in the bucket once the file system's exports have settled."""
         return settled_bytes(self.bucket, self.prefix)
+
+
+def parallel_copy(src: Path, dest: Path, jobs: int = 64) -> None:
+    """Copy the tree src into dest with jobs copies at once, for file systems with a round trip per file.
+
+    Directories are made with the default mode and the current time.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    xargs = f"xargs -0 -r -P {jobs} -n 256"
+    dirs = f'cd "$1" && find . -mindepth 1 -type d -print0 | (cd "$2" && {xargs} mkdir -p --)'
+    files = f'cd "$1" && find . ! -type d -print0 | {xargs} cp -a --parents -t "$2" --'
+    for script in (dirs, files):
+        run("sh", "-c", script, "-", src, dest)
 
 
 def count_entries(path: Path) -> int:

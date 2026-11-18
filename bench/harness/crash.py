@@ -14,8 +14,10 @@ directory on this host, sharing nothing with the first: there the file system is
 (e2fsck -fn for Pando and ZeroFS, `juicefs fsck` for JuiceFS; S3 Files has no checker) and every
 acknowledged file is read back.
 
-Rows: crash.failed_writes (count), crash.stall (s: the longest gap between acknowledged writes),
-crash.fsck (the checker's exit code), crash.acked and crash.correct (files).
+Rows: crash.recovered (1 when a write was acknowledged within 120 s of the kill), crash.failed_writes
+(count), crash.stall (s: the longest gap between acknowledged writes, when recovered), crash.fsck
+(the checker's exit code), crash.acked and crash.correct (files). A system that does not recover
+within 120 s has its branch's pending I/O failed, where it can, and is checked all the same.
 """
 
 import argparse
@@ -95,9 +97,20 @@ class Crasher[W: start.Workspace]:
         """Crash branches of s."""
         self.s = s
 
-    def kill_and_restart(self, i: int) -> None:
-        """Kill the daemon serving branch i with SIGKILL and restart it as the system would."""
+    def kill_and_restart(self, i: int) -> float:
+        """Kill the daemon serving branch i with SIGKILL and restart it as the system would.
+
+        Returns the time.monotonic() of the kill.
+        """
         raise NotImplementedError
+
+    def give_up(self, i: int) -> None:  # noqa: ARG002 -- only the systems that can give up use the branch
+        """Fail branch i's pending I/O after the system did not recover on its own.
+
+        Raises SystemExit when the system has no way to do so.
+        """
+        msg = f"no acknowledged write within {RECOVERY_TIMEOUT} s of the kill"
+        raise SystemExit(msg)
 
     def close(self, i: int) -> None:
         """Close branch i as usual."""
@@ -121,13 +134,15 @@ class PandoCrasher(Crasher[start.Pando]):
     FRESH = 50
 
     @override
-    def kill_and_restart(self, i: int) -> None:
+    def kill_and_restart(self, i: int) -> float:
         p, out = self.s.procs.pop(i)
         os.kill(p.pid, signal.SIGKILL)
+        killed = time.monotonic()
         p.wait()
         out.write(p.stdout.read())
         out.close()
         self.s.attach(i, f"b{i}", "--recover")
+        return killed
 
     @override
     def fresh_check(self, i: int) -> tuple[int, Path]:
@@ -153,15 +168,17 @@ class JuiceFSCrasher(Crasher[start.JuiceFS]):
     """A fresh mount on the same mount point; a fresh host runs `juicefs fsck`."""
 
     @override
-    def kill_and_restart(self, i: int) -> None:
+    def kill_and_restart(self, i: int) -> float:
         pids = run("pgrep", "-f", f"juicefs mount .*{self.s.mnt}", capture=True, check=False).split()
         if not pids:
             msg = "no juicefs mount process"
             raise SystemExit(msg)
         for pid in pids:
             os.kill(int(pid), signal.SIGKILL)
+        killed = time.monotonic()
         run("umount", "-l", self.s.mnt, check=False)
         self.s.ensure_mounted()
+        return killed
 
     @override
     def close(self, i: int) -> None:
@@ -184,13 +201,20 @@ class JuiceFSCrasher(Crasher[start.JuiceFS]):
 class ZeroFSCrasher(Crasher[start.ZeroFS]):
     """The server started again on the same cache; a fresh host has a server on an empty cache.
 
-    The fresh host runs e2fsck -fn.
+    The NBD client keeps the device but does not reconnect it to the new server, so its I/O
+    waits for the client's timeout; giving up disconnects the device. The fresh host runs
+    e2fsck -fn.
     """
 
     @override
-    def kill_and_restart(self, i: int) -> None:
-        self.s.server.stop(kill=True)
+    def kill_and_restart(self, i: int) -> float:
+        killed = self.s.server.stop(kill=True)
         self.s.server.start()
+        return killed
+
+    @override
+    def give_up(self, i: int) -> None:
+        self.s.server.disconnect(self.s.server.device(i))
 
     @override
     def close(self, i: int) -> None:
@@ -218,13 +242,14 @@ class S3FilesCrasher(Crasher[start.S3Files]):
     """
 
     @override
-    def kill_and_restart(self, i: int) -> None:
+    def kill_and_restart(self, i: int) -> float:
         pids = run("pgrep", "-x", "efs-proxy", capture=True, check=False).split()
         if not pids:
             msg = "no efs-proxy process"
             raise SystemExit(msg)
         for pid in pids:
             os.kill(int(pid), signal.SIGKILL)
+        return time.monotonic()
 
     @override
     def close(self, i: int) -> None:
@@ -250,31 +275,33 @@ SYSTEMS: dict[str, tuple[type[start.Workspace], type[Crasher]]] = {
 }
 
 
-def crash_once(s: start.Workspace, crasher: Crasher, i: int, rep: int, out: Results) -> None:
-    """Crash the daemon under writes to a fresh branch i of s, check it as a fresh host would; write the rows.
+def write_through_crash(s: start.Workspace, crasher: Crasher, i: int) -> tuple[bool, Path]:
+    """Run the writer in branch i of s and crash the daemon under it.
 
-    Raises SystemExit when no write is acknowledged within RECOVERY_TIMEOUT of the kill.
+    Returns whether a write was acknowledged within RECOVERY_TIMEOUT of the kill, and the writer's
+    log. Raises SystemExit when the system did not recover and cannot give up on the branch's
+    pending I/O.
     """
-    s.open(i)
     d = s.root(i) / "crash"
     wlog = start.DIR / f"crash-writer-{i}.log"
     stop = start.DIR / f"crash-stop-{i}"
     stop.unlink(missing_ok=True)
     w = subprocess.Popen([sys.executable, "-c", WRITER, str(d), str(wlog), str(stop)])
+    recovered = False
     try:
         time.sleep(BEFORE_KILL)
-        killed = time.monotonic()
-        crasher.kill_and_restart(i)
+        killed = crasher.kill_and_restart(i)
         deadline = time.monotonic() + RECOVERY_TIMEOUT
         while time.monotonic() < deadline:
             ok, _ = read_log(wlog)
             if ok and ok[-1][1] > killed:
+                recovered = True
                 break
             time.sleep(0.2)
+        if recovered:
+            time.sleep(AFTER_RECOVERY)
         else:
-            msg = f"no acknowledged write within {RECOVERY_TIMEOUT} s of the kill"
-            raise SystemExit(msg)
-        time.sleep(AFTER_RECOVERY)
+            crasher.give_up(i)
     finally:
         stop.touch()
         try:
@@ -282,9 +309,20 @@ def crash_once(s: start.Workspace, crasher: Crasher, i: int, rep: int, out: Resu
         except subprocess.TimeoutExpired:
             w.kill()
             w.wait()
+    return recovered, wlog
+
+
+def crash_once(s: start.Workspace, crasher: Crasher, i: int, rep: int, out: Results) -> None:
+    """Crash the daemon under writes to a fresh branch i of s, check it as a fresh host would; write the rows.
+
+    Raises SystemExit when no write is acknowledged within RECOVERY_TIMEOUT of the kill and the
+    system cannot give up on the branch's pending I/O.
+    """
+    s.open(i)
+    recovered, wlog = write_through_crash(s, crasher, i)
     ok, err = read_log(wlog)
     times = [t for _, t in ok]
-    stall = max(b - a for a, b in itertools.pairwise(times))
+    stall = max(b - a for a, b in itertools.pairwise(times)) if recovered else None
     crasher.close(i)
     code, root = crasher.fresh_check(i)
     correct = 0
@@ -294,14 +332,17 @@ def crash_once(s: start.Workspace, crasher: Crasher, i: int, rep: int, out: Resu
                 correct += 1
     crasher.fresh_close(i)
     note = f"rep {rep}"
+    out.add(s.name, "crash.recovered", rep, int(recovered), "count", note)
     out.add(s.name, "crash.failed_writes", rep, len(err), "count", note)
-    out.add(s.name, "crash.stall", rep, stall, "s", note)
+    if stall is not None:
+        out.add(s.name, "crash.stall", rep, stall, "s", note)
     if code is not None:
         out.add(s.name, "crash.fsck", rep, code, "code", note)
     out.add(s.name, "crash.acked", rep, len(ok), "count", note)
     out.add(s.name, "crash.correct", rep, correct, "count", note)
     log(
-        f"{s.name}: crash rep {rep}: {len(err)} failed writes, stall {stall:.2f} s, fsck exit {code}, "
+        f"{s.name}: crash rep {rep}: {'recovered' if recovered else 'not recovered'}, "
+        f"{len(err)} failed writes, stall {'-' if stall is None else f'{stall:.2f}'} s, fsck exit {code}, "
         f"{correct} of {len(ok)} acknowledged files correct"
     )
     wlog.unlink(missing_ok=True)

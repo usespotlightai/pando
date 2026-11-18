@@ -36,8 +36,10 @@ DIR = WORK / "start"
 NPM_CACHE = "/root/.npm"
 CMD_TIMEOUT = 1800
 SNAPSHOTTER_TIMEOUT = 60
-NERDCTL_VERSION = "2.4.2"
-NERDCTL_SHA256 = "41a66995888043c0ba05f8061574eaba1b9e06b9b21c2a238215179df2728d3f"
+# nerdctl 2.3 and later pull through the containerd transfer service, which drops the labels that
+# remote snapshotters need for a lazy pull.
+NERDCTL_VERSION = "2.2.1"
+NERDCTL_SHA256 = "34144de7f12756aa4b9dc42a907fd95b0c5eb82a63566a650ca10c8abe7a26a0"
 SOCI_VERSION = "0.16.1"
 SOCI_SHA256 = "2be9f26ad853455515da69885f8906e6aecc65684cc302f8689c25cad8417bc8"
 NYDUS_VERSION = "2.4.5"
@@ -889,7 +891,7 @@ class LazyPull(Docker):
         ids = self.nerdctl("ps", "-aq", "--filter", "name=pando-bench-lazy-", check=False) or ""
         if ids.split():
             self.nerdctl("rm", "-f", *ids.split(), check=False)
-        self.nerdctl("system", "prune", "-af", check=False)
+        self.nerdctl("image", "prune", "-af", check=False)
 
     @override
     def empty(self) -> None:

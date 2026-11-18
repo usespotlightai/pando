@@ -49,6 +49,17 @@ write_files:
       version = 3
       root = "/data/containerd"
 
+      [plugins."io.containerd.transfer.v1.local"]
+        [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+          platform = "linux/amd64"
+          snapshotter = "overlayfs"
+        [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+          platform = "linux/amd64"
+          snapshotter = "soci"
+        [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+          platform = "linux/amd64"
+          snapshotter = "nydus"
+
       [proxy_plugins]
         [proxy_plugins.soci]
           type = "snapshot"
@@ -64,6 +75,13 @@ write_files:
     content: |
       [Unit]
       RequiresMountsFor=/data
+
+  # Ubuntu's fusermount3 profile allows FUSE mounts only under home, /mnt, /media and /tmp. The
+  # SOCI and Nydus snapshotters mount their lazy layers under /data.
+  - path: /etc/apparmor.d/local/fusermount3
+    content: |
+      mount fstype=@{fuse_types} -> /data/**/,
+      umount /data/**/,
 
   - path: /etc/modules-load.d/pando-bench.conf
     content: |
@@ -157,6 +175,7 @@ runcmd:
   - systemctl restart systemd-modules-load.service
   - snap install aws-cli --classic
   - systemctl daemon-reload
+  - apparmor_parser -r /etc/apparmor.d/fusermount3 || true
   - systemctl enable --now pando-bench-data.service
   # containerd and Docker started while their packages installed, before /data was mounted.
   - systemctl restart containerd docker
