@@ -159,21 +159,25 @@ jobs:
           done
           case " $measures " in *" crash "*) ;; *) exit $status ;; esac
           case ",${SYSTEMS:-pando}," in *,pando,*) ;; *) exit $status ;; esac
-          # The reboot case: start reboots host a under writes without a sync; check runs once it is back.
           for rep in 1 2 3 4 5; do
             boot=$(ssh -n "$ip" cat /proc/sys/kernel/random/boot_id)
             rc=0
+            started="$RUNNER_TEMP/crash-reboot-$rep.log"
             timeout 1800 ssh -n -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$ip" \
-              "cd /data/pando && sudo bench/run.sh crash-reboot start --rep $rep" || rc=$?
-            # 255: the connection dropped with the reboot; anything else: start failed before it.
-            if [ "$rc" != 255 ]; then echo "crash-reboot start $rep exited with $rc" >&2; status=1; break; fi
+              "cd /data/pando && sudo bench/run.sh crash-reboot start --rep $rep" >"$started" 2>&1 || rc=$?
+            cat "$started"
+            if [ "$rc" != 255 ] || ! grep -q ', rebooting$' "$started"; then
+              echo "crash-reboot start $rep exited with $rc before the reboot" >&2
+              status=1
+              break
+            fi
             back=
             for _ in $(seq 120); do
               sleep 5
               now=$(ssh -n -o ConnectTimeout=5 "$ip" cat /proc/sys/kernel/random/boot_id 2>/dev/null) || continue
               if [ "$now" != "$boot" ]; then back=1; break; fi
             done
-            if [ -z "$back" ]; then echo "host a did not come back from reboot $rep" >&2; exit 1; fi
+            if [ -z "$back" ]; then echo "host a did not come back from reboot $rep" >&2; status=1; break; fi
             ssh -n "$ip" 'timeout 300 sh -c "until mountpoint -q /data; do sleep 2; done"' || status=1
             ssh -n "$ip" "cd /data/pando && sudo bench/run.sh crash-reboot check --rep $rep" || status=1
           done

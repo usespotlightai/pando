@@ -20,11 +20,12 @@ write, and five seconds in reboots the host through /proc/sysrq-trigger, which n
 nor unmounts, as a power loss would. After the boot, `check` attaches the branch with
 `--recover=auto` from the state the host kept, mounts it so ext4 replays its journal, unmounts
 it, runs e2fsck -fn, reads every acknowledged file back, closes the branch and checks it again as
-a fresh host. `clean` removes what the runs left on the host and in the bucket.
+a fresh host. `clean` unmounts and detaches what a failed check left, then removes what the runs
+left on the host and in the bucket.
 
-Rows: crash.reboot.failed_writes (count), crash.reboot.attach (s: from the start of the attach
-to the device serving), crash.reboot.fsck and crash.reboot.fresh_fsck (exit codes),
-crash.reboot.acked, crash.reboot.correct and crash.reboot.fresh_correct (files).
+Rows: crash.reboot.attach (s: from the start of the attach to the device serving),
+crash.reboot.fsck and crash.reboot.fresh_fsck (exit codes), crash.reboot.acked,
+crash.reboot.correct and crash.reboot.fresh_correct (files).
 """
 
 import argparse
@@ -334,6 +335,7 @@ def reboot_start(rep: int) -> None:
         msg = f"no acknowledged write in {BEFORE_KILL} s ({len(err)} failed)"
         raise SystemExit(msg)
     log(f"{s.name}: crash reboot rep {rep}: {len(ok)} acknowledged writes, rebooting")
+    time.sleep(1)
     Path("/proc/sysrq-trigger").write_text("b")
     time.sleep(60)
     msg = "the host did not reboot"
@@ -364,7 +366,7 @@ def reboot_check(rep: int) -> None:
     start.unmount(root)
     code = run("e2fsck", "-fn", dev, check=False)
     run("mount", dev, root)
-    ok, err = read_log(reboot_log(rep))
+    ok, _ = read_log(reboot_log(rep))
     correct = correct_files(root, ok)
     crasher.close(rep)
     fresh_code, fresh_root = crasher.fresh_check(rep)
@@ -372,7 +374,6 @@ def reboot_check(rep: int) -> None:
     crasher.fresh_close(rep)
     out = Results("crash")
     note = f"rep {rep}"
-    out.add(s.name, "crash.reboot.failed_writes", rep, len(err), "count", note)
     out.add(s.name, "crash.reboot.attach", rep, attach, "s", note)
     out.add(s.name, "crash.reboot.fsck", rep, code, "code", note)
     out.add(s.name, "crash.reboot.fresh_fsck", rep, fresh_code, "code", note)
@@ -380,7 +381,7 @@ def reboot_check(rep: int) -> None:
     out.add(s.name, "crash.reboot.correct", rep, correct, "count", note)
     out.add(s.name, "crash.reboot.fresh_correct", rep, fresh_correct, "count", note)
     log(
-        f"{s.name}: crash reboot rep {rep}: {len(err)} failed writes, attach {attach:.2f} s, "
+        f"{s.name}: crash reboot rep {rep}: attach {attach:.2f} s, "
         f"fsck exit {code}, fresh fsck exit {fresh_code}, {correct} and {fresh_correct} of {len(ok)} "
         "acknowledged files correct"
     )
@@ -388,9 +389,16 @@ def reboot_check(rep: int) -> None:
 
 
 def reboot_clean() -> None:
-    """Remove what the reboot runs left on this host and in the bucket."""
+    """Close the branches a failed check left; remove what the runs left on this host and in the bucket."""
     s = start.Pando()
     s.connect()
+    for d in (s.dir / "fresh", s.dir):
+        held = start.Pando()
+        held.dir = d
+        held.connect()
+        for root in d.glob("m[0-9]*"):
+            if root.name[1:].isdigit():
+                held.close(int(root.name[1:]))
     s.teardown()
     REBOOT_STATE.unlink(missing_ok=True)
     for f in start.DIR.glob("crash-reboot-*"):
