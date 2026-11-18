@@ -10,8 +10,8 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+getrandom.workspace = true
 pando-engine.workspace = true
-rand.workspace = true
 rayon.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
