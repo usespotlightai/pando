@@ -141,6 +141,11 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
                 root: packed,
                 generation,
                 from: None,
+                log: Some(pando_format::LogPos {
+                    generation,
+                    closed: true,
+                    ..pando_format::LogPos::default()
+                }),
             },
         )
         .await?;

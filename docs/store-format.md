@@ -12,13 +12,18 @@ Every command that opens the store reads the marker before it reads or writes an
 the store. Commands that open the cache (`attach`, `import`, `base`, `follow`, `gc`, `stat`)
 read it while the cache opens, so it adds no time. Opening the cache recovers this host's
 object log and touches nothing in the store, so a refused command may have done that much. The
-others (`init`, `refs`, `branch`, `advance`, `delete`) wait for one more GET.
+others (`init`, `refs`, `branch`, `checkpoint`, `checkpoints`, `delete-checkpoint`, `advance`,
+`delete`) wait for one more GET.
 
-- A command that writes (`init`, `import`, `branch`, `advance`, `delete`, `base`, `follow`,
-  `gc --delete`, `attach`) creates the marker when the store has none. If another host creates
-  it first, the command checks that host's marker instead.
-- A command that only reads (`refs`, `stat`, `gc` without `--delete`) never writes it.
+- A command that writes (`init`, `import`, `branch`, `checkpoint`, `delete-checkpoint`,
+  `advance`, `delete`, `base`, `follow`, `gc --delete`, `attach`) creates the marker when the
+  store has none. If another host creates it first, the command checks that host's marker
+  instead.
+- A command that only reads (`refs`, `checkpoints`, `stat`, `gc` without `--delete`) never
+  writes it.
 - `detach` and `resize` talk only to the daemon of an attached device and skip the check.
+- The host daemon (`pando serve`) checks the marker for the first command it runs that reads
+  and for the first that writes, and not again: the commands after them pay no extra GET.
 - A store without a marker was written before markers existed and is in format 1.0.
 - A marker with a major version this build does not read stops the command before it touches
   anything else in the store: `the store is in format 2.0; this pando reads format 1.x`.
@@ -38,8 +43,8 @@ An older build keeps working on a store with a newer minor version. A newer buil
 own minor version only when it creates the marker; it does not rewrite an existing one.
 
 **Major version** (1.x to 2.0): any other change to the bytes of a stored object: entries,
-refs, tree nodes, frames, segment indexes, recipes, change lists or recordings, or the key
-layout. Builds of the old major version refuse the store, so they cannot misread it or mix old
+refs, checkpoints, write log records, tree nodes, frames, segment indexes, recipes, change
+lists or recordings, or the key layout. Builds of the old major version refuse the store, so they cannot misread it or mix old
 objects into it.
 
 A major change needs:

@@ -6,6 +6,10 @@ use crate::{Hash, SegId};
 pub const SEGMENTS: &str = "segments";
 /// The prefix, before a `/`, of the keys of refs.
 pub const REFS: &str = "refs";
+/// The prefix, before a `/`, of the keys of checkpoints.
+pub const CHECKPOINTS: &str = "checkpoints";
+/// The prefix, before a `/`, of the keys of write log records.
+pub const LOG: &str = "log";
 /// The prefix, before a `/`, of the keys of change lists.
 pub const CHANGES: &str = "changes";
 const HINTS: &str = "hints";
@@ -27,6 +31,27 @@ pub fn segment_index(id: SegId) -> String {
 /// The key of the [`Ref`](crate::Ref) of branch `name`.
 pub fn reference(name: &str) -> String {
     format!("{REFS}/{name}")
+}
+
+/// The key of checkpoint `name`.
+pub fn checkpoint(name: &str) -> String {
+    format!("{CHECKPOINTS}/{name}")
+}
+
+/// The folder of branch `branch`'s write log, named by the hash of the branch's name.
+pub fn log_branch(branch: &str) -> String {
+    format!("{LOG}/{}", Hash::of(branch.as_bytes()))
+}
+
+/// Record `n` of writer `generation` of branch `branch`'s write log.
+pub fn log_record(branch: &str, generation: u64, n: u64) -> String {
+    format!("{}/{generation:020}/{n:020}", log_branch(branch))
+}
+
+/// The generation and number a key under [`log_branch`] names.
+pub fn parse_log_record(name: &str) -> Option<(u64, u64)> {
+    let (g, n) = name.split_once('/')?;
+    Some((g.parse().ok()?, n.parse().ok()?))
 }
 
 /// The key of the [`ChangeList`](crate::ChangeList) from root `from` to root `root`.
