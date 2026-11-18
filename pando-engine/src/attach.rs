@@ -50,6 +50,11 @@ pub struct AttachOptions {
     pub snapshot_every: Duration,
     /// Snapshot early once this many bytes reached the image since the last one; zero never does.
     pub snapshot_bytes: u64,
+    /// Snapshot early once writes came and none came for this long; zero never does.
+    pub snapshot_idle: Duration,
+    /// Snapshots read the chunks written from the image instead of cloning them when they hold
+    /// at most this many bytes; zero always clones.
+    pub snapshot_copy_max: u64,
     /// Parallel fetches for the recording of earlier first reads; zero fetches none.
     pub prefetch: usize,
     /// Record this mount's first reads for the next one.
@@ -111,6 +116,20 @@ pub struct SnapshotCounts {
     pub failed: usize,
     /// The error of the latest failed snapshot.
     pub last_error: Option<String>,
+    /// Snapshots that read the chunks from the image instead of cloning them.
+    pub copied: usize,
+    /// Snapshots that gave up because writes kept coming.
+    pub postponed: usize,
+    /// Time the device spent suspended for snapshots.
+    pub paused: Duration,
+    /// The longest suspend for a snapshot.
+    pub max_paused: Duration,
+    /// The longest suspend to begin an era.
+    pub max_mark: Duration,
+    /// The longest suspend to read a snapshot's last chunks.
+    pub max_freeze: Duration,
+    /// The longest suspend to clone a snapshot's last chunks.
+    pub max_clone: Duration,
 }
 
 /// One branch served on this host.
@@ -235,6 +254,8 @@ impl Attachment {
         SnapshotOptions {
             every: self.opts.snapshot_every,
             burst: self.opts.snapshot_bytes,
+            idle: self.opts.snapshot_idle,
+            copy_max: self.opts.snapshot_copy_max,
         }
     }
 
@@ -378,11 +399,23 @@ impl Attachment {
     pub fn snapshots(&self) -> Option<SnapshotCounts> {
         let h = self.handoff.lock().clone()?;
         let load = |a: &std::sync::atomic::AtomicUsize| a.load(std::sync::atomic::Ordering::Relaxed);
+        let max = |i: usize| {
+            Duration::from_micros(h.stats.max_pause_us[i].load(std::sync::atomic::Ordering::Relaxed))
+        };
         Some(SnapshotCounts {
             taken: load(&h.stats.taken),
             chunks: load(&h.stats.chunks),
             failed: load(&h.stats.failed),
             last_error: h.stats.last_error.lock().clone(),
+            copied: load(&h.stats.copied),
+            postponed: load(&h.stats.postponed),
+            paused: Duration::from_micros(h.stats.paused_us.load(std::sync::atomic::Ordering::Relaxed)),
+            max_paused: Duration::from_micros(
+                h.stats.max_paused_us.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            max_mark: max(0),
+            max_freeze: max(1),
+            max_clone: max(2),
         })
     }
 
@@ -488,6 +521,21 @@ impl DeviceSwitch for NoDevices {
         Ok(None)
     }
     async fn bytes_written(&self, _: &Path) -> std::io::Result<u64> {
+        Err(no_devices())
+    }
+    async fn create_era(&self, _: &str, _: &Path, _: &Path, _: u64, _: u64) -> std::io::Result<PathBuf> {
+        Err(no_devices())
+    }
+    async fn era(&self, _: &str) -> std::io::Result<Option<crate::ports::EraDevice>> {
+        Ok(None)
+    }
+    async fn resize_era(&self, _: &str, _: u64) -> std::io::Result<()> {
+        Err(no_devices())
+    }
+    async fn era_begin(&self, _: &str) -> std::io::Result<u32> {
+        Err(no_devices())
+    }
+    async fn era_listed(&self, _: &str, _: u32) -> std::io::Result<Vec<std::ops::Range<u64>>> {
         Err(no_devices())
     }
 }
