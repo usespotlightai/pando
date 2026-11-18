@@ -1,6 +1,6 @@
-# The kernel tests: fio, e2fsprogs, device-mapper tools, xfstests built from a pinned tag, and
-# MinIO built from its last source release as the store: the tests write gigabytes, more than
-# the AWS emulator keeps. Build with tests/kernel as the context.
+# The kernel tests: fio, e2fsprogs, device-mapper tools, xfstests built from a pinned tag with
+# the fixes in xfstests-*.patch, and MinIO built from its last source release as the store: the
+# tests write gigabytes, more than the AWS emulator keeps. Build with tests/kernel as the context.
 FROM golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73 AS minio
 ARG MINIO_COMMIT=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
 RUN CGO_ENABLED=0 GOBIN=/out go install github.com/minio/minio@$MINIO_COMMIT
@@ -28,6 +28,8 @@ RUN for try in 1 2 3 4 5; do \
 		sleep $((try * 15)); \
 	done
 WORKDIR /opt/xfstests
+COPY xfstests-*.patch /tmp/xfstests-patches/
+RUN git apply /tmp/xfstests-patches/*.patch && rm -rf /tmp/xfstests-patches
 RUN make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 \
 	&& test -x /var/lib/xfstests/check && test -x /var/lib/xfstests/ltp/fsstress \
 	&& test -x /var/lib/xfstests/src/log-writes/replay-log
