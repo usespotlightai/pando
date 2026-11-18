@@ -12,6 +12,11 @@ is durable where another host would open it, and the bytes `npm ci`'s changes ad
             snapshot holds beyond the workspace snapshot (ListChangedBlocks).
   JuiceFS   `sync` of the mount; data is uploaded as files close, and the metadata is in SQLite
             on the host, standing in for a metadata server. Bytes: growth of its bucket prefix.
+  ZeroFS    unmount and disconnect of the NBD device, whose flush makes the server upload what
+            it holds. Bytes: growth of its bucket prefix.
+  S3 Files  `sync` of the mount: the file system is durable on its own, and another host mounts
+            it directly. Bytes: the object versions it exported to its bucket for the branch,
+            once its exports settle (it waits for a file to go a minute without writes).
 
 Rows: save.time in seconds, save.uploaded in bytes, save.npm_ci in seconds. Pando also splits
 save.time: save.unmount, save.detach and save.exit (the end of `pando attach`); within the
@@ -24,6 +29,7 @@ was attached (save.stalls, save.stall in seconds, save.fetched_bytes).
 """
 
 import argparse
+import datetime as dt
 import json
 import subprocess
 import time
@@ -33,7 +39,7 @@ from typing import override
 import fork
 import start
 import workspace
-from common import Results, bucket_bytes, env, log, run
+from common import Results, bucket_bytes, env, log, run, settled_bytes
 
 NPM_CI = ("web", "npm ci --prefer-offline --no-audit --no-fund")
 
@@ -51,8 +57,12 @@ class Saver[W: start.Workspace]:
         return 0
 
     def save(self, i: int) -> int | None:
-        """Make branch i durable; return the bytes it added, or None to measure growth with before."""
+        """Make branch i durable; return the bytes it added, or None to count them with uploaded."""
         raise NotImplementedError
+
+    def uploaded(self, before: int) -> int:
+        """Return the bytes the last save added, given what before returned ahead of `npm ci`."""
+        return self.before() - before
 
     def after(self, i: int) -> None:
         """Close branch i once its save is measured."""
@@ -170,6 +180,10 @@ class EbsSaver(Saver[start.Ebs]):
         ):
             time.sleep(2)
 
+    @override
+    def uploaded(self, before: int) -> int:
+        return self.changed()
+
     def changed(self) -> int:
         """Return the bytes of the blocks the last saved snapshot holds beyond the workspace snapshot."""
         blocks, size, token = 0, 0, None
@@ -223,6 +237,58 @@ class JuiceFSSaver(Saver[start.JuiceFS]):
         run("sync", "-f", self.s.root(i))
 
 
+class ZeroFSSaver(Saver[start.ZeroFS]):
+    """Unmount and disconnect the NBD device; the flush makes the server upload what it holds."""
+
+    @override
+    def before(self) -> int:
+        return bucket_bytes(self.s.bucket, self.s.prefix)
+
+    @override
+    def save(self, i: int) -> int | None:
+        start.unmount(self.s.root(i))
+        self.s.server.disconnect(self.s.server.device(i))
+
+
+class S3FilesSaver(Saver[start.S3Files]):
+    """`sync` of the mount; the bytes are the object versions exported for the branch after `npm ci`."""
+
+    @override
+    def before(self) -> int:
+        self.since = dt.datetime.now(dt.UTC)
+        return 0
+
+    @override
+    def save(self, i: int) -> int | None:
+        self.branch = i
+        run("sync", "-f", self.s.root(i))
+
+    @override
+    def uploaded(self, before: int) -> int:
+        fs = self.s.fs
+        prefix = f"{fs.prefix}/b{self.branch}/"
+        settled_bytes(fs.bucket, prefix.rstrip("/"))
+        out = run(
+            "aws",
+            "s3api",
+            "list-object-versions",
+            "--bucket",
+            fs.bucket,
+            "--prefix",
+            prefix,
+            "--query",
+            "Versions[].[LastModified, Size]",
+            "--output",
+            "json",
+            capture=True,
+        )
+        return sum(
+            size
+            for modified, size in json.loads(out) or []
+            if dt.datetime.fromisoformat(modified) >= self.since
+        )
+
+
 SYSTEMS: dict[str, tuple[type[start.Workspace], type[Saver]]] = {
     "pando": (start.Pando, PandoSaver),
     "pando-capped": (start.PandoCapped, PandoSaver),
@@ -230,6 +296,8 @@ SYSTEMS: dict[str, tuple[type[start.Workspace], type[Saver]]] = {
     "docker": (start.Docker, DockerSaver),
     "ebs": (start.Ebs, EbsSaver),
     "juicefs": (start.JuiceFS, JuiceFSSaver),
+    "zerofs": (start.ZeroFS, ZeroFSSaver),
+    "s3files": (start.S3Files, S3FilesSaver),
 }
 
 
@@ -246,10 +314,8 @@ def save_once(s: start.Workspace, saver: Saver, i: int, rep: int, out: Results) 
         msg = f"npm ci exited with {code}"
         raise SystemExit(msg)
     t, uploaded = start.timed_call(saver.save, i)
-    if isinstance(saver, EbsSaver):
-        uploaded = saver.changed()
-    elif uploaded is None:
-        uploaded = saver.before() - before
+    if uploaded is None:
+        uploaded = saver.uploaded(before)
     saver.after(i)
     note = f"rep {rep}"
     out.add(s.name, "save.time", rep, t, "s", note)
@@ -289,7 +355,7 @@ def measure(names: list[str], reps: int) -> None:
             s.setup()
             start.warm_up(s)
             saver = saver_cls(s)
-            for rep in range(1, reps + 1):
+            for rep in range(1, min(reps, s.max_reps) + 1):
                 save_once(s, saver, rep, rep, out)
         except (
             subprocess.CalledProcessError,

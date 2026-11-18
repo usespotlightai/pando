@@ -17,6 +17,7 @@ import rawio
 import save
 import start
 import workspace
+from common import log
 
 
 def main() -> None:
@@ -36,28 +37,28 @@ def main() -> None:
     more = {"fio": rawio, "save": save, "crash": crash}
     systems = {k: m.main_args(sub.add_parser) for k, m in more.items()}
     a = p.parse_args()
-
     if a.command == "workspace":
         workspace.prepare()
-    elif a.command == "fork":
-        names = [s for s in a.systems.split(",") if s]
-        unknown = [s for s in names if s not in fork.SYSTEMS]
-        if unknown:
-            p.error(f"unknown systems: {', '.join(unknown)}")
-        fork.measure(names, a.branches, a.rep)
-    elif a.command == "crash-reboot":
+        return
+    if a.command == "crash-reboot":
         crash.reboot(a.phase, a.rep)
+        return
+
+    has = {"fork": fork.SYSTEMS, **systems}.get(a.command, start.SYSTEMS)
+    known = set(fork.SYSTEMS) | set(start.SYSTEMS) | {k for v in systems.values() for k in v}
+    names = [s for s in a.systems.split(",") if s]
+    unknown = [s for s in names if s not in known]
+    if unknown:
+        p.error(f"unknown systems: {', '.join(unknown)}")
+    skipped = [s for s in names if s not in has]
+    if skipped:
+        log(f"{a.command}: not measured for {', '.join(skipped)}")
+    names = [s for s in names if s in has]
+    if a.command == "fork":
+        fork.measure(names, a.branches, a.rep)
     elif a.command in more:
-        names = [s for s in a.systems.split(",") if s]
-        unknown = [s for s in names if s not in systems[a.command]]
-        if unknown:
-            p.error(f"unknown systems: {', '.join(unknown)}")
         more[a.command].measure(names, a.reps)
     else:
-        names = [s for s in a.systems.split(",") if s]
-        unknown = [s for s in names if s not in start.SYSTEMS]
-        if unknown:
-            p.error(f"unknown systems: {', '.join(unknown)}")
         start.measure(a.command, names, a.reps)
 
 

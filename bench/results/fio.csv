@@ -74,3 +74,33 @@ JuiceFS,small,fio.randread_qd32,3,76357.3,IOPS,rep 3
 JuiceFS,small,fio.randwrite_qd32,3,456.322,IOPS,rep 3
 JuiceFS,small,fio.seqread,3,1611.37,MB/s,rep 3
 JuiceFS,small,fio.seqwrite,3,1317.16,MB/s,rep 3
+ZeroFS (NBD),small,fio.randread_qd1,1,6770.46,IOPS,rep 1
+ZeroFS (NBD),small,fio.randread_qd32,1,32654.7,IOPS,rep 1
+ZeroFS (NBD),small,fio.randwrite_qd32,1,1319.62,IOPS,rep 1
+ZeroFS (NBD),small,fio.seqread,1,544.983,MB/s,rep 1
+ZeroFS (NBD),small,fio.seqwrite,1,180.473,MB/s,rep 1
+ZeroFS (NBD),small,fio.randread_qd1,2,5985.05,IOPS,rep 2
+ZeroFS (NBD),small,fio.randread_qd32,2,28405,IOPS,rep 2
+ZeroFS (NBD),small,fio.randwrite_qd32,2,1234,IOPS,rep 2
+ZeroFS (NBD),small,fio.seqread,2,593.947,MB/s,rep 2
+ZeroFS (NBD),small,fio.seqwrite,2,226.031,MB/s,rep 2
+ZeroFS (NBD),small,fio.randread_qd1,3,4553.27,IOPS,rep 3
+ZeroFS (NBD),small,fio.randread_qd32,3,31650.3,IOPS,rep 3
+ZeroFS (NBD),small,fio.randwrite_qd32,3,1543.37,IOPS,rep 3
+ZeroFS (NBD),small,fio.seqread,3,529.135,MB/s,rep 3
+ZeroFS (NBD),small,fio.seqwrite,3,189.536,MB/s,rep 3
+Amazon S3 Files,small,fio.randread_qd1,1,228.316,IOPS,rep 1
+Amazon S3 Files,small,fio.randread_qd32,1,16722.6,IOPS,rep 1
+Amazon S3 Files,small,fio.randwrite_qd32,1,4491.51,IOPS,rep 1
+Amazon S3 Files,small,fio.seqread,1,484.442,MB/s,rep 1
+Amazon S3 Files,small,fio.seqwrite,1,187.877,MB/s,rep 1
+Amazon S3 Files,small,fio.randread_qd1,2,244.913,IOPS,rep 2
+Amazon S3 Files,small,fio.randread_qd32,2,25051.3,IOPS,rep 2
+Amazon S3 Files,small,fio.randwrite_qd32,2,4826.32,IOPS,rep 2
+Amazon S3 Files,small,fio.seqread,2,481.641,MB/s,rep 2
+Amazon S3 Files,small,fio.seqwrite,2,184.336,MB/s,rep 2
+Amazon S3 Files,small,fio.randread_qd1,3,242.638,IOPS,rep 3
+Amazon S3 Files,small,fio.randread_qd32,3,24680.3,IOPS,rep 3
+Amazon S3 Files,small,fio.randwrite_qd32,3,4871.82,IOPS,rep 3
+Amazon S3 Files,small,fio.seqread,3,488.323,MB/s,rep 3
+Amazon S3 Files,small,fio.seqwrite,3,185.655,MB/s,rep 3

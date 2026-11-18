@@ -2099,3 +2099,16 @@ JuiceFS,small,fork.time,97,12.5226,s,rep 1
 JuiceFS,small,fork.time,98,12.5224,s,rep 1
 JuiceFS,small,fork.time,99,12.8228,s,rep 1
 JuiceFS,small,fork.time,100,12.8261,s,rep 1
+ZeroFS (NBD),small,fork.time,1,10.8176,s,rep 1
+ZeroFS (NBD),small,fork.time,2,10.7717,s,rep 1
+ZeroFS (NBD),small,fork.time,3,12.8694,s,rep 1
+ZeroFS (NBD),small,fork.time,4,11.0382,s,rep 1
+ZeroFS (NBD),small,fork.time,5,12.9818,s,rep 1
+ZeroFS (NBD),small,fork.time,6,13.6087,s,rep 1
+ZeroFS (NBD),small,fork.time,7,11.3244,s,rep 1
+ZeroFS (NBD),small,fork.time,8,12.8772,s,rep 1
+ZeroFS (NBD),small,fork.time,9,13.5885,s,rep 1
+ZeroFS (NBD),small,fork.time,10,13.1283,s,rep 1
+Amazon S3 Files,small,fork.time,1,179.465,s,rep 1
+Amazon S3 Files,small,fork.time,2,116.207,s,rep 1
+Amazon S3 Files,small,fork.time,3,123.068,s,rep 1

@@ -12,9 +12,12 @@ A system that cannot make N branches in reasonable time or money makes fewer; th
 says how many.
 """
 
+import contextlib
 import json
 import os
+import secrets
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -29,10 +32,13 @@ from common import (
     du_bytes,
     env,
     env_file,
+    extract,
     fetch,
     log,
     percentile,
     run,
+    s3_config,
+    settled_bytes,
     timed,
     used_bytes,
 )
@@ -41,6 +47,16 @@ EDIT_BYTES = 5 << 20
 EDITED = 20
 JUICEFS_VERSION = "1.4.2"
 JUICEFS_SHA256 = "79648a0a67145bf42ca4e8336578c13a5bbc9a0bd34df340b3b93dac1e975247"
+ZEROFS_VERSION = "2.3.7"
+ZEROFS_SHA256 = "8efa26f7abee82e5b720e57ef9c307d0f745a22cd0d81a6d3bbc095db56707c8"
+EFS_UTILS_DEB = (
+    "https://amazon-efs-utils.aws.com/repo/deb/ubuntu/26.04/pool/main/a/amazon-efs-utils/"
+    "amazon-efs-utils-3.4.0-1_amd64.deb"
+)
+EFS_UTILS_SHA256 = "1c2e4df3400b3b50a2900fdc970ada9957c3da425cd88aa18984be7535b1f7e6"
+NBD_DEVICES = 16
+SERVER_TIMEOUT = 120
+MOUNT_TIMEOUT = 900
 TAG = "pando-bench"
 HARNESS_TAG = "harness"
 LSBLK_COLUMNS = 2
@@ -492,12 +508,426 @@ class Pando(System):
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+def wait_port(port: int, proc: subprocess.Popen[bytes], what: str) -> None:
+    """Return once 127.0.0.1:port accepts a connection.
+
+    Raises SystemExit when proc exits first or SERVER_TIMEOUT passes.
+    """
+    deadline = time.monotonic() + SERVER_TIMEOUT
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            msg = f"{what} exited with {proc.returncode}"
+            raise SystemExit(msg)
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        except OSError:
+            time.sleep(0.2)
+        else:
+            return
+    msg = f"{what} did not listen on port {port} within {SERVER_TIMEOUT} s"
+    raise SystemExit(msg)
+
+
+def mounted(path: Path) -> bool:
+    """Return whether path is a mount point, from the mount table, without touching the file system."""
+    return any(line.split()[1] == str(path) for line in Path("/proc/self/mounts").read_text().splitlines())
+
+
+class ZeroFSServer:
+    """A ZeroFS server on this host over a prefix of the bench bucket, with the host role's credentials.
+
+    Its file system is mounted over 9P at mnt; each file in mnt/.nbd is an NBD export of that
+    name. Data written through either is durable in the bucket once flushed or fsynced.
+    """
+
+    NINEP_PORT = 5564
+    NBD_PORT = 10809
+
+    def __init__(self, base: Path, bucket: str, prefix: str) -> None:
+        """Keep the server's files in base; store its data under s3://bucket/prefix."""
+        self.dir = base
+        self.bucket = bucket
+        self.prefix = prefix
+        self.mnt = base / "fs"
+        self.proc: subprocess.Popen[bytes] | None = None
+
+    @staticmethod
+    def install() -> Path:
+        """Return the zerofs binary, first downloading its GitHub release and checking it if needed."""
+        b = TOOLS / f"zerofs-{ZEROFS_VERSION}" / "zerofs"
+        if not b.exists():
+            tar = fetch(
+                f"https://github.com/Barre/ZeroFS/releases/download/v{ZEROFS_VERSION}/zerofs-pgo-multiplatform.tar.gz",
+                TOOLS / f"zerofs-{ZEROFS_VERSION}.tar.gz",
+                ZEROFS_SHA256,
+            )
+            shutil.copy(extract(tar, b.parent / "release", "zerofs-linux-amd64-pgo"), b)
+            b.chmod(0o755)
+        return b
+
+    def start(self, cache: Path | None = None) -> None:
+        """Start the server with its cache in cache (default dir/cache) and mount its file system.
+
+        Raises SystemExit when another process holds its ports or it does not come up.
+        """
+        self.dir.mkdir(parents=True, exist_ok=True)
+        password = self.dir / "password"
+        if not password.exists():
+            password.write_text(secrets.token_hex(16))
+            password.chmod(0o600)
+        config = self.dir / "zerofs.toml"
+        config.write_text(
+            f'[cache]\ndir = "{cache or self.dir / "cache"}"\ndisk_size_gb = 32.0\nmemory_size_gb = 2.0\n\n'
+            f'[storage]\nurl = "s3://{self.bucket}/{self.prefix}"\n'
+            f'encryption_password = "{password.read_text()}"\n\n'
+            f'[aws]\nregion = "{env("AWS_REGION")}"\n\n'
+            f'[servers.ninep]\naddresses = ["127.0.0.1:{self.NINEP_PORT}"]\n\n'
+            f'[servers.nbd]\naddresses = ["127.0.0.1:{self.NBD_PORT}"]\n'
+        )
+        config.chmod(0o600)
+        for port in (self.NINEP_PORT, self.NBD_PORT):
+            with contextlib.suppress(OSError):
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                msg = f"another process listens on port {port}"
+                raise SystemExit(msg)
+        with (self.dir / "zerofs.log").open("ab") as out:
+            self.proc = subprocess.Popen(
+                [str(self.install()), "run", "-c", str(config)], stdout=out, stderr=subprocess.STDOUT
+            )
+        wait_port(self.NINEP_PORT, self.proc, "zerofs")
+        wait_port(self.NBD_PORT, self.proc, "zerofs")
+        self.mnt.mkdir(parents=True, exist_ok=True)
+        run(
+            "mount",
+            "-t",
+            "9p",
+            "-o",
+            f"trans=tcp,port={self.NINEP_PORT},version=9p2000.L,msize=1048576,access=user",
+            "127.0.0.1",
+            self.mnt,
+        )
+        (self.mnt / ".nbd").mkdir(exist_ok=True)
+
+    def stop(self, *, kill: bool = False) -> float:
+        """Unmount the file system and stop the server: SIGTERM, which flushes, or SIGKILL with kill.
+
+        Returns the time.monotonic() of the SIGKILL, or of the stop.
+        """
+        if kill and self.proc:
+            self.proc.kill()
+        stopped = time.monotonic()
+        if mounted(self.mnt) and (kill or run("umount", self.mnt, check=False) != 0):
+            run("umount", "-l", self.mnt, check=False)
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=SERVER_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.proc:
+            self.proc.wait()
+        self.proc = None
+        return stopped
+
+    def put(self, name: str, image: Path) -> None:
+        """Store image as the export name and flush it to the bucket."""
+        run("cp", "--sparse=always", image, self.mnt / ".nbd" / name)
+        run("sync", self.mnt / ".nbd" / name)
+
+    def copy(self, src: str, dst: str) -> None:
+        """Copy export src to a new export dst, a full copy, and flush it to the bucket."""
+        run("cp", "--sparse=always", self.mnt / ".nbd" / src, self.mnt / ".nbd" / dst)
+        run("sync", self.mnt / ".nbd" / dst)
+
+    def remove(self, name: str) -> None:
+        """Delete export name."""
+        (self.mnt / ".nbd" / name).unlink(missing_ok=True)
+
+    @staticmethod
+    def device(i: int) -> str:
+        """Return the NBD device that serves branch i."""
+        return f"/dev/nbd{i % NBD_DEVICES}"
+
+    def connect(self, name: str, i: int) -> str:
+        """Connect export name to branch i's NBD device with ZeroFS's recommended options; return it."""
+        dev = self.device(i)
+        run(
+            "nbd-client",
+            "127.0.0.1",
+            self.NBD_PORT,
+            dev,
+            "-N",
+            name,
+            "-persist",
+            "-timeout",
+            "600",
+            "-connections",
+            "4",
+            capture=True,
+        )
+        return dev
+
+    @staticmethod
+    def disconnect(dev: str) -> None:
+        """Disconnect an NBD device; the export has every write the device flushed."""
+        run("nbd-client", "-d", dev, capture=True, check=False)
+
+    def disconnect_all(self) -> None:
+        """Disconnect every NBD device on this host."""
+        for n in range(NBD_DEVICES):
+            if Path(f"/sys/block/nbd{n}/pid").exists():
+                self.disconnect(f"/dev/nbd{n}")
+
+
+def nbd_unavailable() -> str | None:
+    """Return why this host cannot serve NBD devices, or None."""
+    if not Path("/sys/module/nbd").exists():
+        return "the nbd module is not loaded"
+    return None if shutil.which("nbd-client") else "nbd-client is not installed"
+
+
+class ZeroFS(System):
+    """ZeroFS on the bench bucket, ext4 on its NBD export.
+
+    Checkpoints are read-only, so a branch is a full copy of the base export, made through the
+    server's 9P file system.
+    """
+
+    name = "ZeroFS (NBD)"
+    max_branches = 10  # each branch copies the whole image through the server
+    dir = WORK / "zerofs"
+    mnt = WORK / "zerofs-mnt"
+    prefix = "pando-bench-zerofs-fork"
+
+    @override
+    def unavailable(self) -> str | None:
+        return nbd_unavailable()
+
+    @override
+    def setup(self) -> None:
+        self.bucket = env("S3_BUCKET")
+        self.teardown()
+        self.server = ZeroFSServer(self.dir, self.bucket, self.prefix)
+        self.server.start()
+        self.mnt.mkdir(parents=True, exist_ok=True)
+        log("copying the workspace image into ZeroFS")
+        self.server.put("base", workspace.IMAGE)
+
+    @override
+    def fork(self, i: int) -> float:
+        t0 = time.perf_counter_ns()
+        self.server.copy("base", f"b{i}")
+        return (time.perf_counter_ns() - t0) / 1e9
+
+    @override
+    def edit(self, i: int) -> bool:
+        dev = self.server.connect(f"b{i}", i)
+        try:
+            run("mount", dev, self.mnt)
+            try:
+                write_edit(self.mnt / "pando-bench-edit.bin")
+            finally:
+                run("umount", self.mnt)
+        finally:
+            self.server.disconnect(dev)
+        return True
+
+    @override
+    def used(self) -> int:
+        return bucket_bytes(self.bucket, self.prefix)
+
+    @override
+    def teardown(self) -> None:
+        if self.mnt.is_mount():
+            run("umount", self.mnt, check=False)
+        server = getattr(self, "server", None)
+        if server:
+            server.disconnect_all()
+            server.stop()
+        if hasattr(self, "bucket"):
+            run(
+                "aws", "s3", "rm", "--recursive", "--quiet", f"s3://{self.bucket}/{self.prefix}/", check=False
+            )
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class S3FilesMount:
+    """Amazon S3 Files: the bench's file system over its own versioned bucket, mounted over NFS.
+
+    Its mount helper, from efs-utils, runs an efs-proxy process per mount that carries NFS over
+    TLS; the efs-utils watchdog restarts it if it dies. Files written through the mount reach the
+    bucket about a minute after their last write. S3 Files has no branches or snapshots, so a branch
+    is a copy of the base's files through the mount.
+    """
+
+    def __init__(self, mnt: Path, prefix: str) -> None:
+        """Mount the file system at mnt and keep branches under prefix/ in its bucket."""
+        self.mnt = mnt
+        self.prefix = prefix
+        self.fs = env("PANDO_BENCH_S3FILES", "")
+        self.bucket = env("PANDO_BENCH_S3FILES_BUCKET", "")
+
+    def unavailable(self) -> str | None:
+        """Return why this host cannot use S3 Files, or None."""
+        return None if self.fs and self.bucket else "no S3 Files file system on this host"
+
+    @staticmethod
+    def install() -> None:
+        """Install efs-utils, which has the s3files mount helper, from its pinned Ubuntu package.
+
+        Its CloudWatch logging is turned off: the host role has no CloudWatch access.
+        """
+        if shutil.which("mount.s3files"):
+            return
+        deb = fetch(EFS_UTILS_DEB, TOOLS / "amazon-efs-utils_3.4.0-1_amd64.deb", EFS_UTILS_SHA256)
+        run(
+            "apt-get",
+            "install",
+            "-y",
+            "-q",
+            deb,
+            capture=True,
+            env_extra={"DEBIAN_FRONTEND": "noninteractive"},
+        )
+        conf = Path("/etc/amazon/efs/s3files-utils.conf")
+        if conf.exists():
+            run("sed", "-i", r"/^\[cloudwatch-log\]/,/^\[/ s/^enabled = true/enabled = false/", conf)
+
+    def ensure_mounted(self) -> None:
+        """Mount the file system at mnt unless it is mounted there, retrying while its mount target comes up.
+
+        Raises SystemExit when it cannot be mounted within MOUNT_TIMEOUT.
+        """
+        if self.mnt.is_mount():
+            return
+        self.install()
+        self.mnt.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + MOUNT_TIMEOUT
+        while run("mount", "-t", "s3files", f"{self.fs}:/", self.mnt, check=False) != 0:
+            if time.monotonic() > deadline:
+                msg = f"could not mount S3 Files {self.fs} within {MOUNT_TIMEOUT} s"
+                raise SystemExit(msg)
+            time.sleep(15)
+
+    def unmount(self) -> None:
+        """Unmount the file system."""
+        if self.mnt.is_mount() and run("umount", self.mnt, check=False) != 0:
+            run("umount", "-l", self.mnt, check=False)
+
+    def path(self, name: str) -> Path:
+        """Return the directory of name (a branch, or base) on the mount."""
+        return self.mnt / self.prefix / name
+
+    def load_base(self) -> None:
+        """Copy the workspace into base through the mount."""
+        self.ensure_mounted()
+        parallel_copy(workspace.SRC, self.path("base"))
+        run("sync", "-f", self.path("base"))
+
+    def branch(self, name: str) -> None:
+        """Copy base to name through the mount and flush it to the file system."""
+        parallel_copy(self.path("base"), self.path(name))
+        run("sync", "-f", self.path(name))
+
+    def remove(self, name: str = "") -> None:
+        """Delete name, or all under prefix/, through the mount, then any objects of it left in the bucket."""
+        if self.mnt.is_mount():
+            parallel_remove(self.path(name) if name else self.mnt / self.prefix)
+        key = f"{self.prefix}/{name}/" if name else f"{self.prefix}/"
+        run(
+            "aws",
+            "s3",
+            "rm",
+            "--recursive",
+            "--quiet",
+            f"s3://{self.bucket}/{key}",
+            env_extra={"AWS_CONFIG_FILE": str(s3_config())},
+            check=False,
+        )
+
+    def used(self) -> int:
+        """Return the bytes under prefix/ in the bucket once the file system's exports have settled."""
+        return settled_bytes(self.bucket, self.prefix)
+
+
+def parallel_copy(src: Path, dest: Path, jobs: int = 64) -> None:
+    """Copy the tree src into dest with jobs copies at once, for file systems with a round trip per file.
+
+    Directories are made with the default mode and the current time.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    xargs = f"xargs -0 -r -P {jobs} -n 256"
+    dirs = f'cd "$1" && find . -mindepth 1 -type d -print0 | (cd "$2" && {xargs} mkdir -p --)'
+    files = f'cd "$1" && find . ! -type d -print0 | {xargs} cp -a --parents -t "$2" --'
+    for script in (dirs, files):
+        run("sh", "-c", script, "-", src, dest)
+
+
+def parallel_remove(path: Path, jobs: int = 64) -> None:
+    """Delete the tree path with jobs deletes at once, for file systems with a round trip per file.
+
+    Raises SystemExit when directories are left after 64 passes.
+    """
+    if not path.exists():
+        return
+    xargs = f"xargs -0 -r -P {jobs} -n 256"
+    run("sh", "-c", f'find "$1" ! -type d -print0 | {xargs} rm -f --', "-", path)
+    rmdirs = f'find "$1" -depth -type d -print0 | {xargs} rmdir --ignore-fail-on-non-empty --'
+    for _ in range(64):
+        if not path.exists():
+            return
+        run("sh", "-c", rmdirs, "-", path)
+    msg = f"could not delete {path}"
+    raise SystemExit(msg)
+
+
+class S3Files(System):
+    """Amazon S3 Files; a branch is a copy of the base's files through the mount."""
+
+    name = "Amazon S3 Files"
+    max_branches = 3  # each branch copies every file of the workspace
+    mnt = WORK / "s3files-mnt"
+
+    @override
+    def unavailable(self) -> str | None:
+        return S3FilesMount(self.mnt, "fork").unavailable()
+
+    @override
+    def setup(self) -> None:
+        self.fs = S3FilesMount(self.mnt, f"fork-{time.time_ns()}")
+        log("copying the workspace into S3 Files")
+        self.fs.load_base()
+
+    @override
+    def fork(self, i: int) -> float:
+        t0 = time.perf_counter_ns()
+        self.fs.branch(f"b{i}")
+        return (time.perf_counter_ns() - t0) / 1e9
+
+    @override
+    def edit(self, i: int) -> bool:
+        write_edit(self.fs.path(f"b{i}") / "pando-bench-edit.bin")
+        return True
+
+    @override
+    def used(self) -> int:
+        return self.fs.used()
+
+    @override
+    def teardown(self) -> None:
+        if hasattr(self, "fs"):
+            self.fs.remove()
+            self.fs.unmount()
+
+
 SYSTEMS: dict[str, type[System]] = {
     "pando": Pando,
     "reflink": Reflink,
     "docker": Docker,
     "juicefs": JuiceFS,
     "ebs": Ebs,
+    "zerofs": ZeroFS,
+    "s3files": S3Files,
 }
 
 

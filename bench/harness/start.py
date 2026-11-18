@@ -30,11 +30,22 @@ from typing import Any, TextIO, override
 
 import fork
 import workspace
-from common import RESULTS, TOOLS, WORK, Results, env, env_file, log, run
+from common import DATA, RESULTS, TOOLS, WORK, Results, env, env_file, extract, fetch, log, run
 
 DIR = WORK / "start"
 NPM_CACHE = "/root/.npm"
 CMD_TIMEOUT = 1800
+SNAPSHOTTER_TIMEOUT = 60
+# nerdctl 2.3 and later pull through the containerd transfer service, which drops the labels that
+# remote snapshotters need for a lazy pull.
+NERDCTL_VERSION = "2.2.1"
+NERDCTL_SHA256 = "34144de7f12756aa4b9dc42a907fd95b0c5eb82a63566a650ca10c8abe7a26a0"
+SOCI_VERSION = "0.16.1"
+SOCI_SHA256 = "2be9f26ad853455515da69885f8906e6aecc65684cc302f8689c25cad8417bc8"
+NYDUS_VERSION = "2.4.5"
+NYDUS_SHA256 = "1ad7b793a1996577e462b0bf5c1a22e4450b9c04f7e9e99d4b274ccc92f19072"
+NYDUS_SNAPSHOTTER_VERSION = "0.16.1"
+NYDUS_SNAPSHOTTER_SHA256 = "6e8925642d90896b4dacd903b812548631f6f3dd12495b77bb16bffe533a8f82"
 STAT_SECTORS_WRITTEN = 6
 SECTOR = 512
 
@@ -128,6 +139,7 @@ class Workspace:
 
     name = ""
     local_only = False
+    max_reps = 1000
 
     def unavailable(self) -> str | None:
         """Return why this system cannot run here, or None."""
@@ -849,6 +861,382 @@ class PandoHandoff(Pando):
     handoff = True
 
 
+class LazyPull(Docker):
+    """The Docker row's image, converted for a containerd snapshotter that pulls it lazily.
+
+    A branch is a container run with nerdctl on that snapshotter, which fetches file contents
+    from the registry as they are read. Its local state is the images, the containers and the
+    snapshotter's cache.
+    """
+
+    snapshotter = ""
+    tag = ""
+    socket = ""
+    root = Path()
+
+    @override
+    def unavailable(self) -> str | None:
+        return super().unavailable() or (None if Path("/dev/fuse").exists() else "no /dev/fuse")
+
+    def install(self) -> None:
+        """Install the snapshotter and the conversion tools."""
+        raise NotImplementedError
+
+    def daemon(self) -> list[str]:
+        """Return the command line of the snapshotter's daemon."""
+        raise NotImplementedError
+
+    def convert(self, src: str) -> None:
+        """Convert image src to self.lazy and push it to the registry."""
+        raise NotImplementedError
+
+    def nerdctl(self, *args: object, check: bool = True) -> str | int:
+        """Run nerdctl with args and return its stdout."""
+        return run(self.nerdctl_bin, *args, capture=True, check=check, env_extra={"HOME": "/root"})
+
+    @override
+    def setup(self) -> None:
+        name = f"nerdctl-{NERDCTL_VERSION}-linux-amd64.tar.gz"
+        tar = fetch(
+            f"https://github.com/containerd/nerdctl/releases/download/v{NERDCTL_VERSION}/{name}",
+            TOOLS / name,
+            NERDCTL_SHA256,
+        )
+        self.nerdctl_bin = extract(tar, TOOLS / f"nerdctl-{NERDCTL_VERSION}", "nerdctl")
+        self.install()
+        self.lazy = f"{env('PANDO_BENCH_REGISTRY')}:{self.tag}"
+        super().setup()
+        self.restart()
+        log(f"{self.name}: converting and pushing {self.lazy}")
+        self.convert(self.image)
+        self.empty()
+
+    def restart(self) -> None:
+        """Stop the snapshotter, then start it again on its current root.
+
+        Raises SystemExit when its socket does not appear within SNAPSHOTTER_TIMEOUT.
+        """
+        self.stop()
+        Path(self.socket).unlink(missing_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (DIR / f"{self.snapshotter}-snapshotter.log").open("ab") as out:
+            self.proc = subprocess.Popen(
+                self.daemon(),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                env=dict(os.environ, HOME="/root"),
+                start_new_session=True,
+            )
+        deadline = time.monotonic() + SNAPSHOTTER_TIMEOUT
+        while not Path(self.socket).exists():
+            if self.proc.poll() is not None or time.monotonic() > deadline:
+                msg = f"{self.snapshotter} snapshotter did not start"
+                raise SystemExit(msg)
+            time.sleep(0.2)
+
+    def stop(self) -> None:
+        """Stop the snapshotter's daemon, if it runs."""
+        p = getattr(self, "proc", None)
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=SNAPSHOTTER_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+    @override
+    def container(self, i: int) -> str:
+        return f"pando-bench-lazy-{i}"
+
+    def _remove_lazy(self) -> None:
+        ids = self.nerdctl("ps", "-aq", "--filter", "name=pando-bench-lazy-", check=False) or ""
+        if ids.split():
+            self.nerdctl("rm", "-f", *ids.split(), check=False)
+        self.nerdctl("image", "prune", "-af", check=False)
+
+    @override
+    def empty(self) -> None:
+        self._remove_lazy()
+        self.stop()
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.restart()
+
+    @override
+    def open(self, i: int) -> None:
+        inspect = subprocess.run(
+            [str(self.nerdctl_bin), "image", "inspect", self.lazy], capture_output=True, check=False
+        )
+        if inspect.returncode != 0:
+            self.nerdctl("--snapshotter", self.snapshotter, "pull", "-q", self.lazy)
+        self.nerdctl(
+            "--snapshotter",
+            self.snapshotter,
+            "run",
+            "-d",
+            "--net",
+            "host",
+            "--name",
+            self.container(i),
+            "-v",
+            f"{TOOLS}:{TOOLS}:ro",
+            "-v",
+            f"{NPM_CACHE}:{NPM_CACHE}",
+            self.lazy,
+            "sleep",
+            "infinity",
+        )
+
+    @override
+    def exec(self, i: int, cwd: str, cmd: str) -> int:
+        args = [str(self.nerdctl_bin), "exec", "-w", f"/workspace/{cwd}"]
+        for k, v in shell_env().items():
+            args += ["-e", f"{k}={v}"]
+        p = subprocess.run(
+            [*args, self.container(i), "bash", "-c", f"{cmd} >/dev/null 2>&1"],
+            timeout=CMD_TIMEOUT,
+            check=False,
+        )
+        return p.returncode
+
+    @override
+    def close(self, i: int) -> None:
+        self.nerdctl("rm", "-f", self.container(i), check=False)
+
+    @override
+    def teardown(self) -> None:
+        if hasattr(self, "nerdctl_bin"):
+            self._remove_lazy()
+        self.stop()
+        shutil.rmtree(self.root, ignore_errors=True)
+        if hasattr(self, "lazy"):
+            run(
+                "aws",
+                "ecr",
+                "batch-delete-image",
+                "--region",
+                env("AWS_REGION"),
+                "--repository-name",
+                env("PANDO_BENCH_REGISTRY").split("/", 1)[1],
+                "--image-ids",
+                f"imageTag={self.tag}",
+                capture=True,
+                check=False,
+            )
+        super().teardown()
+
+
+class Soci(LazyPull):
+    """SOCI: the image with a SOCI index (manifest v2), run on the SOCI snapshotter."""
+
+    name = "SOCI lazy pull"
+    snapshotter = "soci"
+    tag = "workspace-soci"
+    socket = "/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"
+    root = DATA / "soci-snapshotter-grpc"
+
+    @override
+    def install(self) -> None:
+        name = f"soci-snapshotter-{SOCI_VERSION}-linux-amd64.tar.gz"
+        tar = fetch(
+            f"https://github.com/awslabs/soci-snapshotter/releases/download/v{SOCI_VERSION}/{name}",
+            TOOLS / name,
+            SOCI_SHA256,
+        )
+        self.soci = extract(tar, TOOLS / f"soci-{SOCI_VERSION}", "soci")
+        self.grpc = extract(tar, TOOLS / f"soci-{SOCI_VERSION}", "soci-snapshotter-grpc")
+
+    @override
+    def daemon(self) -> list[str]:
+        return [str(self.grpc), "--root", str(self.root), "--address", self.socket]
+
+    @override
+    def convert(self, src: str) -> None:
+        self.nerdctl("pull", "-q", src)
+        run(self.soci, "convert", src, self.lazy, capture=True, env_extra={"HOME": "/root"})
+        self.nerdctl("push", "-q", "--all-platforms", self.lazy)
+
+
+class Nydus(LazyPull):
+    """Nydus: the image converted with nydusify, run on the Nydus snapshotter over FUSE (nydusd)."""
+
+    name = "Nydus lazy pull"
+    snapshotter = "nydus"
+    tag = "workspace-nydus"
+    socket = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+    root = DATA / "nydus-snapshotter"
+
+    @override
+    def install(self) -> None:
+        name = f"nydus-static-v{NYDUS_VERSION}-linux-amd64.tgz"
+        tar = fetch(
+            f"https://github.com/dragonflyoss/nydus/releases/download/v{NYDUS_VERSION}/{name}",
+            TOOLS / name,
+            NYDUS_SHA256,
+        )
+        tools = TOOLS / f"nydus-{NYDUS_VERSION}"
+        self.nydusd = extract(tar, tools, "nydusd")
+        self.builder = extract(tar, tools, "nydus-image")
+        self.nydusify = extract(tar, tools, "nydusify")
+        name = f"nydus-snapshotter-v{NYDUS_SNAPSHOTTER_VERSION}-linux-amd64.tar.gz"
+        tar = fetch(
+            f"https://github.com/containerd/nydus-snapshotter/releases/download/v{NYDUS_SNAPSHOTTER_VERSION}/{name}",
+            TOOLS / name,
+            NYDUS_SNAPSHOTTER_SHA256,
+        )
+        self.grpc = extract(
+            tar, TOOLS / f"nydus-snapshotter-{NYDUS_SNAPSHOTTER_VERSION}", "containerd-nydus-grpc"
+        )
+        self.config = DIR / "nydus-config.toml"
+        self.nydusd_config = DIR / "nydusd-config.json"
+        DIR.mkdir(parents=True, exist_ok=True)
+        self.nydusd_config.write_text(
+            '{"device": {"backend": {"type": "registry", "config": {"timeout": 5, "connect_timeout": 5, '
+            '"retry_limit": 2}}, "cache": {"type": "blobcache"}}, "mode": "direct", '
+            '"digest_validate": false, "iostats_files": false, "enable_xattr": true, '
+            '"amplify_io": 1048576, "fs_prefetch": {"enable": true, "threads_count": 8, '
+            '"merging_size": 1048576, "prefetch_all": true}}\n'
+        )
+        self.config.write_text(
+            f'version = 1\nroot = "{self.root}"\naddress = "{self.socket}"\ndaemon_mode = "dedicated"\n\n'
+            "[system]\nenable = false\n\n"
+            f'[daemon]\nnydusd_config = "{self.nydusd_config}"\nnydusd_path = "{self.nydusd}"\n'
+            f'nydusimage_path = "{self.builder}"\nfs_driver = "fusedev"\nrecover_policy = "restart"\n'
+            "threads_number = 4\n\n"
+            "[remote.auth]\nenable_kubeconfig_keychain = false\nenable_cri_keychain = false\n"
+        )
+
+    @override
+    def daemon(self) -> list[str]:
+        return [str(self.grpc), "--config", str(self.config), "--log-to-stdout"]
+
+    @override
+    def convert(self, src: str) -> None:
+        work = DIR / "nydusify"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        run(
+            self.nydusify,
+            "convert",
+            "--source",
+            src,
+            "--target",
+            self.lazy,
+            "--work-dir",
+            work,
+            "--nydus-image",
+            self.builder,
+            capture=True,
+            env_extra={"HOME": "/root"},
+        )
+        shutil.rmtree(work, ignore_errors=True)
+
+
+class ZeroFS(Workspace):
+    """ZeroFS on the bench bucket, ext4 on its NBD export, the server on this host.
+
+    Checkpoints are read-only, so a branch is a full copy of the base export. The server's cache
+    is the host's local state of the workspace.
+    """
+
+    name = fork.ZeroFS.name
+    prefix = "pando-bench-zerofs-start"
+    dir = DIR / "zerofs"
+
+    @override
+    def unavailable(self) -> str | None:
+        return fork.nbd_unavailable()
+
+    @override
+    def setup(self) -> None:
+        self.bucket = env("S3_BUCKET")
+        self.teardown()
+        self.server = fork.ZeroFSServer(self.dir / "server", self.bucket, self.prefix)
+        self.server.start()
+        log(f"{self.name}: copying the workspace image in")
+        self.server.put("base", workspace.IMAGE)
+
+    @override
+    def root(self, i: int) -> Path:
+        return self.dir / f"m{i}"
+
+    @override
+    def empty(self) -> None:
+        self.server.stop()
+        shutil.rmtree(self.server.dir / "cache", ignore_errors=True)
+        self.server.start()
+
+    @override
+    def open(self, i: int) -> None:
+        self.server.copy("base", f"b{i}")
+        dev = self.server.connect(f"b{i}", i)
+        self.root(i).mkdir(exist_ok=True)
+        run("mount", dev, self.root(i))
+
+    @override
+    def close(self, i: int) -> None:
+        unmount(self.root(i))
+        self.server.disconnect(self.server.device(i))
+        self.server.remove(f"b{i}")
+
+    @override
+    def teardown(self) -> None:
+        for m in self.dir.glob("m*"):
+            unmount(m)
+        server = getattr(self, "server", None)
+        if server:
+            server.disconnect_all()
+            server.stop()
+        if hasattr(self, "bucket"):
+            run(
+                "aws", "s3", "rm", "--recursive", "--quiet", f"s3://{self.bucket}/{self.prefix}/", check=False
+            )
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class S3Files(Workspace):
+    """Amazon S3 Files, mounted over NFS; a branch is a copy of the base's objects in its bucket.
+
+    The host's only local state is the mount and its page cache: emptying the host unmounts it.
+    """
+
+    name = fork.S3Files.name
+    max_reps = 3  # every branch copies every file of the workspace
+
+    @override
+    def unavailable(self) -> str | None:
+        return fork.S3FilesMount(DIR / "s3files", "start").unavailable()
+
+    @override
+    def setup(self) -> None:
+        self.fs = fork.S3FilesMount(DIR / "s3files", f"start-{time.time_ns()}")
+        log(f"{self.name}: copying the workspace in")
+        self.fs.load_base()
+
+    @override
+    def root(self, i: int) -> Path:
+        return self.fs.path(f"b{i}")
+
+    @override
+    def empty(self) -> None:
+        self.fs.unmount()
+
+    @override
+    def open(self, i: int) -> None:
+        self.fs.ensure_mounted()
+        self.fs.branch(f"b{i}")
+
+    @override
+    def close(self, i: int) -> None:
+        self.fs.remove(f"b{i}")
+
+    @override
+    def teardown(self) -> None:
+        if hasattr(self, "fs"):
+            self.fs.remove()
+            self.fs.unmount()
+
+
 SYSTEMS: dict[str, type[Workspace]] = {
     "native": Native,
     "pando": Pando,
@@ -856,12 +1244,41 @@ SYSTEMS: dict[str, type[Workspace]] = {
     "tar": Tar,
     "image": Image,
     "docker": Docker,
+    "soci": Soci,
+    "nydus": Nydus,
     "ebs": Ebs,
     "juicefs": JuiceFS,
+    "zerofs": ZeroFS,
+    "s3files": S3Files,
     "reflink": Reflink,
 }
-STARTS = ["pando", "pando-handoff", "tar", "image", "docker", "ebs", "juicefs", "reflink"]
-REPLAYS = ["native", "pando", "pando-handoff", "image", "docker", "ebs", "juicefs"]
+STARTS = [
+    "pando",
+    "pando-handoff",
+    "tar",
+    "image",
+    "docker",
+    "soci",
+    "nydus",
+    "ebs",
+    "juicefs",
+    "zerofs",
+    "s3files",
+    "reflink",
+]
+REPLAYS = [
+    "native",
+    "pando",
+    "pando-handoff",
+    "image",
+    "docker",
+    "soci",
+    "nydus",
+    "ebs",
+    "juicefs",
+    "zerofs",
+    "s3files",
+]
 
 
 def timed_call[T](f: Callable[..., T], *args: object) -> tuple[float, T]:
@@ -930,6 +1347,7 @@ def native_replay_median() -> float | None:
 
 def measure_system(kind: str, s: Workspace, reps: int, out: Results) -> list[float]:
     """Run the measure named by kind on s, which is set up; return its replay totals, if any, per rep."""
+    reps = min(reps, s.max_reps)
     if kind == "cold":
         for rep in range(1, reps + 1):
             s.empty()

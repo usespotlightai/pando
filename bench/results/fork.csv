@@ -28,3 +28,15 @@ EBS snapshot to volume,small,fork.p99,1,2.72189,s,10 branches
 EBS snapshot to volume,small,fork.first,1,2.72189,s,10 branches
 EBS snapshot to volume,small,fork.last,1,2.58104,s,10 branches
 EBS snapshot to volume,small,fork-bytes.per_branch,1,1.71799e+10,B,10 branches
+ZeroFS (NBD),small,fork.p50,1,12.8694,s,10 branches
+ZeroFS (NBD),small,fork.p99,1,13.6087,s,10 branches
+ZeroFS (NBD),small,fork.first,1,10.8176,s,10 branches
+ZeroFS (NBD),small,fork.last,1,13.1283,s,10 branches
+ZeroFS (NBD),small,fork-bytes.per_branch,1,4.35084e+08,B,10 branches
+ZeroFS (NBD),small,fork-bytes.per_edit,1,2.77991e+07,B,"10 branches, 5 MiB each"
+Amazon S3 Files,small,fork.p50,1,123.068,s,3 branches
+Amazon S3 Files,small,fork.p99,1,179.465,s,3 branches
+Amazon S3 Files,small,fork.first,1,179.465,s,3 branches
+Amazon S3 Files,small,fork.last,1,123.068,s,3 branches
+Amazon S3 Files,small,fork-bytes.per_branch,1,1.39775e+09,B,3 branches
+Amazon S3 Files,small,fork-bytes.per_edit,1,5.24288e+06,B,"3 branches, 5 MiB each"

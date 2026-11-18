@@ -28,6 +28,8 @@ write_files:
       S3_BUCKET=${bucket}
       PANDO_BENCH_REGISTRY=${registry}
       PANDO_BENCH_EBS_VOLUME=${ebs_volume}
+      PANDO_BENCH_S3FILES=${s3files}
+      PANDO_BENCH_S3FILES_BUCKET=${s3files_b}
       PANDO_BENCH_DATA=/data
 
   # Docker keeps its images and containers on the instance-store NVMe, like every other system,
@@ -40,6 +42,47 @@ write_files:
     content: |
       [Unit]
       RequiresMountsFor=/data
+
+  # containerd keeps its images and snapshots on the NVMe too. The SOCI and Nydus lazy-pull rows
+  # run their snapshotters, started by the harness, behind these sockets.
+  - path: /etc/containerd/config.toml
+    content: |
+      version = 3
+      root = "/data/containerd"
+
+      [plugins."io.containerd.transfer.v1.local"]
+        [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+          platform = "linux/amd64"
+          snapshotter = "overlayfs"
+        [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+          platform = "linux/amd64"
+          snapshotter = "soci"
+        [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+          platform = "linux/amd64"
+          snapshotter = "nydus"
+
+      [proxy_plugins]
+        [proxy_plugins.soci]
+          type = "snapshot"
+          address = "/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"
+          [proxy_plugins.soci.exports]
+            root = "/data/soci-snapshotter-grpc"
+            enable_remote_snapshot_annotations = "true"
+        [proxy_plugins.nydus]
+          type = "snapshot"
+          address = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+
+  - path: /etc/systemd/system/containerd.service.d/pando-bench.conf
+    content: |
+      [Unit]
+      RequiresMountsFor=/data
+
+  # Ubuntu's fusermount3 profile allows FUSE mounts only under home, /mnt, /media and /tmp. The
+  # SOCI and Nydus snapshotters mount their lazy layers under /data.
+  - path: /etc/apparmor.d/local/fusermount3
+    content: |
+      mount fstype=@{fuse_types} -> /data/**/,
+      umount /data/**/,
 
   - path: /etc/modules-load.d/pando-bench.conf
     content: |
@@ -133,9 +176,10 @@ runcmd:
   - systemctl restart systemd-modules-load.service
   - snap install aws-cli --classic
   - systemctl daemon-reload
+  - apparmor_parser -r /etc/apparmor.d/fusermount3 || true
   - systemctl enable --now pando-bench-data.service
-  # Docker started while its package installed, before /data was mounted.
-  - systemctl restart docker
+  # containerd and Docker started while their packages installed, before /data was mounted.
+  - systemctl restart containerd docker
 %{ if max_hours > 0 ~}
   - systemctl enable --now pando-bench-poweroff.timer
 %{ endif ~}

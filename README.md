@@ -106,7 +106,7 @@ plan and methodology.
 | chunked block device over NBD from object storage, copy-on-write overlay | E2B | E2B-style (ZeroFS NBD, or E2B's own block layer) |
 | compressed disk image in S3, cached on NVMe | Vercel Sandbox | image download |
 | OCI image layers on overlayfs, FUSE mounts of object storage for volumes | Daytona | `docker pull`, SOCI lazy pull |
-| lazy-loading, content-addressed FUSE file system | Modal | Nydus / eStargz lazy pull |
+| lazy-loading, content-addressed FUSE file system | Modal | Nydus lazy pull |
 | chunks in object storage, SQLite metadata, copy-on-write checkpoints | Fly.io Sprites | JuiceFS |
 | reflink copies on local NVMe | CodeSandbox | XFS reflink (local only) |
 
@@ -128,10 +128,9 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **Partly measured.** Every chart has results; SOCI, Nydus, ZeroFS and Amazon S3 Files
-> are not set up yet and fill in as their runs finish on the bench VM (AWS `m8id.4xlarge`, eu-north-1; see
-> [bench/README.md](bench/README.md)). Run `python3 bench/plot.py` to redraw them from
-> `bench/results/`.
+> **Pando's rows are from an earlier run** than those of SOCI, Nydus, ZeroFS and Amazon S3 Files,
+> on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see [bench/README.md](bench/README.md)).
+> Run `python3 bench/plot.py` to redraw the charts from `bench/results/`.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
 1.4 GB and 129k files. All systems use the same VM and bucket. Results show medians of 5 runs,
@@ -141,9 +140,11 @@ adds `--dm` and `--images`, so the device switches to a local image once the bra
 ### Fork
 
 Time to create a writable branch, and the storage each branch and each edit adds. Docker and
-XFS reflink branches exist only on the host's disk. Pando, JuiceFS and EBS branches are durable
-and open on any host, so each fork waits on the network. These rows are from one run so far, not
-five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
+XFS reflink branches exist only on the host's disk. Pando, JuiceFS, EBS, ZeroFS and S3 Files
+branches are durable and open on any host, so each fork waits on the network. These rows are from
+one run so far, not five. JuiceFS made 100 branches, EBS and ZeroFS 10, and S3 Files 3; the others
+made 1,000. ZeroFS has only read-only checkpoints, so a writable branch is a copy of the device
+file. S3 Files has no branches, so a branch is a copy of every file through the mount.
 
 <!-- bench:fork -->
 <picture>
@@ -160,7 +161,8 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | Docker (overlayfs, local) | 11.1 ms | 11.1 ms to 11.1 ms |
 | EBS snapshot to volume | 2.6 s | 2.6 s to 2.6 s |
 | JuiceFS | 12.8 s | 12.8 s to 12.8 s |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 12.9 s | 12.9 s to 12.9 s |
+| Amazon S3 Files | 2.05 min | 2.05 min to 2.05 min |
 | XFS reflink (local) | 1 ms | 1 ms to 1 ms |
 
 | storage added per branch | median | range |
@@ -169,7 +171,8 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | Docker (overlayfs, local) | 36.5 KiB | 36.5 KiB to 36.5 KiB |
 | EBS snapshot to volume | 16 GiB | 16 GiB to 16 GiB |
 | JuiceFS | 25.4 MiB | 25.4 MiB to 25.4 MiB |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 415 MiB | 415 MiB to 415 MiB |
+| Amazon S3 Files | 1.3 GiB | 1.3 GiB to 1.3 GiB |
 | XFS reflink (local) | 4.61 KiB | 4.61 KiB to 4.61 KiB |
 
 | storage added by a 5 MiB edit to a branch | median | range |
@@ -178,7 +181,8 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 | Docker (overlayfs, local) | 5 MiB | 5 MiB to 5 MiB |
 | EBS snapshot to volume | none: billed by volume size | |
 | JuiceFS | 5 MiB | 5 MiB to 5 MiB |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 26.5 MiB | 26.5 MiB to 26.5 MiB |
+| Amazon S3 Files | 5 MiB | 5 MiB to 5 MiB |
 | XFS reflink (local) | 5.75 MiB | 5.75 MiB to 5.75 MiB |
 
 </details>
@@ -188,7 +192,9 @@ five. JuiceFS made 100 branches and EBS 10; the others made 1,000.
 
 Time to fork, mount and finish the first `git status` on a host that has never seen the workspace.
 Pando's slowest repetition, 2.6 s, is the first mount of the base; later mounts prefetch the
-reads it recorded in the bucket.
+reads it recorded in the bucket. SOCI and Nydus open in seconds because they fetch file contents
+only on first read, so their `git status` is the slower part. ZeroFS copies its device file and
+S3 Files copies every file for each branch; S3 Files ran 3 times, not 5.
 
 <!-- bench:cold -->
 <picture>
@@ -206,12 +212,12 @@ reads it recorded in the bucket.
 | tar from S3 | 4.44 s | 4.41 s to 4.48 s |
 | image download from S3 | 4.72 s | 4.69 s to 4.79 s |
 | Docker (overlayfs) | 26.9 s | 26.8 s to 27.3 s |
-| SOCI lazy pull | — | |
-| Nydus lazy pull | — | |
+| SOCI lazy pull | 6.01 s | 5.89 s to 6.74 s |
+| Nydus lazy pull | 3.66 s | 3.5 s to 3.77 s |
 | EBS snapshot to volume | 10.9 s | 10.1 s to 12 s |
 | JuiceFS | 3.88 min | 3.8 min to 3.92 min |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 15 s | 14.6 s to 15.6 s |
+| Amazon S3 Files | 3.55 min | 3.49 min to 4.76 min |
 | XFS reflink (local) | local only | |
 
 </details>
@@ -224,7 +230,8 @@ base on the host: Docker's image is pulled, tar and the image download have thei
 and Pando (handoff) has the host's base image of the root. The page cache is dropped before each
 run. Pando (handoff) switches to the image as soon as the branch opens, so `git status` reads
 through device-mapper and a loop device over a reflink clone and takes about 1 s, against 0.47 s
-over ublk.
+over ublk. SOCI and Nydus keep the contents they fetched in their snapshotter's cache. S3 Files
+copies every file again for each branch, so its warm start is as slow as its cold start.
 
 <!-- bench:warm -->
 <picture>
@@ -242,12 +249,12 @@ over ublk.
 | tar from S3 | 2.51 s | 2.5 s to 2.52 s |
 | image download from S3 | 2.8 s | 2.8 s to 3.12 s |
 | Docker (overlayfs) | 1.27 s | 1.23 s to 1.31 s |
-| SOCI lazy pull | — | |
-| Nydus lazy pull | — | |
+| SOCI lazy pull | 2.19 s | 2.12 s to 2.29 s |
+| Nydus lazy pull | 1.33 s | 1.14 s to 1.43 s |
 | EBS snapshot to volume | 11 s | 10.5 s to 11.4 s |
 | JuiceFS | 18.8 s | 18.4 s to 19.1 s |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 14.8 s | 14.3 s to 15.1 s |
+| Amazon S3 Files | 3.79 min | 3.69 min to 3.95 min |
 | XFS reflink (local) | 563 ms | 410 ms to 613 ms |
 
 </details>
@@ -259,7 +266,10 @@ Time to run the 14 command types agents use most often in Spotlight sandboxes (`
 `tsc`, `oxlint`, `vitest`, `npm ci`, ...), expressed as a ratio to native ext4 on local NVMe.
 Each system ran the replay 3 times on a fresh branch of a warm host, page cache dropped. Native
 took 70.5 s. Most of JuiceFS's time is `npm ci`, about 9.5 min against 7.6 s; in its first
-repetition one `vitest` run failed, and it passed in the other two.
+repetition one `vitest` run failed, and it passed in the other two. SOCI, Nydus, ZeroFS and S3
+Files ran in a later run, against a native run of their own (70.3 s). On S3 Files, where every
+file operation is an NFS round trip, `npm ci` takes about 9.7 min, the first `git status` 44 s
+and the control-plane `tsc` and `vitest` 74 s and 83 s.
 
 <!-- bench:replay -->
 <picture>
@@ -277,11 +287,12 @@ repetition one `vitest` run failed, and it passed in the other two.
 | Pando (handoff) | 1.05x | 1.04x to 1.06x |
 | image download from S3 | 1.03x | 1.03x to 1.04x |
 | Docker (overlayfs) | 1.02x | 1.02x to 1.03x |
-| Nydus lazy pull | — | |
+| SOCI lazy pull | 1.21x | 1.20x to 1.34x |
+| Nydus lazy pull | 1.10x | 1.08x to 1.12x |
 | EBS snapshot to volume | 1.17x | 1.16x to 1.23x |
 | JuiceFS | 9.96x | 9.90x to 12.07x |
-| ZeroFS (NBD) | — | |
-| Amazon S3 Files | — | |
+| ZeroFS (NBD) | 1.16x | 1.12x to 1.17x |
+| Amazon S3 Files | 11.82x | 11.75x to 11.84x |
 
 </details>
 <!-- /bench:replay -->
@@ -294,7 +305,11 @@ what changed since its last background snapshot and publishes the branch. JuiceF
 file as it closes, so its save is a `sync` that finds nothing left, and the upload cost lands in
 `npm ci` itself: about 15 min on JuiceFS against 8 s on the others. tar uploads the whole
 workspace every time. EBS's bytes are the 512 KiB blocks the snapshot holds beyond the workspace
-snapshot. Three runs each.
+snapshot. ZeroFS's save is unmount and `nbd-client -d`, which flush the device to ZeroFS and the
+bucket. On S3 Files, `npm ci` takes about 10 min over NFS; another host's mount reads each file as
+soon as it is closed, so its save is a `sync -f` that finds nothing left. Its bytes are every
+object version written, as S3 Files stores each file as a whole object, about a minute after its
+last write. Three runs each.
 
 <!-- bench:save -->
 <picture>
@@ -307,21 +322,23 @@ snapshot. Three runs each.
 
 | time to durable after npm ci | median | range |
 |---|---|---|
-| Pando | 4.94 s | 2.43 s to 7.68 s |
+| Pando | 3.37 s | 2.31 s to 8.29 s |
 | tar from S3 | 3.2 s | 3.17 s to 3.2 s |
 | Docker (overlayfs) | 41.1 s | 40.9 s to 41.2 s |
 | EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
 | JuiceFS | 2.76 ms | 2.5 ms to 3.52 ms |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 12.4 s | 10.6 s to 14.1 s |
+| Amazon S3 Files | 6.65 ms | 5.66 ms to 7.31 ms |
 
 | uploaded after npm ci | median | range |
 |---|---|---|
-| Pando | 208 MiB | 207 MiB to 214 MiB |
+| Pando | 210 MiB | 207 MiB to 214 MiB |
 | tar from S3 | 323 MiB | 323 MiB to 323 MiB |
 | Docker (overlayfs) | 194 MiB | 194 MiB to 194 MiB |
 | EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |
 | JuiceFS | 732 MiB | 665 MiB to 785 MiB |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 318 MiB | 301 MiB to 320 MiB |
+| Amazon S3 Files | 1.56 GiB | 1.42 GiB to 1.65 GiB |
 
 </details>
 <!-- /bench:save -->
@@ -333,7 +350,9 @@ Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs 
 and written through the host's page cache: direct I/O skips the page cache of the device, not of
 the daemon, so these rows mostly measure memory. After handoff, reads go through device-mapper
 and a loop device to the image on the NVMe; writes are slow there, about 21 MB/s sequential,
-for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s.
+for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On ZeroFS
+every request goes over NBD to its server and on S3 Files over NFS to the file system, so a
+single 4 KiB read waits on a round trip: about 240 IOPS on S3 Files.
 
 <!-- bench:fio -->
 <picture>
@@ -351,7 +370,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 6.72k | 5.99k to 7.24k |
 | EBS gp3 | 1.54k | 1.54k to 1.6k |
 | JuiceFS | 6.37k | 5.98k to 6.58k |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 5.99k | 4.55k to 6.77k |
+| Amazon S3 Files | 243 | 228 to 245 |
 
 | 4 KiB random read, 4 x QD32 | median | range |
 |---|---|---|
@@ -360,7 +380,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 237k | 233k to 265k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 76.7k | 76.4k to 77.3k |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 31.7k | 28.4k to 32.7k |
+| Amazon S3 Files | 24.7k | 16.7k to 25.1k |
 
 | 4 KiB random write, 4 x QD32 | median | range |
 |---|---|---|
@@ -369,7 +390,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 2.47k | 2.14k to 5.09k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 484 | 456 to 493 |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 1.32k | 1.23k to 1.54k |
+| Amazon S3 Files | 4.83k | 4.49k to 4.87k |
 
 | 1 MiB sequential read | median | range |
 |---|---|---|
@@ -378,7 +400,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 1,849 MB/s | 1,826 MB/s to 1,856 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,611 MB/s | 1,576 MB/s to 1,660 MB/s |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 545 MB/s | 529 MB/s to 594 MB/s |
+| Amazon S3 Files | 484 MB/s | 482 MB/s to 488 MB/s |
 
 | 1 MiB sequential write | median | range |
 |---|---|---|
@@ -387,7 +410,8 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 | Pando (after handoff) | 21 MB/s | 16 MB/s to 24 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,328 MB/s | 1,317 MB/s to 1,330 MB/s |
-| ZeroFS (NBD) | — | |
+| ZeroFS (NBD) | 190 MB/s | 180 MB/s to 226 MB/s |
+| Amazon S3 Files | 186 MB/s | 184 MB/s to 188 MB/s |
 
 </details>
 <!-- /bench:fio -->
@@ -395,12 +419,16 @@ for a reason not yet found. EBS gp3 runs at its baseline of 3,000 IOPS and 125 M
 ### Crash
 
 The storage daemon is killed with `kill -9` while a writer writes and fsyncs 256 KiB files, and is
-restarted at once (`pando attach --recover`, or a new JuiceFS mount). The branch is then opened
+restarted at once (`pando attach --recover`, a new JuiceFS mount, a new ZeroFS server on the same
+cache; S3 Files' `efs-proxy` is restarted by the efs-utils watchdog). The branch is then opened
 with a new cache and state directory, sharing nothing with the first, its file system checked
-and every acknowledged file read back. Medians of three runs.
+and every acknowledged file read back. Medians of three runs. ZeroFS did not recover: its NBD
+client does not reconnect to the new server, so writes hang until the harness disconnects the
+device after 120 s. What it acknowledged before the kill was intact.
 
 | System | Failed writes | Stall | fsck | Files correct |
 |---|---|---|---|---|
 | Pando | 0 | 0.12 s | clean | all acknowledged (1,403 to 1,438 per run) |
 | JuiceFS | 2 | 0.23 s | clean | all acknowledged (264 to 270 per run) |
-| ZeroFS | — | — | — | — |
+| ZeroFS | 1 | did not recover | clean | all acknowledged (20 per run) |
+| Amazon S3 Files | 0 | 3.16 s | no checker | all acknowledged (348 to 352 per run) |
