@@ -262,6 +262,20 @@ impl LocalFile for HostFile {
         }
     }
 
+    async fn write_behind(&self, below: u64) {
+        #[cfg(target_os = "linux")]
+        {
+            let f = Arc::clone(&self.file);
+            let _ = blocking(move || {
+                crate::linux::write_behind(&f, below);
+                Ok(())
+            })
+            .await;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = below;
+    }
+
     fn advise(&self, offset: u64, len: u64, advice: Advice) {
         #[cfg(target_os = "linux")]
         crate::linux::advise(&self.file, offset, len, advice);

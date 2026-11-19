@@ -98,6 +98,9 @@ pub trait LocalFile: Send + Sync + fmt::Debug {
     async fn size(&self) -> io::Result<u64>;
     /// Starts writing dirty pages back, without waiting for the disk, so a later sync waits less.
     async fn start_writeback(&self);
+    /// Waits until the pages before offset `below` are on the disk, writing back those still
+    /// dirty, so a writer that calls it as it appends keeps only its last pages in memory.
+    async fn write_behind(&self, below: u64);
     /// A hint about `len` bytes at `offset`; it never changes what reads return.
     fn advise(&self, offset: u64, len: u64, advice: Advice);
 }

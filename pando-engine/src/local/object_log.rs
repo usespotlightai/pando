@@ -21,6 +21,10 @@ const SHARDS: usize = 256;
 /// After this many appended bytes the log starts its write-back, so a flush's sync does not
 /// also write every object fetched since the last one.
 const WRITEBACK_BYTES: u64 = 8 << 20;
+/// The most bytes at the log's end that may wait for the disk. Past it a put waits for the
+/// disk: the daemon serves the device, so the kernel does not slow its writes when the dirty
+/// pages fill its memory cgroup.
+const BEHIND_BYTES: u64 = 16 << 20;
 /// The fewest appended bytes between two sweeps.
 const SWEEP_MIN: u64 = if cfg!(test) { 1 << 20 } else { 1 << 30 };
 /// The longest padding a sweep writes over the records it drops.
@@ -61,6 +65,7 @@ pub(crate) struct ObjectLog {
     files: Mutex<BTreeMap<PathBuf, Arc<ExtFile>>>,
     unwritten: AtomicU64,
     writing_back: Arc<AtomicBool>,
+    behind: tokio::sync::Mutex<()>,
     holds: AtomicU32,
     epoch: AtomicU64,
     /// Bytes appended since the last sweep, and how many make the next one due.
@@ -247,6 +252,7 @@ impl ObjectLog {
             files: Mutex::default(),
             unwritten: AtomicU64::new(0),
             writing_back: Arc::default(),
+            behind: tokio::sync::Mutex::new(()),
             holds: AtomicU32::new(0),
             epoch: AtomicU64::new(1),
             appended: AtomicU64::new(0),
@@ -480,7 +486,7 @@ impl ObjectLog {
             .unwritten
             .fetch_add(u64::from(len) + HEADER_LEN, Ordering::AcqRel);
         if n + u64::from(len) >= WRITEBACK_BYTES && self.holds.load(Ordering::Acquire) == 0 {
-            self.write_back();
+            self.write_behind().await;
         }
         Ok(())
     }
@@ -732,6 +738,16 @@ impl ObjectLog {
     pub(crate) fn hold_writeback(&self) -> WritebackHold<'_> {
         self.holds.fetch_add(1, Ordering::AcqRel);
         WritebackHold(self)
+    }
+
+    /// Starts the write-back, then waits until all but the last [`BEHIND_BYTES`] are on the
+    /// disk.
+    async fn write_behind(&self) {
+        self.unwritten.store(0, Ordering::Release);
+        let _behind = self.behind.lock().await;
+        let end = self.end.load(Ordering::Acquire);
+        self.file.start_writeback().await;
+        self.file.write_behind(end.saturating_sub(BEHIND_BYTES)).await;
     }
 
     fn write_back(&self) {
