@@ -8,8 +8,8 @@
 //! keeps it.
 //!
 //! With a budget ([`Cache::set_budget`]), the uploaded objects of the trees the open branches
-//! read stay only while they fit: those read since the last sweep, then the nodes, then the
-//! chunks read most recently. Those it drops are fetched from the store again when read. What
+//! read stay only while they fit: those fetched or written since the last sweep began, then
+//! the nodes, then the chunks read most recently. Those it drops are fetched from the store again when read. What
 //! is not uploaded always stays, and so does what the root a branch opened at needs and the
 //! store does not have under it.
 
@@ -64,6 +64,19 @@ pub(super) struct Sweeper {
     states_write: tokio::sync::Mutex<()>,
     started: AtomicBool,
     running: tokio::sync::Mutex<()>,
+    /// Whether a sweep is under way; `swept` wakes the fetches waiting for it to end.
+    busy: AtomicBool,
+    swept: tokio::sync::Notify,
+}
+
+/// Marks a sweep under way until dropped, then wakes the fetches that waited for it.
+struct Busy<'a>(&'a Sweeper);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::Release);
+        self.0.swept.notify_waiters();
+    }
 }
 
 impl std::fmt::Debug for Sweeper {
@@ -106,6 +119,8 @@ impl Sweeper {
             states_write: tokio::sync::Mutex::default(),
             started: AtomicBool::new(false),
             running: tokio::sync::Mutex::default(),
+            busy: AtomicBool::new(false),
+            swept: tokio::sync::Notify::new(),
         };
         if new {
             s.write_states().await?;
@@ -233,6 +248,8 @@ impl Cache {
     /// then on, so a pin begun after it keeps only what was put again since.
     pub(crate) async fn sweep(&self) -> Result<Swept> {
         let _one = self.sweeper.running.lock().await;
+        self.sweeper.busy.store(true, Ordering::Release);
+        let _busy = Busy(&self.sweeper);
         let (epoch, below, keep_from, mut roots, users, closed) = {
             let _g = self.sweeper.gate.write();
             let epoch = self.log.next_epoch();
@@ -286,10 +303,10 @@ impl Cache {
             }
         }
         self.mark(roots, epoch).await?;
-        let wanted = self.wanted(read).await?;
+        let (nodes, chunks) = self.wanted(read).await?;
         let swept = self
             .log
-            .sweep(self.sweeper.floor, below, keep_from, &wanted, epoch - 1)
+            .sweep(self.sweeper.floor, below, keep_from, &nodes, &chunks)
             .await?;
         let dropped: HashSet<Hash> = swept.dropped.iter().copied().collect();
         for u in &users {
@@ -344,9 +361,9 @@ impl Cache {
         Ok(())
     }
 
-    /// The objects under `roots` that this host has, through the nodes it has: the nodes
-    /// from the top down, then the chunks read most recently first.
-    async fn wanted(&self, roots: Vec<Root>) -> Result<Vec<Hash>> {
+    /// The objects under `roots` that this host has, through the nodes it has: the nodes,
+    /// and the chunks read most recently first.
+    async fn wanted(&self, roots: Vec<Root>) -> Result<(Vec<Hash>, Vec<Hash>)> {
         let mut nodes = Vec::new();
         let mut chunks = Vec::new();
         let mut seen = HashSet::new();
@@ -379,13 +396,33 @@ impl Cache {
             level = next;
         }
         chunks.sort_by_key(|&(used, _)| std::cmp::Reverse(used));
-        nodes.extend(chunks.into_iter().map(|(_, h)| h));
-        Ok(nodes)
+        Ok((nodes, chunks.into_iter().map(|(_, h)| h).collect()))
+    }
+
+    /// Waits, while the object log is more than a quarter past its budget, for the sweep under
+    /// way or due to end, so fetches cannot outrun sweeps that are slow to sync the log. It
+    /// waits for one sweep at most: when what is not uploaded keeps the log past the budget,
+    /// fetches go on.
+    pub(crate) async fn room_for_fetch(&self) {
+        let budget = self.log.budget();
+        if budget == 0
+            || self.log.live() <= budget.saturating_add(budget / 4)
+            || !self.sweeper.started.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let swept = self.sweeper.swept.notified();
+        tokio::pin!(swept);
+        swept.as_mut().enable();
+        if self.sweeper.busy.load(Ordering::Acquire) || self.log.sweep_is_due() {
+            swept.await;
+        }
     }
 
     /// Limits the bytes of disk the object log keeps of uploaded objects to `bytes`, or lifts
     /// the limit with zero. Objects not uploaded stay whatever their size, so the log may
-    /// pass it while uploads fall behind.
+    /// pass it while uploads fall behind. Past it by a quarter, fetches wait for the sweep
+    /// under way.
     pub fn set_budget(&self, bytes: u64) {
         self.log.set_budget(bytes);
     }
@@ -456,6 +493,50 @@ mod tests {
             c.sweep().await.unwrap().dropped.is_empty(),
             "the floor stays across opens"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_waits_for_a_sweep_once_the_log_is_a_quarter_past_its_budget() {
+        let (ports, _, _) = sim::ports(3);
+        let c = Arc::new(
+            Cache::open_with(
+                Arc::clone(&ports.fs),
+                Arc::clone(&ports.cpu),
+                Remote::new(Arc::clone(&ports.store)),
+                Path::new("/c"),
+            )
+            .await
+            .unwrap(),
+        );
+        for i in 0..10u8 {
+            let b = Bytes::from(vec![i; 1000]);
+            c.put_local(Hash::of(&b), b).await.unwrap();
+        }
+        c.sweeper.started.store(true, Ordering::Release);
+        c.set_budget(1 << 20);
+        c.room_for_fetch().await;
+        c.set_budget(0);
+        c.room_for_fetch().await;
+
+        c.set_budget(4000);
+        let waiting = tokio::spawn({
+            let c = Arc::clone(&c);
+            async move { c.room_for_fetch().await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "the log is past its budget and a sweep is due"
+        );
+        c.sweep().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("the sweep's end wakes the fetch")
+            .unwrap();
+        assert!(c.log_bytes() <= 4000);
+        c.room_for_fetch().await;
     }
 
     #[tokio::test]
