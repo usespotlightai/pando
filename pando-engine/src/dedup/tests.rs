@@ -72,7 +72,6 @@ async fn base(ports: &Ports, t: &Tree, chunks: &[(u64, Bytes)]) -> (Entry, Block
         Arc::clone(&ports.cpu),
         writer(),
         SEG_MAX,
-        Arc::default(),
     );
     let root = t.pack(&root, &mut p).await.unwrap();
     p.finish().await.unwrap();
@@ -100,7 +99,6 @@ async fn pack_one(
         Arc::clone(&ports.cpu),
         writer(),
         SEG_MAX,
-        Arc::default(),
     )
     .with_dedup(dedup, None)
     .with_learner(learner);

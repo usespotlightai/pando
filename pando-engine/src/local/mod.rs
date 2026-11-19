@@ -3,6 +3,7 @@
 mod journal;
 mod object_log;
 mod space;
+mod state;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 pub(crate) use journal::{Extent, Journal, Record};
-pub(crate) use object_log::{ObjectLog, WritebackHold};
+pub(crate) use object_log::{ObjectLog, Swept, WritebackHold};
 use pando_format::usize_from;
 pub(crate) use space::{Space, no_room};
+pub(crate) use state::VolState;
 
 use crate::ports::{LocalFile, LocalFs, Open};
 

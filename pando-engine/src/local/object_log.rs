@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
-use pando_format::{Hash, u64_from, usize_from};
+use pando_format::{Hash, Loc as StoreLoc, u64_from, usize_from};
 use tokio::sync::Notify;
 
 use super::{read_file, take, write_atomic};
@@ -20,6 +20,11 @@ const SHARDS: usize = 256;
 /// After this many appended bytes the log starts its write-back, so a flush's sync does not
 /// also write every object fetched since the last one.
 const WRITEBACK_BYTES: u64 = 8 << 20;
+/// The fewest appended bytes between two sweeps.
+const SWEEP_MIN: u64 = if cfg!(test) { 1 << 20 } else { 1 << 30 };
+/// The longest padding a sweep writes over the records it drops.
+const PAD_MAX: u64 = 1 << 30;
+const PAGE: u64 = 4096;
 
 /// The local tier: one append-only file of records `[hash][length][data]`, with an index in
 /// memory. A record may instead name another file that holds the object (a clone of a
@@ -33,6 +38,10 @@ const WRITEBACK_BYTES: u64 = 8 << 20;
 /// a scan trusts only below `<log>.synced`. When the padding cannot be written either, as on
 /// a full disk, [`ObjectLog::sync`] writes it before it reports the log durable, and fails
 /// until it can. One process at a time opens the log: `<log>.lock`.
+///
+/// A sweep drops the records nothing marked since an epoch: it writes padding over them and
+/// frees their pages, so the offsets of the others hold and the log takes no more disk than
+/// they do.
 #[derive(Debug)]
 pub(crate) struct ObjectLog {
     fs: Arc<dyn LocalFs>,
@@ -52,6 +61,13 @@ pub(crate) struct ObjectLog {
     unwritten: AtomicU64,
     writing_back: Arc<AtomicBool>,
     holds: AtomicU32,
+    epoch: AtomicU64,
+    /// Bytes appended since the last sweep, and how many make the next one due.
+    appended: AtomicU64,
+    sweep_after: AtomicU64,
+    due: Arc<Notify>,
+    /// Records of objects the log had already when they landed, which the next sweep drops.
+    orphans: Mutex<Vec<(u64, u64)>>,
 }
 
 #[derive(Debug)]
@@ -60,9 +76,33 @@ struct Loc {
     len: u32,
     touched: AtomicBool,
     ext: Option<(Arc<ExtFile>, u64)>,
+    /// The last epoch that marked the record or put its object again.
+    mark: AtomicU64,
+    /// Where the store has the object, once an upload put it there.
+    stored: Mutex<Option<StoreLoc>>,
 }
 
 impl Loc {
+    fn new(off: u64, len: u32, ext: Option<(Arc<ExtFile>, u64)>, epoch: u64) -> Arc<Loc> {
+        Arc::new(Loc {
+            off,
+            len,
+            touched: AtomicBool::new(false),
+            ext,
+            mark: AtomicU64::new(epoch),
+            stored: Mutex::new(None),
+        })
+    }
+
+    /// The end of the record in the log.
+    fn end(&self) -> u64 {
+        let body = match &self.ext {
+            None => u64::from(self.len),
+            Some((e, _)) => 12 + u64_from(e.path.as_os_str().as_encoded_bytes().len()),
+        };
+        self.off + HEADER_LEN + body
+    }
+
     fn dead(&self) -> bool {
         self.ext
             .as_ref()
@@ -102,6 +142,13 @@ impl ExtFile {
         }
         self.file.lock().clone()
     }
+}
+
+/// What [`ObjectLog::sweep`] dropped: the objects, and the bytes of disk it freed.
+#[derive(Debug, Default)]
+pub(crate) struct Swept {
+    pub(crate) dropped: Vec<Hash>,
+    pub(crate) freed: u64,
 }
 
 /// Holds the log's write-back until dropped; then it starts one.
@@ -200,6 +247,11 @@ impl ObjectLog {
             unwritten: AtomicU64::new(0),
             writing_back: Arc::default(),
             holds: AtomicU32::new(0),
+            epoch: AtomicU64::new(1),
+            appended: AtomicU64::new(0),
+            sweep_after: AtomicU64::new(SWEEP_MIN),
+            due: Arc::default(),
+            orphans: Mutex::default(),
         };
         let synced = match read_file(fs.as_ref(), &log.synced_path()).await? {
             Some(b) => std::str::from_utf8(&b)
@@ -262,15 +314,7 @@ impl ObjectLog {
                             break;
                         }
                     }
-                    self.index(
-                        h,
-                        Arc::new(Loc {
-                            off,
-                            len,
-                            touched: AtomicBool::new(false),
-                            ext: Some((ext, ext_off)),
-                        }),
-                    );
+                    self.index(h, Loc::new(off, len, Some((ext, ext_off)), 1));
                 }
             } else {
                 if off >= synced {
@@ -279,15 +323,7 @@ impl ObjectLog {
                         break;
                     }
                 }
-                self.index(
-                    h,
-                    Arc::new(Loc {
-                        off,
-                        len: n,
-                        touched: AtomicBool::new(false),
-                        ext: None,
-                    }),
-                );
+                self.index(h, Loc::new(off, n, None, 1));
             }
             off = body + plen;
         }
@@ -321,6 +357,8 @@ impl ObjectLog {
         let mut m = self.shard(&h).write();
         if m.get(&h).is_none_or(|old| old.dead()) {
             m.insert(h, loc);
+        } else {
+            self.orphans.lock().push((loc.off, loc.end()));
         }
     }
 
@@ -378,21 +416,14 @@ impl ObjectLog {
 
     /// Appends object `h`. Readers see it only once it is written. Durable after [`Self::sync`].
     pub(crate) async fn put(&self, h: Hash, b: Bytes) -> Result<()> {
-        if self.has(&h) {
+        if self.touch(&h) {
             return Ok(());
         }
         let len =
             u32::try_from(b.len()).map_err(|_| Error::Corrupt(format!("object {h} of {} bytes", b.len())))?;
         let at = self.append(h, header(h, len), b).await?;
-        self.index(
-            h,
-            Arc::new(Loc {
-                off: at,
-                len,
-                touched: AtomicBool::new(false),
-                ext: None,
-            }),
-        );
+        self.index(h, Loc::new(at, len, None, self.epoch()));
+        self.appended(u64::from(len) + HEADER_LEN);
         let n = self
             .unwritten
             .fetch_add(u64::from(len) + HEADER_LEN, Ordering::AcqRel);
@@ -405,7 +436,7 @@ impl ObjectLog {
     /// Records that object `h` is the `len` bytes at `offset` of `path`, which must not change
     /// until [`Self::drop_file`].
     pub(crate) async fn put_ref(&self, h: Hash, path: &Path, offset: u64, len: u32) -> Result<()> {
-        if self.has(&h) {
+        if self.touch(&h) {
             return Ok(());
         }
         let ext = self.ext_file(path);
@@ -433,16 +464,120 @@ impl ObjectLog {
         let at = self
             .append(h, header(h, REF_FLAG | plen), Bytes::from(payload))
             .await?;
-        self.index(
-            h,
-            Arc::new(Loc {
-                off: at,
-                len,
-                touched: AtomicBool::new(false),
-                ext: Some((ext, offset)),
-            }),
-        );
+        let n = u64::from(plen) + HEADER_LEN;
+        self.index(h, Loc::new(at, len, Some((ext, offset)), self.epoch()));
+        self.appended(n);
         Ok(())
+    }
+
+    /// The current epoch.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Marks object `h` in the current epoch when the log has it.
+    fn touch(&self, h: &Hash) -> bool {
+        let m = self.shard(h).read();
+        match m.get(h).filter(|l| !l.dead()) {
+            Some(l) => {
+                l.mark.fetch_max(self.epoch(), Ordering::AcqRel);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn appended(&self, n: u64) {
+        if self.appended.fetch_add(n, Ordering::AcqRel) + n >= self.sweep_after.load(Ordering::Acquire) {
+            self.due.notify_one();
+        }
+    }
+
+    /// Notified once enough was appended since the last sweep that another is due.
+    pub(crate) fn sweep_due(&self) -> Arc<Notify> {
+        Arc::clone(&self.due)
+    }
+
+    /// Where the log ends; appends land at or past it.
+    pub(crate) fn end(&self) -> u64 {
+        self.end.load(Ordering::Acquire)
+    }
+
+    /// Starts a new epoch and returns it. A put of an object the log has marks it in the
+    /// current epoch.
+    pub(crate) fn next_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Marks object `h` in `epoch`; `false` when the log does not have it.
+    pub(crate) fn mark(&self, h: &Hash, epoch: u64) -> bool {
+        self.lookup(h)
+            .map(|l| l.mark.fetch_max(epoch, Ordering::AcqRel))
+            .is_some()
+    }
+
+    /// Records that the store has object `h` at `l`.
+    pub(crate) fn set_stored(&self, h: &Hash, l: StoreLoc) {
+        if let Some(x) = self.lookup(h) {
+            *x.stored.lock() = Some(l);
+        }
+    }
+
+    /// Where the store has object `h`, when an upload recorded it.
+    pub(crate) fn stored(&self, h: &Hash) -> Option<StoreLoc> {
+        self.lookup(h).and_then(|l| *l.stored.lock())
+    }
+
+    /// Drops every record that starts below `below` and was last marked before epoch
+    /// `keep_from`. Each run of dropped records becomes padding, and its pages are freed once
+    /// the padding is durable and no read of a dropped record is left.
+    pub(crate) async fn sweep(&self, below: u64, keep_from: u64) -> Result<Swept> {
+        let mut gone = Vec::new();
+        let mut kept = 0;
+        for s in &self.shards {
+            s.write().retain(|h, l| {
+                let dropped = l.off < below && (l.mark.load(Ordering::Acquire) < keep_from || l.dead());
+                if dropped {
+                    gone.push((*h, Arc::clone(l)));
+                } else if l.ext.is_none() {
+                    kept += u64::from(l.len) + HEADER_LEN;
+                }
+                !dropped
+            });
+        }
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut recs: Vec<(u64, u64)> = gone.iter().map(|(_, l)| (l.off, l.end())).collect();
+        recs.extend(std::mem::take(&mut *self.orphans.lock()));
+        recs.sort_unstable();
+        for (a, b) in recs {
+            match runs.last_mut() {
+                Some(r) if r.1 == a && b - r.0 <= PAD_MAX => r.1 = b,
+                _ => runs.push((a, b)),
+            }
+        }
+        for (_, l) in &gone {
+            while Arc::strong_count(l) > 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        let dropped = gone.into_iter().map(|(h, _)| h).collect();
+        for &(a, b) in &runs {
+            let len = u32::try_from(b - a - HEADER_LEN)
+                .map_err(|_| Error::Corrupt(format!("padding of {} bytes at {a}", b - a)))?;
+            self.file.write_at(vec![header(pad_hash(a, len), len)], a).await?;
+        }
+        self.file.sync_data().await?;
+        let mut freed = 0;
+        for (a, b) in runs {
+            let (from, to) = ((a + HEADER_LEN).next_multiple_of(PAGE), b / PAGE * PAGE);
+            if from < to {
+                self.file.punch(from, to - from).await?;
+                freed += to - from;
+            }
+        }
+        self.appended.store(0, Ordering::Release);
+        self.sweep_after.store(kept.max(SWEEP_MIN), Ordering::Release);
+        Ok(Swept { dropped, freed })
     }
 
     /// Turns every record that names `path` into a miss; call it before removing the file.
@@ -604,6 +739,8 @@ impl ObjectLog {
 #[cfg(test)]
 #[cfg(feature = "sim")]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::sim::SimFs;
 
@@ -729,6 +866,62 @@ mod tests {
         let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         assert!(again.has(&h1));
         assert_eq!(f.size().await.unwrap(), size);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_drops_what_no_epoch_marked_frees_its_disk_and_survives_a_reopen() {
+        use crate::ports::LocalImage;
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let big = |i: u8| {
+            let b = Bytes::from(vec![i; 20_000]);
+            (Hash::of(&b), b)
+        };
+        let objs: Vec<(Hash, Bytes)> = (1..=6).map(big).collect();
+        for (h, b) in &objs {
+            log.put(*h, b.clone()).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        let epoch = log.next_epoch();
+        assert!(log.mark(&objs[1].0, epoch));
+        log.put(objs[4].0, objs[4].1.clone()).await.unwrap();
+        let below = log.end();
+        let (late_h, late_b) = big(7);
+        log.put(late_h, late_b.clone()).await.unwrap();
+        let before = fs.allocated(path).await.unwrap();
+        let swept = log.sweep(below, epoch).await.unwrap();
+        let dropped: HashSet<Hash> = swept.dropped.into_iter().collect();
+        let want: Vec<Hash> = [0, 2, 3, 5].iter().map(|&i| objs[i].0).collect();
+        assert_eq!(
+            dropped,
+            want.iter().copied().collect(),
+            "the marked, the put again and the appended after stay"
+        );
+        let after = fs.allocated(path).await.unwrap();
+        assert!(
+            before - after >= 3 * 20_000,
+            "{before} -> {after}, freed {}",
+            swept.freed
+        );
+        for i in [1, 4] {
+            assert_eq!(log.get(&objs[i].0).await.unwrap(), Some(objs[i].1.clone()));
+        }
+        assert!(!log.has(&objs[0].0));
+        log.sync().await.unwrap();
+        drop(log);
+
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        for i in [1, 4] {
+            assert_eq!(again.get(&objs[i].0).await.unwrap(), Some(objs[i].1.clone()));
+        }
+        assert_eq!(again.get(&late_h).await.unwrap(), Some(late_b));
+        for h in &want {
+            assert!(!again.has(h), "the padding over a dropped record is skipped");
+        }
+        let (h, b) = big(9);
+        again.put(h, b.clone()).await.unwrap();
+        assert_eq!(again.get(&h).await.unwrap(), Some(b));
     }
 
     #[tokio::test]

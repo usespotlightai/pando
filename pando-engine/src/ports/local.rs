@@ -91,6 +91,9 @@ pub trait LocalFile: Send + Sync + fmt::Debug {
     /// bytes when it is shorter; added bytes read as zeros. Fails with `StorageFull` when the
     /// disk lacks the space.
     async fn allocate(&self, len: u64) -> io::Result<()>;
+    /// Frees the disk space of `len` bytes at `offset` where the file system can, keeping the
+    /// length; the bytes read as zeros.
+    async fn punch(&self, offset: u64, len: u64) -> io::Result<()>;
     /// The length in bytes; for a block device, the size of the device.
     async fn size(&self) -> io::Result<u64>;
     /// Starts writing dirty pages back, without waiting for the disk, so a later sync waits less.

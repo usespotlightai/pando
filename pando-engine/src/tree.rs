@@ -115,6 +115,11 @@ impl Tree {
         })
     }
 
+    /// Forgets the loaded nodes among `dropped`.
+    pub(crate) fn forget(&self, dropped: &HashSet<Hash>) {
+        self.nodes.lock().retain(|h, _| !dropped.contains(h));
+    }
+
     /// Records `n`, stored under `h` already, as a loaded node.
     pub(crate) fn keep(&self, h: Hash, n: Node) {
         self.nodes.lock().insert(h, Arc::new(n));
@@ -719,7 +724,6 @@ mod tests {
             Arc::clone(&ports.cpu),
             writer,
             crate::packer::SEG_MAX,
-            Arc::default(),
         );
         let packed = t.pack(&root, &mut p).await.unwrap();
         p.finish().await.unwrap();

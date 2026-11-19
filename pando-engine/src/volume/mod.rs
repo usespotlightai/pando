@@ -9,13 +9,13 @@
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use pando_format::{
-    BLOCK_SIZE, BlockKeys, CHUNK_SIZE, Entry, Hash, Loc, Ref, Writer, WriterId, depth_for, is_zero, u64_from,
+    BLOCK_SIZE, BlockKeys, CHUNK_SIZE, Entry, Hash, Ref, Writer, WriterId, depth_for, is_zero, u64_from,
     usize_from,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, watch};
@@ -23,12 +23,12 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::base::{BaseView, Bases};
-use crate::cache::Cache;
+use crate::cache::{Cache, Root, Roots};
 use crate::dedup::learned::Learner;
 use crate::dedup::{Dedup, PreparedChunks};
 use crate::flight::bounded;
 use crate::gate::Gate;
-use crate::local::{Extent, Journal, Record, read_file, write_durable};
+use crate::local::{Extent, Journal, Record, VolState, read_file, write_durable};
 use crate::packer::{PackStats, Packer, SEG_MAX};
 use crate::ports::{Cpu, CpuClass, FileLock, LocalFs, Rng, StoreError, Version, on_cpu};
 use crate::remote::Remote;
@@ -101,12 +101,17 @@ struct Mem {
     unpersisted: Option<u64>,
     /// Per file, the last flush that recorded a chunk as a reference into it.
     ref_seq: HashMap<PathBuf, u64>,
+    /// The roots the state on disk may name, with their trees' depths: the last one written,
+    /// and those whose writes have not finished or failed since.
+    persisted: Vec<(Entry, usize)>,
 }
 
 impl Mem {
     /// The state of a branch that opened at `root`, with nothing written since.
     fn opened(root: Entry, tree: Arc<Tree>, size: u64, jfloor: u64) -> Mem {
+        let persisted = vec![(root, tree.depth())];
         Mem {
+            persisted,
             root,
             tree,
             size,
@@ -167,7 +172,6 @@ struct Up {
     uploaded: Entry,
     last_from: Hash,
     publishing: Entry,
-    known: Arc<HashMap<Hash, Loc>>,
     fenced: bool,
     gen_taken: bool,
     error: Option<Arc<Error>>,
@@ -228,6 +232,7 @@ struct Inner {
     stripes: Vec<RwLock<()>>,
     mem: Mutex<Mem>,
     commit: AsyncMutex<()>,
+    persisting: AsyncMutex<()>,
     up: Mutex<Up>,
     changed: watch::Sender<u64>,
     kick: Notify,
@@ -262,57 +267,48 @@ pub struct Volume {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// The local state of a branch. `size` is the size `root` belongs to, and `generation` the
-/// writer that wrote it; states written before sizes could grow, or before the write log, have
-/// none.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct VolState {
-    root: Entry,
-    published: Entry,
-    publishing: Entry,
-    jfloor: u64,
-    size: Option<u64>,
-    generation: Option<u64>,
-}
-
 impl VolState {
-    fn encode(&self) -> Bytes {
-        let tail = match (self.size, self.generation) {
-            (Some(n), Some(g)) => format!("{n}\n{g}\n"),
-            (Some(n), None) => format!("{n}\n"),
-            (None, _) => String::new(),
-        };
-        Bytes::from(format!(
-            "{}\n{}\n{}\n{}\n{tail}",
-            self.root, self.published, self.publishing, self.jfloor
-        ))
-    }
-
-    fn decode(b: &[u8]) -> Option<VolState> {
-        let s = std::str::from_utf8(b).ok()?;
-        let lines: Vec<&str> = s.lines().collect();
-        let (root, published, publishing, jfloor, size, generation) = match lines.as_slice() {
-            [r, p, q, j] => (r, p, q, j, None, None),
-            [r, p, q, j, n] => (r, p, q, j, Some(n.parse().ok()?), None),
-            [r, p, q, j, n, g] => (r, p, q, j, Some(n.parse().ok()?), Some(g.parse().ok()?)),
-            _ => return None,
-        };
-        Some(VolState {
-            root: Entry::parse_text(root).ok()?,
-            published: Entry::parse_text(published).ok()?,
-            publishing: Entry::parse_text(publishing).ok()?,
-            jfloor: jfloor.parse().ok()?,
-            size,
-            generation,
-        })
-    }
-
     /// Whether a writer may resume this state over ref `r`: the ref holds the root this state
     /// published or was publishing, and the last writer to take the branch is the one this
     /// state names.
     fn resumes(&self, r: &Ref) -> bool {
         (self.published.hash == r.root.hash || self.publishing.hash == r.root.hash)
             && self.generation.is_none_or(|g| g == r.generation)
+    }
+}
+
+/// A root an operation starts from, of a tree of `depth`: what it has not uploaded stays.
+fn pinned(entry: Entry, depth: usize) -> Root {
+    Root {
+        entry,
+        height: depth,
+        all: false,
+    }
+}
+
+impl Roots for Inner {
+    fn roots(&self, out: &mut Vec<Root>) {
+        let m = self.mem.lock();
+        out.push(Root {
+            entry: m.root,
+            height: m.tree.depth(),
+            all: true,
+        });
+        out.extend(m.persisted.iter().map(|&(e, depth)| pinned(e, depth)));
+        let flushing = m
+            .flushing
+            .iter()
+            .flat_map(|f| f.values().filter_map(Dirty::stored));
+        out.extend(m.dirty.stored().chain(flushing).map(|&entry| Root {
+            entry,
+            height: 0,
+            all: true,
+        }));
+    }
+
+    fn forget(&self, dropped: &HashSet<Hash>) {
+        let tree = Arc::clone(&self.mem.lock().tree);
+        tree.forget(dropped);
     }
 }
 
@@ -395,6 +391,7 @@ impl Volume {
             stripes: (0..STRIPES).map(|_| RwLock::new(())).collect(),
             mem: Mutex::new(mem),
             commit: AsyncMutex::new(()),
+            persisting: AsyncMutex::new(()),
             up: Mutex::new(Up {
                 version: version.clone(),
                 published: r.root,
@@ -402,7 +399,6 @@ impl Volume {
                 uploaded: r.root,
                 last_from: Hash::ZERO,
                 publishing: Entry::EMPTY,
-                known: Arc::default(),
                 fenced: false,
                 gen_taken: false,
                 error: None,
@@ -428,6 +424,10 @@ impl Volume {
             rng: Arc::clone(&ports.rng),
             unuploaded: Mutex::default(),
         });
+        let weak: Weak<Inner> = Arc::downgrade(&inner);
+        let roots: Weak<dyn Roots> = weak;
+        inner.cache.register(&inner.state_path, roots).await?;
+        inner.cache.start_sweeps();
         inner.start_journal(resume).await?;
         let grown = size != r.size;
         let v = Volume {
@@ -979,24 +979,29 @@ impl Inner {
             Arc::new(from.at_depth(depth))
         };
         loop {
-            let (root, opened) = {
+            let ((root, opened), pin) = self.cache.pin(|| {
                 let m = self.mem.lock();
-                (m.root, m.opened_now)
-            };
+                ((m.root, m.opened_now), vec![pinned(m.root, from.depth())])
+            });
             let lifted = to.lift(&root, from.depth()).await?;
             let opened = to.lift(&opened, from.depth()).await?;
             if depth != from.depth() {
                 self.cache.sync_local().await?;
             }
-            let mut m = self.mem.lock();
-            if m.root.hash != root.hash {
-                continue;
+            let grown = pin.finish(|| {
+                let mut m = self.mem.lock();
+                if m.root.hash != root.hash {
+                    return false;
+                }
+                m.root = lifted;
+                m.opened_now = opened;
+                m.tree = Arc::clone(&to);
+                m.size = size;
+                true
+            });
+            if grown {
+                break;
             }
-            m.root = lifted;
-            m.opened_now = opened;
-            m.tree = Arc::clone(&to);
-            m.size = size;
-            break;
         }
         self.persist().await?;
         self.size.store(size, Ordering::Release);
@@ -1120,8 +1125,11 @@ impl Inner {
     }
 
     async fn persist(&self) -> Result<()> {
+        let _one = self.persisting.lock().await;
         let (root, jfloor, size) = {
-            let m = self.mem.lock();
+            let mut m = self.mem.lock();
+            let state = (m.root, m.tree.depth());
+            m.persisted.push(state);
             (m.root, m.jfloor, m.size)
         };
         let (published, publishing) = {
@@ -1136,7 +1144,9 @@ impl Inner {
             size: Some(size),
             generation: Some(self.state_generation.load(Ordering::Acquire)),
         };
-        Ok(write_durable(self.fs.as_ref(), &self.state_path, st.encode()).await?)
+        write_durable(self.fs.as_ref(), &self.state_path, st.encode()).await?;
+        self.mem.lock().persisted.retain(|p| p.0.hash == root.hash);
+        Ok(())
     }
 
     async fn take_generation(self: Arc<Self>, mut r: Ref, version: Version) {
@@ -1490,22 +1500,26 @@ impl Inner {
             return Ok(seq);
         }
         let generation = self.journal.rotate().await?;
-        let (snapshot, refs, tree, root) = {
+        let ((snapshot, refs, tree, root), pin) = self.cache.pin(|| {
             let mut m = self.mem.lock();
             let snap = Arc::new(m.dirty.take());
             m.flushing = Some(Arc::clone(&snap));
+            let root = pinned(m.root, m.tree.depth());
             (
-                snap,
-                std::mem::take(&mut m.dirty_ref),
-                Arc::clone(&m.tree),
-                m.root,
+                (
+                    snap,
+                    std::mem::take(&mut m.dirty_ref),
+                    Arc::clone(&m.tree),
+                    m.root,
+                ),
+                vec![root],
             )
-        };
+        });
         drop(guards);
         let keep = min == 0 && snapshot.len() <= log::KEPT_MAX;
         match self.commit_snapshot(&tree, &snapshot, &refs, &root, keep).await {
             Ok((new_root, updates)) => {
-                let (seq, size, after_unpersisted) = {
+                let (seq, size, after_unpersisted) = pin.finish(|| {
                     let mut m = self.mem.lock();
                     m.root = new_root;
                     m.flushing = None;
@@ -1516,7 +1530,7 @@ impl Inner {
                         m.ref_seq.insert(r.path, seq);
                     }
                     (seq, m.size, m.unpersisted.replace(generation).is_some())
-                };
+                });
                 self.committed(seq);
                 self.persist_commit(generation).await?;
                 let chunks = updates
@@ -1576,12 +1590,13 @@ impl Inner {
             .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        {
-            let up = self.up.lock();
-            for (_, e, _) in &mut done {
-                if let Some(l) = up.known.get(&e.hash) {
-                    e.loc = *l;
-                }
+        for (_, e, _) in &mut done {
+            if let Some(l) = self
+                .cache
+                .stored(&e.hash)
+                .filter(|l| l.seg.writer() == self.writer.id())
+            {
+                e.loc = l;
             }
         }
         done.sort_by_key(|u| u.0);
@@ -1673,31 +1688,25 @@ impl Inner {
 
     /// Packs everything pending under the current local root and publishes it.
     async fn upload(&self) -> Result<()> {
-        let (root, seq, tree, size) = {
+        let ((root, seq, tree, size), pin) = self.cache.pin(|| {
             let m = self.mem.lock();
-            (m.root, m.flush_seq, Arc::clone(&m.tree), m.size)
-        };
-        let (known, version) = {
+            (
+                (m.root, m.flush_seq, Arc::clone(&m.tree), m.size),
+                vec![pinned(m.root, m.tree.depth())],
+            )
+        });
+        let version = {
             let up = self.up.lock();
             if (root.hash == up.uploaded.hash && size == up.published_size) || up.fenced {
                 return Ok(());
             }
-            (Arc::clone(&up.known), up.version.clone())
+            up.version.clone()
         };
         let t0 = Instant::now();
         let dedup = self.dedup.lock().clone();
         let learner = self.learner.lock().clone();
         let prepared = self.prepared.lock().clone();
-        let mut p = Packer::new(
-            self.remote.clone(),
-            Arc::clone(&self.cpu),
-            Arc::clone(&self.writer),
-            SEG_MAX,
-            known,
-        )
-        .with_dedup(dedup.clone(), prepared.clone())
-        .with_gate(Arc::clone(&self.gate))
-        .with_learner(learner.clone());
+        let mut p = self.packer(dedup.clone(), prepared.clone(), learner.clone());
         let packed = match tree.pack(&root, &mut p).await {
             Ok(e) => e,
             Err(e) => {
@@ -1738,12 +1747,11 @@ impl Inner {
             }
         };
         let stats = p.stats();
-        let added = p.added().clone();
+        self.cache.set_stored_all(p.added());
         record_learned(dedup.as_ref(), learner.as_ref(), &p).await;
         drop(p);
-        {
+        pin.finish(|| {
             let mut up = self.up.lock();
-            Arc::make_mut(&mut up.known).extend(added);
             up.version = new_version;
             up.published = packed;
             up.published_size = size;
@@ -1762,7 +1770,7 @@ impl Inner {
                 m.root = packed;
                 up.uploaded = packed;
             }
-        }
+        });
         if let Some(p) = &prepared {
             p.drop_through(seq);
         }
@@ -1771,6 +1779,24 @@ impl Inner {
         self.notify();
         let _ = self.persist().await;
         Ok(())
+    }
+
+    fn packer(
+        &self,
+        dedup: Option<Arc<Dedup>>,
+        prepared: Option<Arc<PreparedChunks>>,
+        learner: Option<Arc<Learner>>,
+    ) -> Packer {
+        Packer::new(
+            self.remote.clone(),
+            Arc::clone(&self.cpu),
+            Arc::clone(&self.writer),
+            SEG_MAX,
+        )
+        .with_stored(Arc::clone(&self.cache))
+        .with_dedup(dedup, prepared)
+        .with_gate(Arc::clone(&self.gate))
+        .with_learner(learner)
     }
 
     /// Puts the change list of `root`, a root of `tree` for a branch of `size` bytes, from the
@@ -2252,6 +2278,80 @@ mod tests {
 
     fn crash(fs: &SimFs) {
         fs.crash();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeps_drop_old_chunk_versions_and_keep_what_any_branch_still_needs() {
+        use crate::ports::LocalImage;
+        let (ports, store, fs) = sim::ports(6);
+        branch(&ports, "main").await;
+        branch(&ports, "other").await;
+        let cache = host(&ports, "/a").await;
+        store.refuse(StoreOp::Create);
+        let other = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "other")
+            .await
+            .unwrap();
+        other.write_at(&data(9, 3 * CHUNK_SIZE), 0).await.unwrap();
+        other.flush().await.unwrap();
+        other.close().await;
+        drop(other);
+        store.accept();
+
+        let v = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let chunks = 8;
+        let version = |round: u8| {
+            let mut b = Vec::with_capacity(chunks * CHUNK_SIZE);
+            for idx in 0..u8::try_from(chunks).unwrap() {
+                let seed = if idx < 4 {
+                    round.wrapping_mul(8).wrapping_add(idx)
+                } else {
+                    round
+                };
+                b.extend_from_slice(&data(seed, CHUNK_SIZE));
+            }
+            b
+        };
+        for round in 0..40u8 {
+            v.write_at(&version(round), 0).await.unwrap();
+            v.flush().await.unwrap();
+            if round % 10 == 9 {
+                v.checkpoint().await.unwrap();
+            }
+        }
+        cache.sweep().await.unwrap();
+        let used = fs.allocated(Path::new("/a/objects")).await.unwrap();
+        assert!(
+            used < 2 * 11 * u64_from(CHUNK_SIZE),
+            "40 versions of {chunks} chunks went in; the log keeps {used} bytes"
+        );
+        assert_eq!(read(&v, 0, chunks * CHUNK_SIZE).await, version(39));
+        v.write_at(&data(77, CHUNK_SIZE), 0).await.unwrap();
+        v.flush().await.unwrap();
+        drop(v);
+        drop(cache);
+        crash(&fs);
+
+        let cache = host(&ports, "/a").await;
+        let v = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let mut want = data(77, CHUNK_SIZE);
+        want.extend_from_slice(&version(39)[CHUNK_SIZE..]);
+        assert_eq!(read(&v, 0, chunks * CHUNK_SIZE).await, want);
+        let other = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "other")
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&other, 0, 3 * CHUNK_SIZE).await,
+            data(9, 3 * CHUNK_SIZE),
+            "a branch closed before its upload keeps its writes"
+        );
+        other.checkpoint().await.unwrap();
+        v.checkpoint().await.unwrap();
+        other.close().await;
+        v.close().await;
     }
 
     #[test]

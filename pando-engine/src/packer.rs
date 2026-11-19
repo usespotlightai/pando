@@ -11,6 +11,7 @@ use pando_format::{
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 
+use crate::cache::Cache;
 use crate::dedup::learned::{LearnedRec, Learner};
 use crate::dedup::{Dedup, Prepared, PreparedChunks, prepare};
 use crate::gate::Gate;
@@ -83,7 +84,7 @@ pub(crate) struct Packer {
     cpu: Arc<dyn Cpu>,
     writer: Arc<Writer>,
     seg_max: usize,
-    known: Arc<HashMap<Hash, Loc>>,
+    stored: Option<Arc<Cache>>,
     added: HashMap<Hash, Loc>,
     keys: HashMap<Hash, BlockKeys>,
     deps: BTreeSet<SegId>,
@@ -104,22 +105,15 @@ pub(crate) struct Packer {
 }
 
 impl Packer {
-    /// A packer for `writer`; objects in `known` are uploaded already and go up again only
-    /// as their locations.
-    pub(crate) fn new(
-        remote: Remote,
-        cpu: Arc<dyn Cpu>,
-        writer: Arc<Writer>,
-        seg_max: usize,
-        known: Arc<HashMap<Hash, Loc>>,
-    ) -> Packer {
+    /// A packer for `writer`.
+    pub(crate) fn new(remote: Remote, cpu: Arc<dyn Cpu>, writer: Arc<Writer>, seg_max: usize) -> Packer {
         let seg_id = writer.next_seg_id();
         Packer {
             remote,
             cpu,
             writer,
             seg_max,
-            known,
+            stored: None,
             added: HashMap::new(),
             keys: HashMap::new(),
             deps: BTreeSet::new(),
@@ -156,6 +150,13 @@ impl Packer {
         self
     }
 
+    /// Lets the objects `cache` says this writer uploaded already go up again only as their
+    /// locations.
+    pub(crate) fn with_stored(mut self, cache: Arc<Cache>) -> Packer {
+        self.stored = Some(cache);
+        self
+    }
+
     /// Lets at most as many chunks be prepared at once as `gate` admits.
     pub(crate) fn with_gate(mut self, gate: Arc<Gate>) -> Packer {
         self.preparer.gate = Some(gate);
@@ -183,7 +184,10 @@ impl Packer {
     }
 
     pub(crate) fn lookup(&self, h: &Hash) -> Option<Loc> {
-        self.known.get(h).or_else(|| self.added.get(h)).copied()
+        self.added.get(h).copied().or_else(|| {
+            let l = self.stored.as_ref()?.stored(h)?;
+            (l.seg.writer() == self.writer.id()).then_some(l)
+        })
     }
 
     /// The objects this packer appended, with their locations.
@@ -203,7 +207,7 @@ impl Packer {
         }
     }
 
-    /// Appends object `h` unless it is known or appended already.
+    /// Appends object `h` unless it is stored or appended already.
     pub(crate) async fn append_object(&mut self, h: Hash, b: &[u8]) -> Result<Loc> {
         if let Some(l) = self.lookup(&h) {
             return Ok(l);
@@ -386,7 +390,6 @@ mod tests {
     use pando_format::{Entry, WriterId};
 
     use super::*;
-    use crate::cache::Cache;
     use crate::ports::Store;
     use crate::sim;
 
@@ -395,13 +398,7 @@ mod tests {
         let (ports, store, _) = sim::ports(1);
         let remote = Remote::new(Arc::clone(&ports.store));
         let writer = Arc::new(Writer::new(WriterId::new("main", 1), 0));
-        let mut p = Packer::new(
-            remote.clone(),
-            Arc::clone(&ports.cpu),
-            writer,
-            1 << 20,
-            Arc::default(),
-        );
+        let mut p = Packer::new(remote.clone(), Arc::clone(&ports.cpu), writer, 1 << 20);
         let mut es = Vec::new();
         for i in 0..40u32 {
             let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -439,26 +436,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_known_object_is_not_appended_again() {
+    async fn an_object_this_writer_stored_is_not_appended_again() {
         let (ports, _, _) = sim::ports(2);
-        let h = Hash::of(b"x");
+        let remote = Remote::new(Arc::clone(&ports.store));
+        let cache = Arc::new(
+            Cache::open_with(
+                Arc::clone(&ports.fs),
+                Arc::clone(&ports.cpu),
+                remote.clone(),
+                Path::new("/c"),
+            )
+            .await
+            .unwrap(),
+        );
+        let id = WriterId::new("main", 1);
+        let (h, other) = (Hash::of(b"x"), Hash::of(b"y"));
         let loc = Loc {
-            seg: SegId([1; 16]),
+            seg: SegId::new(id, 7),
             frame: 2,
             inner: 3,
             len: 1,
         };
-        let known = Arc::new(HashMap::from([(h, loc)]));
-        let writer = Arc::new(Writer::new(WriterId::new("main", 1), 0));
-        let mut p = Packer::new(
-            Remote::new(Arc::clone(&ports.store)),
-            Arc::clone(&ports.cpu),
-            writer,
-            SEG_MAX,
-            known,
+        for o in [h, other] {
+            cache.put_local(o, Bytes::from_static(b"x")).await.unwrap();
+        }
+        cache.set_stored(&h, loc);
+        cache.set_stored(
+            &other,
+            Loc {
+                seg: SegId::new(WriterId::new("main", 2), 7),
+                ..loc
+            },
         );
+        let writer = Arc::new(Writer::new(id, 0));
+        let mut p = Packer::new(remote, Arc::clone(&ports.cpu), writer, SEG_MAX).with_stored(cache);
         assert_eq!(p.append_object(h, b"x").await.unwrap(), loc);
-        p.finish().await.unwrap();
         assert_eq!(p.stats().segments, 0);
+        assert_ne!(
+            p.append_object(other, b"y").await.unwrap().seg.writer(),
+            WriterId::new("main", 2),
+            "another writer's upload goes up again"
+        );
+        p.finish().await.unwrap();
     }
 }
