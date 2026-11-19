@@ -221,12 +221,14 @@ impl Cache {
     }
 
     /// Drops the records of the object log that no root, pin or closed branch on this host
-    /// reaches.
+    /// reaches. A sweep marks in an epoch of its own, older than the one puts mark in from
+    /// then on, so a pin begun after it keeps only what was put again since.
     pub(crate) async fn sweep(&self) -> Result<Swept> {
         let _one = self.sweeper.running.lock().await;
         let (epoch, below, keep_from, mut roots, users, closed) = {
             let _g = self.sweeper.gate.write();
             let epoch = self.log.next_epoch();
+            self.log.next_epoch();
             let end = self.log.end();
             let pins = self.sweeper.pins.lock();
             let from = || pins.1.values().filter_map(|p| p.from);
@@ -380,5 +382,37 @@ mod tests {
             c.sweep().await.unwrap().dropped.is_empty(),
             "the floor stays across opens"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pin_begun_after_a_sweep_keeps_nothing_that_sweep_alone_marked() {
+        let (ports, _, _) = sim::ports(3);
+        let c = Arc::new(
+            Cache::open_with(
+                Arc::clone(&ports.fs),
+                Arc::clone(&ports.cpu),
+                Remote::new(Arc::clone(&ports.store)),
+                Path::new("/c"),
+            )
+            .await
+            .unwrap(),
+        );
+        let old = Bytes::from_static(b"old");
+        let h = Hash::of(&old);
+        c.put_local(h, old).await.unwrap();
+        let root = Root {
+            entry: Entry {
+                hash: h,
+                loc: Entry::EMPTY.loc,
+            },
+            height: 0,
+            all: true,
+        };
+        let ((), held) = c.pin_roots(|| ((), vec![root]));
+        assert!(c.sweep().await.unwrap().dropped.is_empty(), "a root keeps it");
+        let ((), commit) = c.pin(|| ((), Vec::new()));
+        drop(held);
+        assert_eq!(c.sweep().await.unwrap().dropped, vec![h]);
+        drop(commit);
     }
 }
