@@ -6,6 +6,12 @@
 //! host, then drops the records older than every pin that nothing marked since the oldest pin
 //! began. A put of an object the log has marks it, so an operation that finds its object there
 //! keeps it.
+//!
+//! With a budget ([`Cache::set_budget`]), the uploaded objects of the trees the open branches
+//! read stay only while they fit: those read since the last sweep, then the nodes, then the
+//! chunks read most recently. Those it drops are fetched from the store again when read. What
+//! is not uploaded always stays, and so does what the root a branch opened at needs and the
+//! store does not have under it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -268,8 +274,23 @@ impl Cache {
                 None => gone.push(p),
             }
         }
+        let budget = self.log.budget() > 0;
+        let read: Vec<Root> = if budget {
+            roots.iter().filter(|r| r.all && r.height > 0).copied().collect()
+        } else {
+            Vec::new()
+        };
+        if budget {
+            for r in &mut roots {
+                r.all &= r.height == 0;
+            }
+        }
         self.mark(roots, epoch).await?;
-        let swept = self.log.sweep(self.sweeper.floor, below, keep_from).await?;
+        let wanted = self.wanted(read).await?;
+        let swept = self
+            .log
+            .sweep(self.sweeper.floor, below, keep_from, &wanted, epoch - 1)
+            .await?;
         let dropped: HashSet<Hash> = swept.dropped.iter().copied().collect();
         for u in &users {
             u.forget(&dropped);
@@ -321,6 +342,57 @@ impl Cache {
             }));
         }
         Ok(())
+    }
+
+    /// The objects under `roots` that this host has, through the nodes it has: the nodes
+    /// from the top down, then the chunks read most recently first.
+    async fn wanted(&self, roots: Vec<Root>) -> Result<Vec<Hash>> {
+        let mut nodes = Vec::new();
+        let mut chunks = Vec::new();
+        let mut seen = HashSet::new();
+        let mut level: Vec<Root> = roots;
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for r in level {
+                let e = r.entry;
+                if e.is_empty() || !seen.insert(e.hash) {
+                    continue;
+                }
+                let Some(used) = self.log.used(&e.hash) else {
+                    continue;
+                };
+                if r.height == 0 {
+                    chunks.push((used, e.hash));
+                    continue;
+                }
+                nodes.push(e.hash);
+                let Some(b) = self.log.get(&e.hash).await? else {
+                    continue;
+                };
+                let n = Node::decode(&b)?;
+                next.extend(n.children().map(|(_, c)| Root {
+                    entry: *c,
+                    height: r.height - 1,
+                    all: true,
+                }));
+            }
+            level = next;
+        }
+        chunks.sort_by_key(|&(used, _)| std::cmp::Reverse(used));
+        nodes.extend(chunks.into_iter().map(|(_, h)| h));
+        Ok(nodes)
+    }
+
+    /// Limits the bytes of disk the object log keeps of uploaded objects to `bytes`, or lifts
+    /// the limit with zero. Objects not uploaded stay whatever their size, so the log may
+    /// pass it while uploads fall behind.
+    pub fn set_budget(&self, bytes: u64) {
+        self.log.set_budget(bytes);
+    }
+
+    /// The bytes of disk the object log takes, as of its last sweep, with the appends since.
+    pub fn log_bytes(&self) -> u64 {
+        self.log.live()
     }
 
     /// Where the store has object `h`, when the uploads of `uploads` recorded it.

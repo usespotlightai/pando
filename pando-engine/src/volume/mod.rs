@@ -2358,6 +2358,120 @@ mod tests {
         v.close().await;
     }
 
+    fn chunks(from: u8, n: u8) -> Vec<u8> {
+        (from..from + n).flat_map(|i| data(i, CHUNK_SIZE)).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cache_budget_keeps_the_chunks_read_last_and_fetches_the_rest_again() {
+        use crate::ports::LocalImage;
+        let (ports, store, fs) = sim::ports(7);
+        branch(&ports, "main").await;
+        let cache = host(&ports, "/a").await;
+        let v = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let all = chunks(0, 96);
+        v.write_at(&all, 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        cache.sweep().await.unwrap();
+        assert!(cache.log_bytes() >= 96 * u64_from(CHUNK_SIZE));
+
+        let budget = 48 * u64_from(CHUNK_SIZE);
+        cache.set_budget(budget);
+        let hot = 4 * CHUNK_SIZE;
+        assert_eq!(read(&v, 0, hot).await, all[..hot]);
+        cache.sweep().await.unwrap();
+        assert!(cache.log_bytes() <= budget, "{} bytes kept", cache.log_bytes());
+        assert!(fs.allocated(Path::new("/a/objects")).await.unwrap() <= budget + 64 * 4096);
+
+        store.refuse(StoreOp::Get);
+        assert_eq!(read(&v, 0, hot).await, all[..hot], "the chunks read last stay");
+        store.accept();
+        assert_eq!(read(&v, 0, all.len()).await, all, "the rest come from the store");
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cache_budget_never_drops_what_is_not_uploaded() {
+        let (ports, store, fs) = sim::ports(8);
+        branch(&ports, "main").await;
+        let cache = host(&ports, "/a").await;
+        cache.set_budget(4 * u64_from(CHUNK_SIZE));
+        store.refuse(StoreOp::Create);
+        let v = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let all = chunks(0, 24);
+        v.write_at(&all, 0).await.unwrap();
+        v.flush().await.unwrap();
+        cache.sweep().await.unwrap();
+        assert!(cache.log_bytes() >= 24 * u64_from(CHUNK_SIZE));
+        drop(v);
+        drop(cache);
+        crash(&fs);
+
+        let cache = host(&ports, "/a").await;
+        cache.set_budget(4 * u64_from(CHUNK_SIZE));
+        let v = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "main")
+            .await
+            .unwrap();
+        cache.sweep().await.unwrap();
+        store.refuse(StoreOp::Get);
+        assert_eq!(read(&v, 0, all.len()).await, all, "every flushed write stays");
+        store.accept();
+        v.checkpoint().await.unwrap();
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_crash_at_any_step_of_a_sweep_within_a_budget_loses_nothing() {
+        let mut steps = 0;
+        loop {
+            let (ports, store, fs) = sim::ports(9);
+            branch(&ports, "main").await;
+            let cache = host(&ports, "/a").await;
+            let v = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "main")
+                .await
+                .unwrap();
+            let uploaded = chunks(0, 16);
+            v.write_at(&uploaded, 0).await.unwrap();
+            v.checkpoint().await.unwrap();
+            store.refuse(StoreOp::Create);
+            let pending = chunks(100, 4);
+            let at = u64_from(uploaded.len());
+            v.write_at(&pending, at).await.unwrap();
+            v.flush().await.unwrap();
+            cache.sweep().await.unwrap();
+
+            fs.stop_after(Some(steps));
+            cache.set_budget(4 * u64_from(CHUNK_SIZE));
+            let swept = cache.sweep().await;
+            let stopped = fs.stopped();
+            drop(v);
+            drop(cache);
+            crash(&fs);
+
+            let cache = host(&ports, "/a").await;
+            let v = Volume::open(&ports, Arc::clone(&cache), Path::new("/a"), "main")
+                .await
+                .unwrap();
+            assert_eq!(read(&v, 0, uploaded.len()).await, uploaded, "step {steps}");
+            assert_eq!(read(&v, at, pending.len()).await, pending, "step {steps}");
+            store.accept();
+            v.checkpoint().await.unwrap();
+            v.close().await;
+            if !stopped {
+                let dropped = swept.unwrap().dropped.len();
+                assert!(dropped >= 12, "the sweep dropped {dropped} objects");
+                break;
+            }
+            steps += 1;
+            assert!(steps < 200, "a sweep takes fewer steps");
+        }
+        assert!(steps > 3, "the sweep stopped at {steps} steps");
+    }
+
     #[test]
     fn a_state_without_a_size_or_generation_still_reads() {
         let s = VolState {

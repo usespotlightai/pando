@@ -23,7 +23,7 @@ on:
       tests:
         description: "Tests to run, from tests/kernel, or systemd"
         type: string
-        default: "fio-verify crash discard drain outage diskfull fuse memory systemd"
+        default: "fio-verify crash discard drain outage diskfull budget fuse memory systemd"
       asan:
         description: "Build pando with AddressSanitizer"
         type: boolean
@@ -58,7 +58,7 @@ jobs:
           case $EVENT in
             schedule) tests="log-writes" ;;
             workflow_dispatch) tests=$ASKED ;;
-            *) tests="fio-verify crash discard drain outage diskfull fuse memory systemd" ;;
+            *) tests="fio-verify crash discard drain outage diskfull budget fuse memory systemd" ;;
           esac
           case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel, or systemd" >&2; exit 2 ;; esac
           inside=
@@ -201,7 +201,7 @@ jobs:
         run: |
           sudo mkdir -p "$DATA"
           status=0
-          tests/kernel/host.sh fio-verify crash discard drain outage diskfull || status=$?
+          tests/kernel/host.sh fio-verify crash discard drain outage diskfull budget || status=$?
           if compgen -G "$RESULTS/asan.*" > /dev/null; then
             cat "$RESULTS"/asan.*
             exit 1

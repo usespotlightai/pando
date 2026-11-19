@@ -111,6 +111,17 @@ daemon allocates the reserve again, logs that the disk has room and takes writes
 the same one. Reads of chunks this host has not fetched fail with EIO while the disk is full,
 since the cache cannot keep them.
 
+**Cache budget.** Every chunk this host fetches or writes stays in the cache's object log while
+a branch on the host still reads it, so without a limit the log grows to the data its branches
+have touched. `--cache-budget SIZE` (a global flag, such as `--cache-budget 200G` in
+`PANDO_ARGS`) limits the disk it takes. Each sweep keeps what was read since the last one,
+then the tree nodes, then the chunks read most recently, and drops the rest, which the next
+read of them fetches from the store again. A sweep runs whenever the log nears the budget, and
+leaves it within seven eighths of it. Writes not uploaded yet always stay, so the log passes the
+budget while uploads fall behind, and so do the writes a branch had not uploaded when it was
+attached, until its next attach. The journal, the state and the 128 MiB reserve come on top of
+the budget; leave room for them, and for writes during an outage, on the cache's disk.
+
 ## A host that never comes back
 
 The store holds the branch as of its last upload. Before a handoff the daemon uploads within

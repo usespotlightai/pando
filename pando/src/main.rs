@@ -36,6 +36,10 @@ struct Cli {
     /// The local cache directory [default: /data/cache].
     #[arg(long, global = true)]
     cache: Option<PathBuf>,
+    /// At most this much disk for the objects the cache keeps of what is in the store, with a
+    /// K, M, G or T suffix (0: no limit). Writes not uploaded yet stay whatever their size.
+    #[arg(long, global = true, value_parser = parse_cache_budget, default_value = "0")]
+    cache_budget: u64,
     /// The socket of the host daemon: `serve` listens on it, and every other command is sent
     /// to the daemon on it and runs there.
     #[arg(long, global = true, env = "PANDO_SOCKET")]
@@ -240,6 +244,10 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
 
 /// Parses sizes such as `4096`, `512M` and `8G`: bytes, or a number with K, M, G or T in
 /// powers of 1024.
+fn parse_cache_budget(s: &str) -> Result<u64, String> {
+    parse_size(s).map_err(|e| format!("{e:#}"))
+}
+
 pub(crate) fn parse_size(s: &str) -> Result<u64> {
     let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (n, unit) = s.split_at(at);
@@ -263,6 +271,7 @@ pub(crate) fn parse_size(s: &str) -> Result<u64> {
 pub(crate) struct Host {
     ports: Ports,
     cache_dir: PathBuf,
+    cache_budget: u64,
     cache: OnceCell<Arc<Cache>>,
     readable: OnceCell<StoreFormat>,
     marked: OnceCell<StoreFormat>,
@@ -381,7 +390,9 @@ impl Host {
         let c = self
             .cache
             .get_or_try_init(|| async {
-                Ok::<_, anyhow::Error>(Arc::new(Cache::open(&self.ports, &self.cache_dir).await?))
+                let c = Cache::open(&self.ports, &self.cache_dir).await?;
+                c.set_budget(self.cache_budget);
+                Ok::<_, anyhow::Error>(Arc::new(c))
             })
             .await?;
         Ok(Arc::clone(c))
@@ -450,6 +461,7 @@ async fn start(cli: Cli) -> Result<Exit> {
             matches!(cli.command, Command::Attach(_) | Command::Serve),
         )?,
         cache_dir: cli.cache.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE)),
+        cache_budget: cli.cache_budget,
         cache: OnceCell::new(),
         readable: OnceCell::new(),
         marked: OnceCell::new(),

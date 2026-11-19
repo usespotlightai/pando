@@ -1,5 +1,5 @@
 use parking_lot::{Mutex, RwLock};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,8 @@ const PAGE: u64 = 4096;
 ///
 /// A sweep drops the records nothing marked since an epoch: it writes padding over them and
 /// frees their pages, so the offsets of the others hold and the log takes no more disk than
-/// they do.
+/// they do. With a budget, a sweep also drops records it was asked to keep only while they
+/// fit: those read longest ago go first.
 #[derive(Debug)]
 pub(crate) struct ObjectLog {
     fs: Arc<dyn LocalFs>,
@@ -72,6 +73,11 @@ pub(crate) struct ObjectLog {
     appended: AtomicU64,
     sweep_after: AtomicU64,
     due: Arc<Notify>,
+    /// The bytes of the records in the log itself, as of the last sweep or open, with the
+    /// appends since.
+    live: AtomicU64,
+    /// The most bytes the log keeps of objects a sweep may drop; zero for no limit.
+    budget: AtomicU64,
     /// Records of objects the log had already when they landed, which the next sweep drops.
     orphans: Mutex<Vec<(u64, u64)>>,
 }
@@ -84,18 +90,21 @@ struct Loc {
     ext: Option<(Arc<ExtFile>, u64)>,
     /// The last epoch that marked the record or put its object again.
     mark: AtomicU64,
+    /// The epoch of the last read of the object or put of it.
+    used: AtomicU64,
     /// Where the store has the object, once an upload put it there, and whose upload.
     stored: Mutex<Option<(u64, StoreLoc)>>,
 }
 
 impl Loc {
-    fn new(off: u64, len: u32, ext: Option<(Arc<ExtFile>, u64)>) -> Arc<Loc> {
+    fn new(off: u64, len: u32, ext: Option<(Arc<ExtFile>, u64)>, used: u64) -> Arc<Loc> {
         Arc::new(Loc {
             off,
             len,
             touched: AtomicBool::new(false),
             ext,
             mark: AtomicU64::new(0),
+            used: AtomicU64::new(used),
             stored: Mutex::new(None),
         })
     }
@@ -107,6 +116,15 @@ impl Loc {
             Some((e, _)) => 12 + u64_from(e.path.as_os_str().as_encoded_bytes().len()),
         };
         self.off + HEADER_LEN + body
+    }
+
+    /// The bytes of the record in the log itself; a reference record counts none.
+    fn own_bytes(&self) -> u64 {
+        if self.ext.is_some() {
+            0
+        } else {
+            u64::from(self.len) + HEADER_LEN
+        }
     }
 
     fn dead(&self) -> bool {
@@ -150,11 +168,13 @@ impl ExtFile {
     }
 }
 
-/// What [`ObjectLog::sweep`] dropped: the objects, and the bytes of disk it freed.
+/// What [`ObjectLog::sweep`] dropped: the objects, and the bytes of disk it freed. `kept` is
+/// the bytes of the records left in the log itself.
 #[derive(Debug, Default)]
 pub(crate) struct Swept {
     pub(crate) dropped: Vec<Hash>,
     pub(crate) freed: u64,
+    pub(crate) kept: u64,
 }
 
 /// Holds the log's write-back until dropped; then it starts one.
@@ -218,6 +238,17 @@ fn pad_hash(off: u64, len: u32) -> Hash {
     Hash::of(&b)
 }
 
+/// How many bytes to append before the next sweep, after one that kept `kept` bytes: as many
+/// as it kept, at least [`SWEEP_MIN`], and with a budget no more than what is left of it, or
+/// an eighth of it when nothing is.
+fn next_sweep(kept: u64, budget: u64) -> u64 {
+    let n = kept.max(SWEEP_MIN);
+    if budget == 0 {
+        return n;
+    }
+    n.min(budget.saturating_sub(kept).max(budget / 8).max(1))
+}
+
 fn header(h: Hash, len: u32) -> Bytes {
     let mut b = Vec::with_capacity(HEADER);
     b.extend_from_slice(&h.0);
@@ -258,6 +289,8 @@ impl ObjectLog {
             appended: AtomicU64::new(0),
             sweep_after: AtomicU64::new(SWEEP_MIN),
             due: Arc::default(),
+            live: AtomicU64::new(0),
+            budget: AtomicU64::new(0),
             orphans: Mutex::default(),
         };
         let synced = match read_file(fs.as_ref(), &log.synced_path()).await? {
@@ -368,7 +401,7 @@ impl ObjectLog {
                             break;
                         }
                     }
-                    self.index(h, Loc::new(off, len, Some((ext, ext_off))));
+                    self.index(h, Loc::new(off, len, Some((ext, ext_off)), 0));
                 }
             } else {
                 if off >= synced {
@@ -377,7 +410,8 @@ impl ObjectLog {
                         break;
                     }
                 }
-                self.index(h, Loc::new(off, n, None));
+                self.index(h, Loc::new(off, n, None, 0));
+                self.live.fetch_add(HEADER_LEN + u64::from(n), Ordering::AcqRel);
             }
             off = body + plen;
         }
@@ -480,7 +514,8 @@ impl ObjectLog {
         let len =
             u32::try_from(b.len()).map_err(|_| Error::Corrupt(format!("object {h} of {} bytes", b.len())))?;
         let at = self.append(h, header(h, len), b).await?;
-        self.index(h, Loc::new(at, len, None));
+        self.index(h, Loc::new(at, len, None, self.epoch()));
+        self.live.fetch_add(u64::from(len) + HEADER_LEN, Ordering::AcqRel);
         self.appended(u64::from(len) + HEADER_LEN);
         let n = self
             .unwritten
@@ -523,7 +558,7 @@ impl ObjectLog {
             .append(h, header(h, REF_FLAG | plen), Bytes::from(payload))
             .await?;
         let n = u64::from(plen) + HEADER_LEN;
-        self.index(h, Loc::new(at, len, Some((ext, offset))));
+        self.index(h, Loc::new(at, len, Some((ext, offset)), self.epoch()));
         self.appended(n);
         Ok(())
     }
@@ -539,6 +574,7 @@ impl ObjectLog {
         match m.get(h).filter(|l| !l.dead()) {
             Some(l) => {
                 l.mark.fetch_max(self.epoch(), Ordering::AcqRel);
+                l.used.fetch_max(self.epoch(), Ordering::AcqRel);
                 true
             }
             None => false,
@@ -559,6 +595,35 @@ impl ObjectLog {
     /// Whether enough was appended since the last sweep that another is due.
     pub(crate) fn sweep_is_due(&self) -> bool {
         self.appended.load(Ordering::Acquire) >= self.sweep_after.load(Ordering::Acquire)
+    }
+
+    /// Limits the bytes the log keeps of objects a sweep may drop to `bytes`, or lifts the
+    /// limit with zero. A log over it makes a sweep due at once.
+    pub(crate) fn set_budget(&self, bytes: u64) {
+        self.budget.store(bytes, Ordering::Release);
+        let live = self.live.load(Ordering::Acquire);
+        let after = next_sweep(live, bytes);
+        self.sweep_after.fetch_min(after, Ordering::AcqRel);
+        if bytes > 0 && live > bytes {
+            self.sweep_after.store(0, Ordering::Release);
+            self.due.notify_one();
+        }
+    }
+
+    /// The most bytes the log keeps of objects a sweep may drop; zero for no limit.
+    pub(crate) fn budget(&self) -> u64 {
+        self.budget.load(Ordering::Acquire)
+    }
+
+    /// The bytes of the records in the log itself, as far as it knows: what the last sweep
+    /// kept and what was appended since.
+    pub(crate) fn live(&self) -> u64 {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// The epoch of the last read or put of object `h`, when the log has it.
+    pub(crate) fn used(&self, h: &Hash) -> Option<u64> {
+        self.lookup(h).map(|l| l.used.load(Ordering::Acquire))
     }
 
     /// Where the log ends; appends land at or past it.
@@ -592,25 +657,76 @@ impl ObjectLog {
     }
 
     /// Drops every record that starts from `floor` and below `below` and was last marked
-    /// before epoch `keep_from`. Each run of dropped records becomes padding, and its pages are freed once
-    /// the padding is durable and no read of a dropped record is left.
-    pub(crate) async fn sweep(&self, floor: u64, below: u64, keep_from: u64) -> Result<Swept> {
+    /// before epoch `keep_from`, except the objects of `wanted` that fit: all of them without
+    /// a budget, and with one those read or put from epoch `fresh_from` on, then the longest
+    /// run of the rest from its start that leaves the log within seven eighths of the budget.
+    /// Each run of dropped records becomes padding, and its pages are freed once the padding
+    /// is durable and no read of a dropped record is left.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "the sums and sets it builds do not depend on the order"
+    )]
+    pub(crate) async fn sweep(
+        &self,
+        floor: u64,
+        below: u64,
+        keep_from: u64,
+        wanted: &[Hash],
+        fresh_from: u64,
+    ) -> Result<Swept> {
+        let droppable = |l: &Loc| {
+            (floor..below).contains(&l.off) && (l.mark.load(Ordering::Acquire) < keep_from || l.dead())
+        };
+        let budget = self.budget.load(Ordering::Acquire);
+        let keep: HashSet<Hash> = if budget == 0 {
+            wanted.iter().copied().collect()
+        } else {
+            let room = budget - budget / 8;
+            let mut cost: HashMap<Hash, u64> = HashMap::new();
+            let mut base = 0;
+            let mut keep = HashSet::new();
+            let wanted_set: HashSet<&Hash> = wanted.iter().collect();
+            for s in &self.shards {
+                for (h, l) in s.read().iter() {
+                    if !droppable(l) {
+                        base += l.own_bytes();
+                    } else if wanted_set.contains(h) && l.used.load(Ordering::Acquire) >= fresh_from {
+                        base += l.own_bytes();
+                        keep.insert(*h);
+                    } else {
+                        cost.insert(*h, l.own_bytes());
+                    }
+                }
+            }
+            for h in wanted {
+                let Some(&c) = cost.get(h) else {
+                    continue;
+                };
+                if base + c > room {
+                    break;
+                }
+                base += c;
+                keep.insert(*h);
+            }
+            keep
+        };
         let mut gone = Vec::new();
         let mut kept = 0;
         for s in &self.shards {
             s.write().retain(|h, l| {
-                let dropped = (floor..below).contains(&l.off)
-                    && (l.mark.load(Ordering::Acquire) < keep_from || l.dead());
+                let dropped = droppable(l) && !keep.contains(h);
                 if dropped {
                     gone.push((*h, Arc::clone(l)));
-                } else if l.ext.is_none() && l.off >= floor {
-                    kept += u64::from(l.len) + HEADER_LEN;
+                } else {
+                    kept += l.own_bytes();
                 }
                 !dropped
             });
         }
         self.appended.store(0, Ordering::Release);
-        self.sweep_after.store(kept.max(SWEEP_MIN), Ordering::Release);
+        self.live.store(kept, Ordering::Release);
+        self.sweep_after
+            .store(next_sweep(kept, budget), Ordering::Release);
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut recs: Vec<(u64, u64)> = gone.iter().map(|(_, l)| (l.off, l.end())).collect();
         recs.extend(std::mem::take(&mut *self.orphans.lock()));
@@ -642,7 +758,7 @@ impl ObjectLog {
                 freed += to - from;
             }
         }
-        Ok(Swept { dropped, freed })
+        Ok(Swept { dropped, freed, kept })
     }
 
     /// Turns every record that names `path` into a miss; call it before removing the file.
@@ -673,6 +789,7 @@ impl ObjectLog {
         let Some((f, at)) = self.source(&loc).await else {
             return Ok(None);
         };
+        loc.used.fetch_max(self.epoch(), Ordering::AcqRel);
         if len < loc.len as usize && !loc.touched.swap(true, Ordering::AcqRel) {
             f.advise(at, u64::from(loc.len), Advice::WillNeed);
         }
@@ -698,6 +815,7 @@ impl ObjectLog {
                 None => return Ok(false),
             },
         };
+        loc.used.fetch_max(self.epoch(), Ordering::AcqRel);
         Ok(f.read_at_nowait(dst, at + u64_from(inner))? == Some(dst.len()))
     }
 
@@ -965,7 +1083,7 @@ mod tests {
         let (late_h, late_b) = big(7);
         log.put(late_h, late_b.clone()).await.unwrap();
         let before = fs.allocated(path).await.unwrap();
-        let swept = log.sweep(0, below, epoch).await.unwrap();
+        let swept = log.sweep(0, below, epoch, &[], epoch).await.unwrap();
         let dropped: HashSet<Hash> = swept.dropped.into_iter().collect();
         let want: Vec<Hash> = [0, 2, 3, 5].iter().map(|&i| objs[i].0).collect();
         assert_eq!(
@@ -1010,9 +1128,63 @@ mod tests {
         let (below, keep_from) = (log.end(), log.epoch());
         log.put(h2, b2.clone()).await.unwrap();
         log.next_epoch();
-        let swept = log.sweep(0, below, keep_from).await.unwrap();
+        let swept = log.sweep(0, below, keep_from, &[], keep_from).await.unwrap();
         assert_eq!(swept.dropped, vec![h1], "an append alone marks nothing");
         assert_eq!(log.get(&h2).await.unwrap(), Some(b2));
+    }
+
+    #[tokio::test]
+    async fn a_budget_keeps_the_wanted_records_read_last_and_never_the_marked_ones() {
+        use crate::ports::LocalImage;
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let big = |i: u8| {
+            let b = Bytes::from(vec![i; 20_000]);
+            (Hash::of(&b), b)
+        };
+        let objs: Vec<(Hash, Bytes)> = (1..=8).map(big).collect();
+        for (h, b) in &objs {
+            log.put(*h, b.clone()).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        let record = 20_000 + HEADER_LEN;
+        log.set_budget(4 * record + record / 2);
+        assert!(log.sweep_is_due(), "the log is over its budget");
+        log.next_epoch();
+        for i in [5, 2] {
+            log.get(&objs[i].0).await.unwrap();
+        }
+        let epoch = log.next_epoch();
+        assert!(log.mark(&objs[7].0, epoch));
+        let mut wanted: Vec<(u64, Hash)> = objs[..7]
+            .iter()
+            .map(|(h, _)| (log.used(h).unwrap(), *h))
+            .collect();
+        wanted.sort_by_key(|&(used, _)| std::cmp::Reverse(used));
+        let wanted: Vec<Hash> = wanted.into_iter().map(|(_, h)| h).collect();
+        let swept = log.sweep(0, log.end(), epoch, &wanted, epoch).await.unwrap();
+        assert_eq!(swept.kept, 3 * record, "the marked one and two read last fit");
+        assert!(!log.sweep_is_due());
+        for i in [2, 5, 7] {
+            assert_eq!(log.get(&objs[i].0).await.unwrap(), Some(objs[i].1.clone()));
+        }
+        for i in [0, 1, 3, 4, 6] {
+            assert!(!log.has(&objs[i].0), "object {i} goes");
+        }
+        assert!(fs.allocated(path).await.unwrap() <= 4 * record + 8 * PAGE);
+
+        log.set_budget(0);
+        let epoch = log.next_epoch();
+        let swept = log
+            .sweep(0, log.end(), epoch, &[objs[2].0, objs[5].0], epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            swept.dropped,
+            vec![objs[7].0],
+            "without a budget every wanted record stays"
+        );
     }
 
     #[tokio::test]
