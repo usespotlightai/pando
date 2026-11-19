@@ -75,6 +75,10 @@ const WINDOW: usize = 4 << 20;
 /// The bytes a shard writes before it starts their writeback. Commits drop the journal only
 /// after much more than this, so without it the dirty pages would fill a small memory cgroup.
 const WRITEBACK_BYTES: u64 = 2 << 20;
+/// The most bytes at a shard's end that may wait for the disk. Past it a shard waits for
+/// the disk before its next write: the daemon serves the device, so the kernel does not slow
+/// its writes when the dirty pages fill its memory cgroup.
+const BEHIND_BYTES: u64 = 4 << 20;
 /// Set in a record's length field: the record zeroes a whole chunk and carries no data.
 const ZERO_CHUNK: u32 = 1 << 31;
 
@@ -146,7 +150,7 @@ impl Shard {
                 )
             };
             let cut = if torn { self.file.set_len(at).await } else { Ok(()) };
-            let mut write_back = false;
+            let mut write_back = None;
             let done = match cut.and_then(|()| self.file.write_at_now(&batch, at)) {
                 Ok(()) => {
                     let mut q = self.queue.lock();
@@ -155,7 +159,7 @@ impl Shard {
                     q.unwritten += u64_from(batch.len());
                     if q.unwritten >= WRITEBACK_BYTES {
                         q.unwritten = 0;
-                        write_back = true;
+                        write_back = Some(q.end);
                     }
                     Ok(at)
                 }
@@ -168,8 +172,9 @@ impl Shard {
             for w in waiters {
                 let _ = w.send(done.clone());
             }
-            if write_back {
+            if let Some(end) = write_back {
                 self.file.start_writeback().await;
+                self.file.write_behind(end.saturating_sub(BEHIND_BYTES)).await;
             }
         }
     }

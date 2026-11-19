@@ -37,6 +37,17 @@ pub(crate) fn start_writeback(f: &File) {
     let _ = unsafe { libc::sync_file_range(f.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
 }
 
+pub(crate) fn write_behind(f: &File, below: u64) {
+    let Ok(n) = i64::try_from(below) else { return };
+    if n == 0 {
+        return;
+    }
+    let flags =
+        libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+    // SAFETY: sync_file_range only reads the descriptor, which `f` keeps open for the call.
+    let _ = unsafe { libc::sync_file_range(f.as_raw_fd(), 0, n, flags) };
+}
+
 pub(crate) fn advise(f: &File, offset: u64, len: u64, advice: Advice) {
     let advice = match advice {
         Advice::WillNeed => rustix::fs::Advice::WillNeed,

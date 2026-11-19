@@ -518,6 +518,8 @@ impl LocalFile for SimFile {
 
     async fn start_writeback(&self) {}
 
+    async fn write_behind(&self, _below: u64) {}
+
     fn advise(&self, _offset: u64, _len: u64, _advice: Advice) {}
 }
 
