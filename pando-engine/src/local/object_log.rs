@@ -84,13 +84,13 @@ struct Loc {
 }
 
 impl Loc {
-    fn new(off: u64, len: u32, ext: Option<(Arc<ExtFile>, u64)>, epoch: u64) -> Arc<Loc> {
+    fn new(off: u64, len: u32, ext: Option<(Arc<ExtFile>, u64)>) -> Arc<Loc> {
         Arc::new(Loc {
             off,
             len,
             touched: AtomicBool::new(false),
             ext,
-            mark: AtomicU64::new(epoch),
+            mark: AtomicU64::new(0),
             stored: Mutex::new(None),
         })
     }
@@ -362,7 +362,7 @@ impl ObjectLog {
                             break;
                         }
                     }
-                    self.index(h, Loc::new(off, len, Some((ext, ext_off)), 1));
+                    self.index(h, Loc::new(off, len, Some((ext, ext_off))));
                 }
             } else {
                 if off >= synced {
@@ -371,7 +371,7 @@ impl ObjectLog {
                         break;
                     }
                 }
-                self.index(h, Loc::new(off, n, None, 1));
+                self.index(h, Loc::new(off, n, None));
             }
             off = body + plen;
         }
@@ -403,10 +403,14 @@ impl ObjectLog {
 
     fn index(&self, h: Hash, loc: Arc<Loc>) {
         let mut m = self.shard(&h).write();
-        if m.get(&h).is_none_or(|old| old.dead()) {
-            m.insert(h, loc);
-        } else {
-            self.orphans.lock().push((loc.off, loc.end()));
+        match m.get(&h).filter(|old| !old.dead()) {
+            None => {
+                m.insert(h, loc);
+            }
+            Some(old) => {
+                old.mark.fetch_max(self.epoch(), Ordering::AcqRel);
+                self.orphans.lock().push((loc.off, loc.end()));
+            }
         }
     }
 
@@ -470,7 +474,7 @@ impl ObjectLog {
         let len =
             u32::try_from(b.len()).map_err(|_| Error::Corrupt(format!("object {h} of {} bytes", b.len())))?;
         let at = self.append(h, header(h, len), b).await?;
-        self.index(h, Loc::new(at, len, None, self.epoch()));
+        self.index(h, Loc::new(at, len, None));
         self.appended(u64::from(len) + HEADER_LEN);
         let n = self
             .unwritten
@@ -513,7 +517,7 @@ impl ObjectLog {
             .append(h, header(h, REF_FLAG | plen), Bytes::from(payload))
             .await?;
         let n = u64::from(plen) + HEADER_LEN;
-        self.index(h, Loc::new(at, len, Some((ext, offset)), self.epoch()));
+        self.index(h, Loc::new(at, len, Some((ext, offset))));
         self.appended(n);
         Ok(())
     }
@@ -972,6 +976,22 @@ mod tests {
         let (h, b) = big(9);
         again.put(h, b.clone()).await.unwrap();
         assert_eq!(again.get(&h).await.unwrap(), Some(b));
+    }
+
+    #[tokio::test]
+    async fn an_epoch_held_open_keeps_what_was_put_again_not_all_it_appended() {
+        let log = ObjectLog::open(Arc::new(SimFs::default()), Path::new("/c/objects"))
+            .await
+            .unwrap();
+        let ((h1, b1), (h2, b2)) = (obj(1), obj(2));
+        log.put(h1, b1).await.unwrap();
+        log.put(h2, b2.clone()).await.unwrap();
+        let (below, keep_from) = (log.end(), log.epoch());
+        log.put(h2, b2.clone()).await.unwrap();
+        log.next_epoch();
+        let swept = log.sweep(0, below, keep_from).await.unwrap();
+        assert_eq!(swept.dropped, vec![h1], "an append alone marks nothing");
+        assert_eq!(log.get(&h2).await.unwrap(), Some(b2));
     }
 
     #[tokio::test]
