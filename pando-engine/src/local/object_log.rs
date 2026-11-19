@@ -550,6 +550,11 @@ impl ObjectLog {
         Arc::clone(&self.due)
     }
 
+    /// Whether enough was appended since the last sweep that another is due.
+    pub(crate) fn sweep_is_due(&self) -> bool {
+        self.appended.load(Ordering::Acquire) >= self.sweep_after.load(Ordering::Acquire)
+    }
+
     /// Where the log ends; appends land at or past it.
     pub(crate) fn end(&self) -> u64 {
         self.end.load(Ordering::Acquire)
@@ -598,6 +603,8 @@ impl ObjectLog {
                 !dropped
             });
         }
+        self.appended.store(0, Ordering::Release);
+        self.sweep_after.store(kept.max(SWEEP_MIN), Ordering::Release);
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut recs: Vec<(u64, u64)> = gone.iter().map(|(_, l)| (l.off, l.end())).collect();
         recs.extend(std::mem::take(&mut *self.orphans.lock()));
@@ -629,8 +636,6 @@ impl ObjectLog {
                 freed += to - from;
             }
         }
-        self.appended.store(0, Ordering::Release);
-        self.sweep_after.store(kept.max(SWEEP_MIN), Ordering::Release);
         Ok(Swept { dropped, freed })
     }
 

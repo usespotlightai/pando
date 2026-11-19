@@ -215,7 +215,9 @@ impl Cache {
                 let Some(c) = weak.upgrade() else {
                     return;
                 };
-                let _ = c.sweep().await;
+                if c.log.sweep_is_due() {
+                    let _ = c.sweep().await;
+                }
             }
         });
     }
