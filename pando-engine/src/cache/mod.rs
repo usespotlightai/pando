@@ -139,7 +139,7 @@ impl Cache {
         dir: &Path,
     ) -> Result<Cache> {
         let log = ObjectLog::open(Arc::clone(&fs), &dir.join("objects")).await?;
-        let sweeper = sweep::Sweeper::open(Arc::clone(&fs), dir).await?;
+        let sweeper = sweep::Sweeper::open(Arc::clone(&fs), dir, log.end()).await?;
         let space = Space::open(fs, dir, "reserve", RESERVE).await?;
         Ok(Cache {
             remote,

@@ -76,6 +76,7 @@ const DIRTY_MAX: usize = 1 << 30;
 #[cfg(test)]
 const DIRTY_MAX: usize = 4 << 20;
 static ZEROS: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
+static UPLOADS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct Mem {
@@ -89,6 +90,9 @@ struct Mem {
     /// Every chunk written since the branch opened, so not the base image's any more.
     touched: HashSet<u64>,
     flushing: Option<Arc<BTreeMap<u64, Dirty>>>,
+    /// The last commit's chunks: a write that started from one may still hold what lay under
+    /// it, until the next commit takes the stripes.
+    flushed: Option<Arc<BTreeMap<u64, Dirty>>>,
     jfloor: u64,
     /// Dirty chunks whose bytes are also in a file that stays until they are published.
     dirty_ref: BTreeMap<u64, ChunkRef>,
@@ -119,6 +123,7 @@ impl Mem {
             dirty: DirtySet::default(),
             touched: HashSet::new(),
             flushing: None,
+            flushed: None,
             jfloor,
             dirty_ref: BTreeMap::new(),
             track: None,
@@ -225,6 +230,8 @@ struct Inner {
     fs: Arc<dyn LocalFs>,
     cpu: Arc<dyn Cpu>,
     writer: Arc<Writer>,
+    /// Tells this open's uploads apart from every other's in the cache.
+    uploads: u64,
     journal: Journal,
     state_path: PathBuf,
     state_lock: Mutex<Option<Box<dyn FileLock>>>,
@@ -295,10 +302,9 @@ impl Roots for Inner {
             all: true,
         });
         out.extend(m.persisted.iter().map(|&(e, depth)| pinned(e, depth)));
-        let flushing = m
-            .flushing
-            .iter()
-            .flat_map(|f| f.values().filter_map(Dirty::stored));
+        out.push(pinned(m.opened_now, m.tree.depth()));
+        let flushing =
+            (m.flushing.iter().chain(&m.flushed)).flat_map(|f| f.values().filter_map(Dirty::stored));
         out.extend(m.dirty.stored().chain(flushing).map(|&entry| Root {
             entry,
             height: 0,
@@ -384,6 +390,7 @@ impl Volume {
             fs: Arc::clone(&ports.fs),
             cpu: Arc::clone(&ports.cpu),
             writer: Arc::new(Writer::new(WriterId::new(name, generation), ports.rng.next_u32())),
+            uploads: UPLOADS.fetch_add(1, Ordering::Relaxed),
             journal,
             state_path,
             state_lock: Mutex::new(Some(state_lock)),
@@ -1504,6 +1511,7 @@ impl Inner {
             let mut m = self.mem.lock();
             let snap = Arc::new(m.dirty.take());
             m.flushing = Some(Arc::clone(&snap));
+            m.flushed = None;
             let root = pinned(m.root, m.tree.depth());
             (
                 (
@@ -1522,7 +1530,7 @@ impl Inner {
                 let (seq, size, after_unpersisted) = pin.finish(|| {
                     let mut m = self.mem.lock();
                     m.root = new_root;
-                    m.flushing = None;
+                    m.flushed = m.flushing.take();
                     m.jfloor = generation;
                     m.flush_seq += 1;
                     let seq = m.flush_seq;
@@ -1591,11 +1599,7 @@ impl Inner {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         for (_, e, _) in &mut done {
-            if let Some(l) = self
-                .cache
-                .stored(&e.hash)
-                .filter(|l| l.seg.writer() == self.writer.id())
-            {
+            if let Some(l) = self.cache.stored(&e.hash, self.uploads) {
                 e.loc = l;
             }
         }
@@ -1688,7 +1692,7 @@ impl Inner {
 
     /// Packs everything pending under the current local root and publishes it.
     async fn upload(&self) -> Result<()> {
-        let ((root, seq, tree, size), pin) = self.cache.pin(|| {
+        let ((root, seq, tree, size), pin) = self.cache.pin_roots(|| {
             let m = self.mem.lock();
             (
                 (m.root, m.flush_seq, Arc::clone(&m.tree), m.size),
@@ -1747,7 +1751,7 @@ impl Inner {
             }
         };
         let stats = p.stats();
-        self.cache.set_stored_all(p.added());
+        self.cache.set_stored_all(p.added(), self.uploads);
         record_learned(dedup.as_ref(), learner.as_ref(), &p).await;
         drop(p);
         pin.finish(|| {
@@ -1793,7 +1797,7 @@ impl Inner {
             Arc::clone(&self.writer),
             SEG_MAX,
         )
-        .with_stored(Arc::clone(&self.cache))
+        .with_stored(Arc::clone(&self.cache), self.uploads)
         .with_dedup(dedup, prepared)
         .with_gate(Arc::clone(&self.gate))
         .with_learner(learner)

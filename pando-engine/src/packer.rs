@@ -84,7 +84,7 @@ pub(crate) struct Packer {
     cpu: Arc<dyn Cpu>,
     writer: Arc<Writer>,
     seg_max: usize,
-    stored: Option<Arc<Cache>>,
+    stored: Option<(Arc<Cache>, u64)>,
     added: HashMap<Hash, Loc>,
     keys: HashMap<Hash, BlockKeys>,
     deps: BTreeSet<SegId>,
@@ -150,10 +150,10 @@ impl Packer {
         self
     }
 
-    /// Lets the objects `cache` says this writer uploaded already go up again only as their
-    /// locations.
-    pub(crate) fn with_stored(mut self, cache: Arc<Cache>) -> Packer {
-        self.stored = Some(cache);
+    /// Lets the objects `cache` says the uploads of `uploads` put already go up again only as
+    /// their locations.
+    pub(crate) fn with_stored(mut self, cache: Arc<Cache>, uploads: u64) -> Packer {
+        self.stored = Some((cache, uploads));
         self
     }
 
@@ -185,8 +185,8 @@ impl Packer {
 
     pub(crate) fn lookup(&self, h: &Hash) -> Option<Loc> {
         self.added.get(h).copied().or_else(|| {
-            let l = self.stored.as_ref()?.stored(h)?;
-            (l.seg.writer() == self.writer.id()).then_some(l)
+            let (c, uploads) = self.stored.as_ref()?;
+            c.stored(h, *uploads)
         })
     }
 
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_object_this_writer_stored_is_not_appended_again() {
+    async fn an_object_these_uploads_stored_is_not_appended_again() {
         let (ports, _, _) = sim::ports(2);
         let remote = Remote::new(Arc::clone(&ports.store));
         let cache = Arc::new(
@@ -457,25 +457,23 @@ mod tests {
             inner: 3,
             len: 1,
         };
+        let theirs = Loc {
+            seg: SegId::new(id, 9),
+            ..loc
+        };
         for o in [h, other] {
             cache.put_local(o, Bytes::from_static(b"x")).await.unwrap();
         }
-        cache.set_stored(&h, loc);
-        cache.set_stored(
-            &other,
-            Loc {
-                seg: SegId::new(WriterId::new("main", 2), 7),
-                ..loc
-            },
-        );
+        cache.set_stored_all(&HashMap::from([(h, loc)]), 1);
+        cache.set_stored_all(&HashMap::from([(other, theirs)]), 2);
         let writer = Arc::new(Writer::new(id, 0));
-        let mut p = Packer::new(remote, Arc::clone(&ports.cpu), writer, SEG_MAX).with_stored(cache);
+        let mut p = Packer::new(remote, Arc::clone(&ports.cpu), writer, SEG_MAX).with_stored(cache, 1);
         assert_eq!(p.append_object(h, b"x").await.unwrap(), loc);
         assert_eq!(p.stats().segments, 0);
         assert_ne!(
-            p.append_object(other, b"y").await.unwrap().seg.writer(),
-            WriterId::new("main", 2),
-            "another writer's upload goes up again"
+            p.append_object(other, b"y").await.unwrap(),
+            theirs,
+            "what another open of the branch uploaded goes up again"
         );
         p.finish().await.unwrap();
     }

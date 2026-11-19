@@ -1,5 +1,6 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use bytes::Bytes;
 use pando_format::{Hash, Loc as StoreLoc, u64_from, usize_from};
 use tokio::sync::Notify;
 
-use super::{read_file, take, write_atomic};
+use super::{read_file, take, write_atomic, write_durable};
 use crate::ports::{Advice, FileLock, LocalFile, LocalFs, Open};
 use crate::{Error, Result};
 
@@ -78,8 +79,8 @@ struct Loc {
     ext: Option<(Arc<ExtFile>, u64)>,
     /// The last epoch that marked the record or put its object again.
     mark: AtomicU64,
-    /// Where the store has the object, once an upload put it there.
-    stored: Mutex<Option<StoreLoc>>,
+    /// Where the store has the object, once an upload put it there, and whose upload.
+    stored: Mutex<Option<(u64, StoreLoc)>>,
 }
 
 impl Loc {
@@ -260,12 +261,59 @@ impl ObjectLog {
                 .unwrap_or(0),
             None => 0,
         };
+        log.redo_pads().await?;
         let end = log.scan(synced).await?;
         if end < log.file.size().await? {
             log.file.set_len(end).await?;
         }
         log.end.store(end, Ordering::Release);
         Ok(log)
+    }
+
+    /// `<log>.pads`: the padding a sweep writes over dropped records, recorded before it does,
+    /// so an open writes it again in full when a crash tore a header.
+    fn pads_path(&self) -> PathBuf {
+        let mut s = self.path.as_os_str().to_owned();
+        s.push(".pads");
+        PathBuf::from(s)
+    }
+
+    /// Writes padding over each run `[a, b)` of records and makes it durable.
+    async fn pad_runs(&self, runs: &[(u64, u64)]) -> Result<()> {
+        for &(a, b) in runs {
+            let len = u32::try_from(b - a - HEADER_LEN)
+                .map_err(|_| Error::Corrupt(format!("padding of {} bytes at {a}", b - a)))?;
+            self.file.write_at(vec![header(pad_hash(a, len), len)], a).await?;
+        }
+        self.file.sync_data().await?;
+        Ok(())
+    }
+
+    /// Writes again the padding a sweep recorded and may not have finished.
+    async fn redo_pads(&self) -> Result<()> {
+        let Some(b) = read_file(self.fs.as_ref(), &self.pads_path()).await? else {
+            return Ok(());
+        };
+        let corrupt = || Error::Corrupt(format!("{} does not parse", self.pads_path().display()));
+        let text = std::str::from_utf8(&b).map_err(|_| corrupt())?;
+        let mut runs = Vec::new();
+        for l in text.lines() {
+            let (a, b) = l.split_once(' ').ok_or_else(corrupt)?;
+            let (a, b): (u64, u64) = (
+                a.parse().map_err(|_| corrupt())?,
+                b.parse().map_err(|_| corrupt())?,
+            );
+            if b < a + HEADER_LEN {
+                return Err(corrupt());
+            }
+            runs.push((a, b));
+        }
+        if runs.is_empty() {
+            return Ok(());
+        }
+        self.pad_runs(&runs).await?;
+        write_durable(self.fs.as_ref(), &self.pads_path(), Bytes::new()).await?;
+        Ok(())
     }
 
     fn synced_path(&self) -> PathBuf {
@@ -516,30 +564,31 @@ impl ObjectLog {
             .is_some()
     }
 
-    /// Records that the store has object `h` at `l`.
-    pub(crate) fn set_stored(&self, h: &Hash, l: StoreLoc) {
+    /// Records where the store has object `h`, and whose upload put it there.
+    pub(crate) fn set_stored(&self, h: &Hash, l: (u64, StoreLoc)) {
         if let Some(x) = self.lookup(h) {
             *x.stored.lock() = Some(l);
         }
     }
 
-    /// Where the store has object `h`, when an upload recorded it.
-    pub(crate) fn stored(&self, h: &Hash) -> Option<StoreLoc> {
+    /// Where the store has object `h`, and whose upload put it there, when one recorded it.
+    pub(crate) fn stored(&self, h: &Hash) -> Option<(u64, StoreLoc)> {
         self.lookup(h).and_then(|l| *l.stored.lock())
     }
 
-    /// Drops every record that starts below `below` and was last marked before epoch
-    /// `keep_from`. Each run of dropped records becomes padding, and its pages are freed once
+    /// Drops every record that starts from `floor` and below `below` and was last marked
+    /// before epoch `keep_from`. Each run of dropped records becomes padding, and its pages are freed once
     /// the padding is durable and no read of a dropped record is left.
-    pub(crate) async fn sweep(&self, below: u64, keep_from: u64) -> Result<Swept> {
+    pub(crate) async fn sweep(&self, floor: u64, below: u64, keep_from: u64) -> Result<Swept> {
         let mut gone = Vec::new();
         let mut kept = 0;
         for s in &self.shards {
             s.write().retain(|h, l| {
-                let dropped = l.off < below && (l.mark.load(Ordering::Acquire) < keep_from || l.dead());
+                let dropped = (floor..below).contains(&l.off)
+                    && (l.mark.load(Ordering::Acquire) < keep_from || l.dead());
                 if dropped {
                     gone.push((*h, Arc::clone(l)));
-                } else if l.ext.is_none() {
+                } else if l.ext.is_none() && l.off >= floor {
                     kept += u64::from(l.len) + HEADER_LEN;
                 }
                 !dropped
@@ -561,12 +610,13 @@ impl ObjectLog {
             }
         }
         let dropped = gone.into_iter().map(|(h, _)| h).collect();
+        let mut planned = String::new();
         for &(a, b) in &runs {
-            let len = u32::try_from(b - a - HEADER_LEN)
-                .map_err(|_| Error::Corrupt(format!("padding of {} bytes at {a}", b - a)))?;
-            self.file.write_at(vec![header(pad_hash(a, len), len)], a).await?;
+            let _ = writeln!(planned, "{a} {b}");
         }
-        self.file.sync_data().await?;
+        write_durable(self.fs.as_ref(), &self.pads_path(), Bytes::from(planned)).await?;
+        self.pad_runs(&runs).await?;
+        write_durable(self.fs.as_ref(), &self.pads_path(), Bytes::new()).await?;
         let mut freed = 0;
         for (a, b) in runs {
             let (from, to) = ((a + HEADER_LEN).next_multiple_of(PAGE), b / PAGE * PAGE);
@@ -890,7 +940,7 @@ mod tests {
         let (late_h, late_b) = big(7);
         log.put(late_h, late_b.clone()).await.unwrap();
         let before = fs.allocated(path).await.unwrap();
-        let swept = log.sweep(below, epoch).await.unwrap();
+        let swept = log.sweep(0, below, epoch).await.unwrap();
         let dropped: HashSet<Hash> = swept.dropped.into_iter().collect();
         let want: Vec<Hash> = [0, 2, 3, 5].iter().map(|&i| objs[i].0).collect();
         assert_eq!(
@@ -922,6 +972,38 @@ mod tests {
         let (h, b) = big(9);
         again.put(h, b.clone()).await.unwrap();
         assert_eq!(again.get(&h).await.unwrap(), Some(b));
+    }
+
+    #[tokio::test]
+    async fn an_open_finishes_the_padding_a_sweep_recorded() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let ((h1, b1), (h2, b2), (h3, b3)) = (obj(1), obj(2), obj(3));
+        for (h, b) in [(h1, b1.clone()), (h2, b2), (h3, b3.clone())] {
+            log.put(h, b).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        let (a, b) = {
+            let l = log.lookup(&h2).unwrap();
+            (l.off, l.end())
+        };
+        drop(log);
+        write_durable(
+            &fs,
+            Path::new("/c/objects.pads"),
+            Bytes::from(format!("{a} {b}\n")),
+        )
+        .await
+        .unwrap();
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert!(!again.has(&h2), "the recorded run is padding");
+        assert_eq!(again.get(&h1).await.unwrap(), Some(b1));
+        assert_eq!(again.get(&h3).await.unwrap(), Some(b3));
+        assert_eq!(
+            read_file(&fs, Path::new("/c/objects.pads")).await.unwrap(),
+            Some(Bytes::new())
+        );
     }
 
     #[tokio::test]

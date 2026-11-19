@@ -39,13 +39,16 @@ pub(crate) trait Roots: Send + Sync {
 }
 
 struct Held {
-    at: u64,
-    epoch: u64,
+    /// Where the log ended and the epoch when the pin began, when it keeps what the
+    /// operation appends.
+    from: Option<(u64, u64)>,
     roots: Vec<Root>,
 }
 
 pub(super) struct Sweeper {
     fs: Arc<dyn LocalFs>,
+    /// Records below it are kept: they were in the log before it had the list of states.
+    floor: u64,
     /// Pins and roots change under its read lock; a sweep takes them under its write lock.
     gate: RwLock<()>,
     pins: Mutex<(u64, HashMap<u64, Held>)>,
@@ -66,20 +69,29 @@ impl std::fmt::Debug for Sweeper {
 }
 
 impl Sweeper {
-    /// The sweeper of the cache in `dir`, with the branch states it was told of there.
-    pub(super) async fn open(fs: Arc<dyn LocalFs>, dir: &Path) -> Result<Sweeper> {
+    /// The sweeper of the cache in `dir`, with the branch states it was told of there. A
+    /// cache without that list yet keeps every record below `end`, where its log ends: the
+    /// branches that wrote them are not on it.
+    pub(super) async fn open(fs: Arc<dyn LocalFs>, dir: &Path, end: u64) -> Result<Sweeper> {
         let states_path = dir.join("states");
-        let states = match read_file(fs.as_ref(), &states_path).await? {
-            Some(b) => std::str::from_utf8(&b)
-                .map_err(|_| Error::Corrupt(format!("{} is not text", states_path.display())))?
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(PathBuf::from)
-                .collect(),
-            None => BTreeSet::new(),
+        let corrupt = || Error::Corrupt(format!("{} does not parse", states_path.display()));
+        let (floor, states, new) = match read_file(fs.as_ref(), &states_path).await? {
+            Some(b) => {
+                let text = std::str::from_utf8(&b).map_err(|_| corrupt())?;
+                let mut lines = text.lines();
+                let floor = lines
+                    .next()
+                    .and_then(|l| l.strip_prefix("floor "))
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(corrupt)?;
+                let states = lines.filter(|l| !l.is_empty()).map(PathBuf::from).collect();
+                (floor, states, false)
+            }
+            None => (end, BTreeSet::new(), true),
         };
-        Ok(Sweeper {
+        let s = Sweeper {
             fs,
+            floor,
             gate: RwLock::default(),
             pins: Mutex::default(),
             users: Mutex::default(),
@@ -88,12 +100,16 @@ impl Sweeper {
             states_write: tokio::sync::Mutex::default(),
             started: AtomicBool::new(false),
             running: tokio::sync::Mutex::default(),
-        })
+        };
+        if new {
+            s.write_states().await?;
+        }
+        Ok(s)
     }
 
     async fn write_states(&self) -> Result<()> {
         let _w = self.states_write.lock().await;
-        let mut b = String::new();
+        let mut b = format!("floor {}\n", self.floor);
         for p in self.states.lock().iter() {
             b.push_str(&p.to_string_lossy());
             b.push('\n');
@@ -131,15 +147,13 @@ impl Drop for Pin {
     }
 }
 
-fn state_root(path: &Path, b: &[u8]) -> Result<Root> {
-    let s = VolState::decode(b)
-        .ok_or_else(|| Error::Corrupt(format!("the state {} does not parse", path.display())))?;
-    let size = s
-        .size
-        .ok_or_else(|| Error::Corrupt(format!("the state {} has no size", path.display())))?;
-    Ok(Root {
+/// The root a branch's state names. A state that does not parse, or has no size, resumes
+/// nothing that needs it.
+fn state_root(b: &[u8]) -> Option<Root> {
+    let s = VolState::decode(b)?;
+    Some(Root {
         entry: s.root,
-        height: depth_for(size.div_ceil(u64_from(CHUNK_SIZE))),
+        height: depth_for(s.size?.div_ceil(u64_from(CHUNK_SIZE))),
         all: false,
     })
 }
@@ -148,11 +162,20 @@ impl Cache {
     /// Runs `f`, which reads the roots an operation starts from, and pins them with what the
     /// operation appends from now on.
     pub(crate) fn pin<T>(self: &Arc<Self>, f: impl FnOnce() -> (T, Vec<Root>)) -> (T, Pin) {
+        self.pin_with(f, true)
+    }
+
+    /// [`Self::pin`] of the roots only, for an operation whose appends the store gets before
+    /// anything reads them from this host: an upload.
+    pub(crate) fn pin_roots<T>(self: &Arc<Self>, f: impl FnOnce() -> (T, Vec<Root>)) -> (T, Pin) {
+        self.pin_with(f, false)
+    }
+
+    fn pin_with<T>(self: &Arc<Self>, f: impl FnOnce() -> (T, Vec<Root>), appends: bool) -> (T, Pin) {
         let _g = self.sweeper.gate.read();
         let (t, roots) = f();
         let held = Held {
-            at: self.log.end(),
-            epoch: self.log.epoch(),
+            from: appends.then(|| (self.log.end(), self.log.epoch())),
             roots,
         };
         let mut pins = self.sweeper.pins.lock();
@@ -206,8 +229,9 @@ impl Cache {
             let epoch = self.log.next_epoch();
             let end = self.log.end();
             let pins = self.sweeper.pins.lock();
-            let below = pins.1.values().map(|p| p.at).min().unwrap_or(end).min(end);
-            let keep_from = pins.1.values().map(|p| p.epoch).min().unwrap_or(epoch).min(epoch);
+            let from = || pins.1.values().filter_map(|p| p.from);
+            let below = from().map(|(at, _)| at).min().unwrap_or(end).min(end);
+            let keep_from = from().map(|(_, e)| e).min().unwrap_or(epoch).min(epoch);
             let mut roots: Vec<Root> = pins.1.values().flat_map(|p| p.roots.iter().copied()).collect();
             drop(pins);
             let mut users = Vec::new();
@@ -236,12 +260,12 @@ impl Cache {
         let mut gone = Vec::new();
         for p in closed {
             match read_file(self.sweeper.fs.as_ref(), &p).await? {
-                Some(b) => roots.push(state_root(&p, &b)?),
+                Some(b) => roots.extend(state_root(&b)),
                 None => gone.push(p),
             }
         }
         self.mark(roots, epoch).await?;
-        let swept = self.log.sweep(below, keep_from).await?;
+        let swept = self.log.sweep(self.sweeper.floor, below, keep_from).await?;
         let dropped: HashSet<Hash> = swept.dropped.iter().copied().collect();
         for u in &users {
             u.forget(&dropped);
@@ -249,7 +273,15 @@ impl Cache {
         if !gone.is_empty() {
             {
                 let mut s = self.sweeper.states.lock();
-                for p in &gone {
+                let open: HashSet<PathBuf> = self
+                    .sweeper
+                    .users
+                    .lock()
+                    .iter()
+                    .filter(|(_, w)| w.strong_count() > 0)
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                for p in gone.iter().filter(|p| !open.contains(*p)) {
                     s.remove(p);
                 }
             }
@@ -287,24 +319,66 @@ impl Cache {
         Ok(())
     }
 
-    /// Where the store has object `h`, when an upload from this host recorded it.
-    pub(crate) fn stored(&self, h: &Hash) -> Option<pando_format::Loc> {
-        self.log.stored(h)
+    /// Where the store has object `h`, when the uploads of `uploads` recorded it.
+    pub(crate) fn stored(&self, h: &Hash, uploads: u64) -> Option<pando_format::Loc> {
+        self.log.stored(h).and_then(|(u, l)| (u == uploads).then_some(l))
     }
 
-    /// Records that the store has object `h` at `l`.
-    pub(crate) fn set_stored(&self, h: &Hash, l: pando_format::Loc) {
-        self.log.set_stored(h, l);
-    }
-
-    /// [`Self::set_stored`] for each object of an upload.
+    /// Records where the store has each object an upload of `uploads` put.
     #[expect(
         clippy::iter_over_hash_type,
         reason = "each object gets its own location, so the order does not matter"
     )]
-    pub(crate) fn set_stored_all(&self, added: &HashMap<Hash, pando_format::Loc>) {
+    pub(crate) fn set_stored_all(&self, added: &HashMap<Hash, pando_format::Loc>, uploads: u64) {
         for (h, l) in added {
-            self.log.set_stored(h, *l);
+            self.log.set_stored(h, (uploads, *l));
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "sim")]
+mod tests {
+    use super::*;
+    use crate::remote::Remote;
+    use crate::sim;
+
+    #[tokio::test]
+    async fn a_cache_from_before_the_list_of_states_keeps_its_records() {
+        let (ports, _, _) = sim::ports(3);
+        let open = || async {
+            Arc::new(
+                Cache::open_with(
+                    Arc::clone(&ports.fs),
+                    Arc::clone(&ports.cpu),
+                    Remote::new(Arc::clone(&ports.store)),
+                    Path::new("/c"),
+                )
+                .await
+                .unwrap(),
+            )
+        };
+        let c = open().await;
+        let (old, new) = (Bytes::from_static(b"old"), Bytes::from_static(b"new"));
+        c.put_local(Hash::of(&old), old.clone()).await.unwrap();
+        c.sync_local().await.unwrap();
+        drop(c);
+        ports.fs.remove(Path::new("/c/states")).await.unwrap();
+
+        let c = open().await;
+        c.put_local(Hash::of(&new), new.clone()).await.unwrap();
+        let swept = c.sweep().await.unwrap();
+        assert_eq!(
+            swept.dropped,
+            vec![Hash::of(&new)],
+            "only what came after the list goes"
+        );
+        assert_eq!(c.local(&Hash::of(&old)).await.unwrap(), Some(old));
+        drop(c);
+        let c = open().await;
+        assert!(
+            c.sweep().await.unwrap().dropped.is_empty(),
+            "the floor stays across opens"
+        );
     }
 }
