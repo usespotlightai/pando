@@ -88,6 +88,7 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
         return Err(crate::Error::RefExists(name.to_owned()));
     }
     let generation = 1;
+    let ((), _pin) = cache.pin(|| ((), Vec::new()));
     let tree = Tree::new(Arc::clone(cache), size.div_ceil(CHUNK));
     let cpu = Arc::clone(&ports.cpu);
     let mut chunks = futures::stream::iter(0..size.div_ceil(CHUNK))
@@ -123,13 +124,7 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
     cache.sync_local().await?;
     let root = tree.update(&Entry::EMPTY, &updates).await?;
     let writer = Arc::new(Writer::new(WriterId::new(name, generation), ports.rng.next_u32()));
-    let mut p = Packer::new(
-        remote.clone(),
-        Arc::clone(&ports.cpu),
-        writer,
-        SEG_MAX,
-        Arc::default(),
-    );
+    let mut p = Packer::new(remote.clone(), Arc::clone(&ports.cpu), writer, SEG_MAX);
     let metadata = pack_metadata(&f, cache, &updates, &mut p).await?;
     let packed = tree.pack(&root, &mut p).await?;
     p.finish().await?;

@@ -237,6 +237,11 @@ impl DirtySet {
         self.chunks.keys()
     }
 
+    /// The committed chunks the dirty chunks were written over.
+    pub(super) fn stored(&self) -> impl Iterator<Item = &Entry> {
+        self.chunks.values().filter_map(Dirty::stored)
+    }
+
     /// Makes chunk `idx` hold `d`, counting the bytes `d` holds.
     pub(super) fn insert(&mut self, idx: u64, d: Dirty) {
         self.bytes += d.held();

@@ -501,6 +501,17 @@ impl LocalFile for SimFile {
         })
     }
 
+    async fn punch(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.with(|d| {
+            let end = usize_from(offset + len).min(d.current.len());
+            let start = usize_from(offset).min(end);
+            d.current[start..end].fill(0);
+            let (first, last) = (u64_from(start).div_ceil(BLOCK), u64_from(end) / BLOCK);
+            d.blocks.retain(|b, _| *b < first || *b >= last);
+        });
+        Ok(())
+    }
+
     async fn size(&self) -> io::Result<u64> {
         Ok(self.with(|d| d.len()))
     }

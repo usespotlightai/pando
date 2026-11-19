@@ -11,6 +11,7 @@ mod kept;
 mod partial;
 mod recorder;
 mod sched;
+mod sweep;
 #[cfg(test)]
 #[cfg(feature = "sim")]
 mod tests;
@@ -26,6 +27,7 @@ use futures::future::BoxFuture;
 use pando_format::{Entry, Hash, SegId, SegmentIndex};
 pub(crate) use partial::{BaseKey, PartialBase};
 pub(crate) use sched::{FetchOpts, Sink};
+pub(crate) use sweep::{Root, Roots};
 
 use crate::flight::Flights;
 use crate::local::{ObjectLog, Space, WritebackHold};
@@ -81,6 +83,7 @@ pub struct Cache {
     bases: RwLock<HashMap<BaseKey, Arc<PartialBase>>>,
     recorder: Mutex<recorder::Recorder>,
     stats: CacheStats,
+    sweeper: sweep::Sweeper,
 }
 
 fn shared(e: Error) -> Arc<Error> {
@@ -136,6 +139,7 @@ impl Cache {
         dir: &Path,
     ) -> Result<Cache> {
         let log = ObjectLog::open(Arc::clone(&fs), &dir.join("objects")).await?;
+        let sweeper = sweep::Sweeper::open(Arc::clone(&fs), dir, log.end()).await?;
         let space = Space::open(fs, dir, "reserve", RESERVE).await?;
         Ok(Cache {
             remote,
@@ -152,6 +156,7 @@ impl Cache {
             bases: RwLock::default(),
             recorder: Mutex::default(),
             stats: CacheStats::default(),
+            sweeper,
         })
     }
 

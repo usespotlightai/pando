@@ -225,6 +225,19 @@ impl LocalFile for HostFile {
         .await
     }
 
+    async fn punch(&self, offset: u64, len: u64) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let f = Arc::clone(&self.file);
+            blocking(move || crate::linux::punch_hole(&f, offset, len)).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (offset, len);
+            Ok(())
+        }
+    }
+
     async fn size(&self) -> io::Result<u64> {
         let f = Arc::clone(&self.file);
         blocking(move || {
