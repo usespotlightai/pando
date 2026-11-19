@@ -50,11 +50,14 @@ recorded. Two background tasks then take it to the store:
 - The **uploader** packs pending chunks and tree nodes into segments and moves the ref. The ref's
   `log` line says which records its root covers; the shipper then deletes them.
 
-Writes wait in memory until a commit, so a commit also starts without a flush once 16 MiB of
-written chunks wait, and past 32 MiB a write that needs a new chunk buffer commits first. Such a
+A write goes to the journal, one local file per shard of chunks, and is acknowledged once the file
+has it, without a sync; memory keeps where in the journal each write is. A commit also starts
+without a flush once 256 MiB of written chunks wait, and past 1 GiB a write commits first. Such a
 commit is local only: it leaves the log to the uploader, as a flush does when 32 MiB of flushes
-already wait for the shipper. A daemon's memory for writes therefore stays bounded however much
-is written between flushes.
+already wait for the shipper. The daemon serves the device, so the kernel does not slow its own
+writes when its dirty pages fill its memory: a journal shard waits for the disk once it is more than
+4 MiB behind, and the cache log once it is more than 16 MiB behind. A daemon's memory for writes
+therefore stays bounded however much is written between flushes.
 
 An open that does not resume this host's own state reads the records the ref does not cover, from
 the ref's log position through the last writer's log, and applies them as writes. It seals each
@@ -70,6 +73,27 @@ With `--log behind`, the default, a flush returns once it is durable on the host
 creates its record within about 50 ms. With `--log strict`, a flush returns once its record is
 created or an upload published it; a strict branch cannot hand off to an image, since the kernel
 then flushes the image without Pando. With `--log off`, only uploads reach the store.
+
+## Cache log
+
+The cache log is one append-only file of the objects this host holds: the chunks and tree nodes
+it wrote, and those it fetched. Each commit appends new versions of the chunks it changed, so a
+sweep drops the old ones. A sweep runs once 1 GiB has been appended since the last one, or as many
+bytes as that sweep kept, if that is more. It keeps:
+
+- what each open branch reaches from its root, and the objects not yet uploaded under its saved
+  state;
+- what commits, grows, imports and uploads in flight start from, and what the commits, grows
+  and imports append or put again while they run;
+- the objects not yet uploaded under the saved state of each branch closed on this host.
+  `<cache>/states` lists those state files.
+
+It drops every other record. Over each run of dropped records it writes padding and syncs, then
+frees the pages with a hole punch: offsets stay and nothing is copied. An open finishes padding
+that a crash interrupted, and its scan skips padding. A sweep marks in an epoch of its own, older
+than the one later puts use, so a commit that starts after a sweep keeps only what it puts again.
+Under constant random writes, the log stays near the live data plus the trees that uploads in
+flight still need.
 
 ## Host daemon
 
