@@ -1,19 +1,4 @@
 system,workspace,measure,rep,value,unit,notes
-Pando,small,cold.git_status,1,2.60016,s,rep 1
-Pando,small,cold.open,1,0.781722,s,rep 1
-Pando,small,cold.status,1,1.81844,s,rep 1
-Pando,small,cold.git_status,2,1.16583,s,rep 2
-Pando,small,cold.open,2,0.599815,s,rep 2
-Pando,small,cold.status,2,0.566012,s,rep 2
-Pando,small,cold.git_status,3,1.22929,s,rep 3
-Pando,small,cold.open,3,0.663439,s,rep 3
-Pando,small,cold.status,3,0.565849,s,rep 3
-Pando,small,cold.git_status,4,1.19264,s,rep 4
-Pando,small,cold.open,4,0.626765,s,rep 4
-Pando,small,cold.status,4,0.565874,s,rep 4
-Pando,small,cold.git_status,5,1.15207,s,rep 5
-Pando,small,cold.open,5,0.586135,s,rep 5
-Pando,small,cold.status,5,0.565937,s,rep 5
 tar from S3,small,cold.git_status,1,4.48324,s,rep 1
 tar from S3,small,cold.open,1,4.31873,s,rep 1
 tar from S3,small,cold.status,1,0.164517,s,rep 1
@@ -89,21 +74,6 @@ JuiceFS,small,cold.status,4,217.912,s,rep 4
 JuiceFS,small,cold.git_status,5,233.169,s,rep 5
 JuiceFS,small,cold.open,5,13.4658,s,rep 5
 JuiceFS,small,cold.status,5,219.704,s,rep 5
-Pando (handoff),small,cold.git_status,1,2.25118,s,rep 1
-Pando (handoff),small,cold.open,1,0.832803,s,rep 1
-Pando (handoff),small,cold.status,1,1.41838,s,rep 1
-Pando (handoff),small,cold.git_status,2,1.20555,s,rep 2
-Pando (handoff),small,cold.open,2,0.639716,s,rep 2
-Pando (handoff),small,cold.status,2,0.565839,s,rep 2
-Pando (handoff),small,cold.git_status,3,1.18607,s,rep 3
-Pando (handoff),small,cold.open,3,0.670368,s,rep 3
-Pando (handoff),small,cold.status,3,0.515704,s,rep 3
-Pando (handoff),small,cold.git_status,4,0.934495,s,rep 4
-Pando (handoff),small,cold.open,4,0.669186,s,rep 4
-Pando (handoff),small,cold.status,4,0.265309,s,rep 4
-Pando (handoff),small,cold.git_status,5,1.15589,s,rep 5
-Pando (handoff),small,cold.open,5,0.589585,s,rep 5
-Pando (handoff),small,cold.status,5,0.56631,s,rep 5
 SOCI lazy pull,small,cold.git_status,1,6.74074,s,rep 1
 SOCI lazy pull,small,cold.open,1,3.42062,s,rep 1
 SOCI lazy pull,small,cold.status,1,3.32013,s,rep 1
@@ -158,3 +128,33 @@ Amazon S3 Files,small,cold.status,2,35.041,s,rep 2
 Amazon S3 Files,small,cold.git_status,3,209.394,s,rep 3
 Amazon S3 Files,small,cold.open,3,172.158,s,rep 3
 Amazon S3 Files,small,cold.status,3,37.2365,s,rep 3
+Pando,small,cold.git_status,1,2.83398,s,rep 1
+Pando,small,cold.open,1,0.864882,s,rep 1
+Pando,small,cold.status,1,1.9691,s,rep 1
+Pando,small,cold.git_status,2,1.16362,s,rep 2
+Pando,small,cold.open,2,0.597297,s,rep 2
+Pando,small,cold.status,2,0.566319,s,rep 2
+Pando,small,cold.git_status,3,1.24908,s,rep 3
+Pando,small,cold.open,3,0.733268,s,rep 3
+Pando,small,cold.status,3,0.515807,s,rep 3
+Pando,small,cold.git_status,4,1.22425,s,rep 4
+Pando,small,cold.open,4,0.708305,s,rep 4
+Pando,small,cold.status,4,0.515946,s,rep 4
+Pando,small,cold.git_status,5,1.18107,s,rep 5
+Pando,small,cold.open,5,0.665179,s,rep 5
+Pando,small,cold.status,5,0.515895,s,rep 5
+Pando (handoff),small,cold.git_status,1,2.32316,s,rep 1
+Pando (handoff),small,cold.open,1,0.805022,s,rep 1
+Pando (handoff),small,cold.status,1,1.51814,s,rep 1
+Pando (handoff),small,cold.git_status,2,1.18622,s,rep 2
+Pando (handoff),small,cold.open,2,0.670892,s,rep 2
+Pando (handoff),small,cold.status,2,0.515328,s,rep 2
+Pando (handoff),small,cold.git_status,3,1.22329,s,rep 3
+Pando (handoff),small,cold.open,3,0.708101,s,rep 3
+Pando (handoff),small,cold.status,3,0.515192,s,rep 3
+Pando (handoff),small,cold.git_status,4,1.21077,s,rep 4
+Pando (handoff),small,cold.open,4,0.695459,s,rep 4
+Pando (handoff),small,cold.status,4,0.515315,s,rep 4
+Pando (handoff),small,cold.git_status,5,1.21142,s,rep 5
+Pando (handoff),small,cold.open,5,0.696176,s,rep 5
+Pando (handoff),small,cold.status,5,0.515244,s,rep 5

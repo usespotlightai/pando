@@ -8,7 +8,8 @@
 #   bench/run.sh crash-reboot start | check | clean [--rep R]   crash survival across a reboot;
 #                              start reboots the host, check runs once it is back
 # Results go to $PANDO_BENCH_RESULTS (default /data/results). Pando's store keys, when the
-# workflow passed them, are in the file named by PANDO_ENV_FILE and are never printed.
+# workflow passed them, are in the file named by PANDO_ENV_FILE and are never printed; that file
+# may instead hold S3_CREDENTIALS=instance, for the host role.
 set -euo pipefail
 
 set -a
@@ -79,6 +80,7 @@ store_keys_work() {
 		# shellcheck source=/dev/null
 		. "$PANDO_ENV_FILE"
 		set +a
+		[[ ${S3_CREDENTIALS:-} == instance ]] && exec aws s3api head-bucket --bucket "$S3_BUCKET" --region "$S3_REGION"
 		env -u AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID?}" \
 			AWS_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY?}" \
 			aws s3api head-bucket --bucket "$S3_BUCKET" --region "$S3_REGION"
@@ -123,7 +125,7 @@ smoke() {
 	if [[ $PANDO_BENCH_HOST == a ]]; then
 		check "EBS volume attached" sh -c "lsblk -dn -o SERIAL | grep -q '${PANDO_BENCH_EBS_VOLUME/-/}'"
 	fi
-	check "Pando store keys" store_keys_work
+	check "Pando store credentials" store_keys_work
 	if [[ $failed -eq 0 ]]; then
 		echo "smoke: ready"
 	else
