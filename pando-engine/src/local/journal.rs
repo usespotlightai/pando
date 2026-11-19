@@ -72,6 +72,9 @@ const HEADER: usize = 16;
 const SHARDS: usize = 16;
 /// The bytes a replay reads at once.
 const WINDOW: usize = 4 << 20;
+/// The bytes a shard writes before it starts their writeback. Commits drop the journal only
+/// after much more than this, so without it the dirty pages would fill a small memory cgroup.
+const WRITEBACK_BYTES: u64 = 2 << 20;
 /// Set in a record's length field: the record zeroes a whole chunk and carries no data.
 const ZERO_CHUNK: u32 = 1 << 31;
 
@@ -117,6 +120,8 @@ struct Queue {
     waiters: Vec<oneshot::Sender<Result<u64, Arc<Error>>>>,
     writing: bool,
     torn: bool,
+    /// The bytes written since the last writeback started.
+    unwritten: u64,
 }
 
 impl Shard {
@@ -141,11 +146,17 @@ impl Shard {
                 )
             };
             let cut = if torn { self.file.set_len(at).await } else { Ok(()) };
+            let mut write_back = false;
             let done = match cut.and_then(|()| self.file.write_at_now(&batch, at)) {
                 Ok(()) => {
                     let mut q = self.queue.lock();
                     q.end += u64_from(batch.len());
                     q.torn = false;
+                    q.unwritten += u64_from(batch.len());
+                    if q.unwritten >= WRITEBACK_BYTES {
+                        q.unwritten = 0;
+                        write_back = true;
+                    }
                     Ok(at)
                 }
                 Err(e) => {
@@ -156,6 +167,9 @@ impl Shard {
             };
             for w in waiters {
                 let _ = w.send(done.clone());
+            }
+            if write_back {
+                self.file.start_writeback().await;
             }
         }
     }
