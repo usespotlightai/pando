@@ -258,7 +258,7 @@ pub(crate) async fn detach(_: DetachArgs, _: &crate::Out) -> anyhow::Result<()> 
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn supported(_: &AttachArgs) -> anyhow::Result<()> {
+pub(crate) async fn supported(_: &AttachArgs) -> anyhow::Result<()> {
     Err(crate::exit::Unsupported("attach needs Linux".into()).into())
 }
 
@@ -449,7 +449,7 @@ mod linux {
                 "branch": a.name,
                 "device": device,
                 "dm": a.dm.as_ref().map(|_| mounted),
-                "mount": mounted,
+                "block_device": mounted,
                 "generation": att.volume().generation(),
                 "rejoined": att.rejoined(),
                 "recovered": recovered,
@@ -477,7 +477,7 @@ mod linux {
                 "device": fe.device(),
                 "fuse": dir,
                 "file": fe.file(),
-                "mount": fe.device(),
+                "block_device": fe.device(),
                 "direct_io": fe.direct_io(),
                 "generation": att.volume().generation(),
                 "rejoined": att.rejoined(),
@@ -1076,7 +1076,10 @@ mod linux {
         let v = att.volume();
         let lag = v.upload_lag();
         let stopped = v.upload_error().map_or_default(|e| one_line(&e.to_string()));
-        let unuploaded = v.unuploaded_bytes().await.unwrap_or_default();
+        let unuploaded = v
+            .unuploaded_bytes()
+            .await
+            .map_or_else(|_| "-".to_owned(), |n| n.to_string());
         let state = if v.upload_error().is_some() {
             "uploads-stopped"
         } else if v.disk_full().await {
@@ -1131,7 +1134,10 @@ mod linux {
                     };
                     if let [generation, unuploaded, cache, stopped] = rest {
                         st.generation = Some(number("generation", generation)?);
-                        st.unuploaded = Some(number("bytes not uploaded", unuploaded)?);
+                        st.unuploaded = match *unuploaded {
+                            "-" => None,
+                            n => Some(number("bytes not uploaded", n)?),
+                        };
                         st.cache = Some(number("cache bytes", cache)?);
                         st.stopped = (!stopped.is_empty()).then(|| (*stopped).to_owned());
                     }
@@ -1527,9 +1533,9 @@ mod linux {
         Standing::parse(line.trim_end_matches('\n'))
     }
 
-    /// Fails with [`Unsupported`] when this host lacks a device node `a` needs, before the
-    /// attach touches the store.
-    pub(crate) fn supported(a: &AttachArgs) -> Result<()> {
+    /// Fails with [`Unsupported`] when this host lacks a device node `a` needs, or ublk lacks
+    /// user recovery, before the attach touches the store.
+    pub(crate) async fn supported(a: &AttachArgs) -> Result<()> {
         let needs: &[&str] = if a.fuse.is_some() {
             &["fuse", "loop"]
         } else if a.dm.is_some() {
@@ -1542,8 +1548,15 @@ mod linux {
                 return Err(Unsupported(format!("{} is missing: {}", c.node, c.fix)).into());
             }
         }
+        if a.fuse.is_none() && matches!(pando_linux::user_recovery().await, Ok(false)) {
+            return Err(Unsupported(format!("ublk lacks user recovery with reissue: {RECOVERY_FIX}")).into());
+        }
         Ok(())
     }
+
+    /// What to do when ublk lacks user recovery, which every `attach --device` asks for.
+    const RECOVERY_FIX: &str =
+        "use Linux 6.0 or later, so a crash or an upgrade takes the device over without failing its I/O";
 
     /// A device node an attach needs, and what to do when it is missing.
     struct Check {
@@ -1594,18 +1607,8 @@ mod linux {
         } else {
             (false, "no ublk".to_owned())
         };
-        report(
-            out,
-            "user-recovery",
-            recovery.0,
-            &recovery.1,
-            "use Linux 6.0 or later, so a crash or an upgrade takes the device over without \
-             failing its I/O",
-        );
-        let root = std::fs::metadata("/proc/self").is_ok_and(|m| {
-            use std::os::unix::fs::MetadataExt;
-            m.uid() == 0
-        });
+        report(out, "user-recovery", recovery.0, &recovery.1, RECOVERY_FIX);
+        let root = rustix::process::geteuid().is_root();
         report(out, "root", root, "runs as root", "run attach and detach as root");
         let ublk = ok["ublk"] && recovery.0 && root;
         let fuse = ok["fuse"] && ok["loop"] && root;

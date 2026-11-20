@@ -29,26 +29,27 @@ drained prints `drained` instead:
 | 3 | `in-use` | Another process holds the device, mount or cache: a mounted device at `detach`, a live daemon at `attach --recover`, a cache another `pando` has open. Nothing changed. |
 | 4 | `store-unreachable` | The store did not answer, or kept failing in a way a retry may fix, after the retries of the store client (about three minutes). |
 | 5 | `fenced` | Another writer took the branch; this writer stopped. |
-| 6 | `unsupported` | This host lacks what the command needs, such as ublk for `attach --device`. `attach` checks this before it touches the store. |
+| 6 | `unsupported` | This host lacks what the command needs, such as ublk, or its user recovery, for `attach --device`. `attach` checks this before it touches the store. |
 | 75 | `try-again` | The work goes on and ends later: an attach drained on SIGTERM and left its device to the next `attach --recover`, or a `detach` ran out of `--publish-wait` while the daemon still publishes. |
 
 ## Readiness
 
 `attach` prints its `attached` line once the device serves: a program may then make or mount the
-file system on `mount`. Under systemd with `Type=notify` the attach also sends `READY=1` then.
+file system on `block_device`. Under systemd with `Type=notify` the attach also sends `READY=1`
+then.
 
 ## Events
 
 ### attach
 
 ```json
-{"branch":"task-1","device":"/dev/ublkb1","dm":null,"event":"attached","generation":4,"mount":"/dev/ublkb1","recovered":false,"rejoined":false,"took_ms":312}
+{"block_device":"/dev/ublkb1","branch":"task-1","device":"/dev/ublkb1","dm":null,"event":"attached","generation":4,"recovered":false,"rejoined":false,"took_ms":312}
 ```
 
-- `attached`: the device serves. `mount` is the device to make and mount the file system on: the
-  device-mapper device with `--dm`, else `device`. `generation` is this writer's generation, one
-  past the ref's when it opened. `recovered` is true when it took the device over from a daemon
-  that died; `rejoined` when it kept the local image a drained daemon left. With `--fuse`,
+- `attached`: the device serves. `block_device` is the device to make and mount the file system
+  on: the device-mapper device with `--dm`, else `device`. `generation` is this writer's
+  generation, one past the ref's when it opened. `recovered` is true when it took the device over
+  from a daemon that died; `rejoined` when it kept the local image a drained daemon left. With `--fuse`,
   `device` is the loop device and the line also has `fuse`, `file` and `direct_io`.
 - `state`: how the branch stands changed. `state` is `serving`, `lagging` (uploads are a minute
   behind the flushes, as while the store is unreachable), `disk-full` (the cache's disk is
@@ -77,9 +78,10 @@ One line per attached branch on this host, or for the one `--device` or `--fuse`
 ```
 
 `state` is as in `attach`'s `state` line, and `degraded` is true for any state but `serving`.
-`unuploaded_bytes` counts the 64 KiB chunks flushed but not yet in the store; `cache_bytes` is the
-disk the cache's object log takes; `error` is why uploads stopped. `status` asks each daemon on
-its control socket, so it works while the branch's cache is open. A daemon of an earlier release
+`unuploaded_bytes` counts the 64 KiB chunks flushed but not yet in the store, or is null when the
+daemon could not count them; `cache_bytes` is the disk the cache's object log takes; `error` is
+why uploads stopped. `status` asks each daemon on its control socket, so it works while the
+branch's cache is open. A daemon of an earlier release
 leaves `generation`, `unuploaded_bytes`, `cache_bytes` and `error` null.
 
 ### check-host

@@ -529,7 +529,7 @@ async fn start(cli: Cli) -> Result<Exit> {
 /// Runs one command on `host`, writing its output to `out`.
 pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> {
     if let Command::Attach(a) = &command {
-        device::supported(a)?;
+        device::supported(a).await?;
     }
     host.prepare(&command).await?;
     let ports = &host.ports;

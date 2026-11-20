@@ -55,6 +55,7 @@ fn check_host_reports_each_check_then_whether_attach_works() {
 #[test]
 fn attach_without_ublk_fails_as_unsupported_before_it_touches_the_store() {
     if Path::new("/dev/ublk-control").exists() {
+        eprintln!("skipped: this host has ublk; CI's test container, which has none, runs this test");
         return;
     }
     let cache = tempfile::tempdir().unwrap();

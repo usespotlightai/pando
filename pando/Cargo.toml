@@ -19,6 +19,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pando-linux.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
