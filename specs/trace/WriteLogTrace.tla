@@ -21,7 +21,7 @@ VARIABLES ref, store, disk, proc, nextId, opens, advances, acked, histories, i
 vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, i>>
 
 WL == INSTANCE WriteLog WITH Hosts <- TraceHosts, Modes <- {"behind", "strict"},
-                             MaxFlushes <- TraceFlushes, MaxOpens <- TraceOpens,
+                             MaxWrites <- TraceWrites, MaxOpens <- TraceOpens,
                              MaxAdvances <- TraceAdvances, Depth <- 0
 
 Init == WL!Init /\ i = 0
@@ -88,7 +88,8 @@ Observe(e) ==
                 \/ p.gen = e.g /\ WL!TrimOwn(h, e.n)
                 \/ WL!TrimDeleteOlder(h, <<e.g, e.n>>)
          [] e.op = "list_log" -> WL!TrimListOlder(h)
-         [] e.op = "flush" -> WL!Flush(h, TRUE)
+         [] e.op = "write" -> \E kept \in BOOLEAN : WL!Write(h, kept)
+         [] e.op = "flush" -> WL!Commit(h, TRUE, TRUE)
          [] e.op = "stop" -> WL!Stop(h)
          [] e.op = "lose" -> WL!Lose(h)
 
@@ -96,7 +97,8 @@ Hidden ==
     /\ UNCHANGED i
     /\ \E h \in TraceHosts :
         \/ WL!Replay(h)
-        \/ \E to \in 1..TraceFlushes + 1 : WL!ShipBatch(h, to)
+        \/ WL!Commit(h, TRUE, FALSE)
+        \/ \E to \in 1..TraceWrites + 1 : WL!ShipBatch(h, to)
         \/ WL!ShipNumber(h)
         \/ WL!ShipCovered(h)
         \/ WL!ShipFence(h)
