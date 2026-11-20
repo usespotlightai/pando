@@ -242,12 +242,13 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
     })
 }
 
-/// Parses sizes such as `4096`, `512M` and `8G`: bytes, or a number with K, M, G or T in
-/// powers of 1024.
+/// [`parse_size`] for clap, which takes the error as text.
 fn parse_cache_budget(s: &str) -> Result<u64, String> {
     parse_size(s).map_err(|e| format!("{e:#}"))
 }
 
+/// Parses sizes such as `4096`, `512M` and `8G`: bytes, or a number with K, M, G or T in
+/// powers of 1024.
 pub(crate) fn parse_size(s: &str) -> Result<u64> {
     let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (n, unit) = s.split_at(at);

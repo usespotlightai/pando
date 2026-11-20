@@ -36,6 +36,9 @@ pub(crate) struct Root {
     pub(crate) all: bool,
 }
 
+/// How long the sweeper waits before it runs a failed sweep again.
+const SWEEP_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A user of the cache with roots of its own.
 pub(crate) trait Roots: Send + Sync {
     /// Adds the roots whose objects must stay on this host to `out`.
@@ -223,7 +226,8 @@ impl Cache {
     }
 
     /// Starts the task that sweeps the object log whenever enough was appended since the last
-    /// sweep.
+    /// sweep. A sweep that fails while one is still due runs again after [`SWEEP_RETRY`],
+    /// without waiting for another append.
     pub(crate) fn start_sweeps(self: &Arc<Self>) {
         if self.sweeper.started.swap(true, Ordering::AcqRel) {
             return;
@@ -233,11 +237,15 @@ impl Cache {
         tokio::spawn(async move {
             loop {
                 due.notified().await;
-                let Some(c) = weak.upgrade() else {
-                    return;
-                };
-                if c.log.sweep_is_due() {
-                    let _ = c.sweep().await;
+                loop {
+                    let Some(c) = weak.upgrade() else {
+                        return;
+                    };
+                    if !c.log.sweep_is_due() || c.sweep().await.is_ok() {
+                        break;
+                    }
+                    drop(c);
+                    tokio::time::sleep(SWEEP_RETRY).await;
                 }
             }
         });
@@ -401,8 +409,8 @@ impl Cache {
 
     /// Waits, while the object log is more than a quarter past its budget, for the sweep under
     /// way or due to end, so fetches cannot outrun sweeps that are slow to sync the log. It
-    /// waits for one sweep at most: when what is not uploaded keeps the log past the budget,
-    /// fetches go on.
+    /// waits for one sweep at most, failed or not: when what is not uploaded keeps the log past
+    /// the budget, fetches go on.
     pub(crate) async fn room_for_fetch(&self) {
         let budget = self.log.budget();
         if budget == 0
@@ -537,6 +545,51 @@ mod tests {
             .unwrap();
         assert!(c.log_bytes() <= 4000);
         c.room_for_fetch().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_sweep_runs_again_and_ends_the_wait_of_a_fetch() {
+        let (ports, _, _) = sim::ports(3);
+        let c = Arc::new(
+            Cache::open_with(
+                Arc::clone(&ports.fs),
+                Arc::clone(&ports.cpu),
+                Remote::new(Arc::clone(&ports.store)),
+                Path::new("/c"),
+            )
+            .await
+            .unwrap(),
+        );
+        for i in 0..10u8 {
+            let b = Bytes::from(vec![i; 1000]);
+            c.put_local(Hash::of(&b), b).await.unwrap();
+        }
+        let bad = Bytes::from_static(b"not a node");
+        let h = Hash::of(&bad);
+        c.put_local(h, bad).await.unwrap();
+        let root = Root {
+            entry: Entry {
+                hash: h,
+                loc: Entry::EMPTY.loc,
+            },
+            height: 1,
+            all: true,
+        };
+        let ((), held) = c.pin_roots(|| ((), vec![root]));
+        assert!(c.sweep().await.is_err(), "the pinned node does not decode");
+
+        c.start_sweeps();
+        c.set_budget(4000);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(c.log.sweep_is_due(), "a failed sweep leaves one due");
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.room_for_fetch())
+            .await
+            .expect("the sweep run again ends the wait");
+
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(!c.log.sweep_is_due());
+        assert!(c.log_bytes() <= 4000, "a sweep ran again with no append");
     }
 
     #[tokio::test]

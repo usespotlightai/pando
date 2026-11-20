@@ -71,6 +71,9 @@ pub(crate) struct ObjectLog {
     behind: tokio::sync::Mutex<()>,
     holds: AtomicU32,
     epoch: AtomicU64,
+    /// Counts the objects appended. A read stamps its object with it, so the order of reads
+    /// between two sweeps shows apart from the reads between two appends.
+    clock: AtomicU64,
     /// Bytes appended since the last sweep, and how many make the next one due.
     appended: AtomicU64,
     sweep_after: AtomicU64,
@@ -111,7 +114,7 @@ struct Loc {
     ext: Option<(Arc<ExtFile>, u64)>,
     /// The last epoch that marked the record or put its object again.
     mark: AtomicU64,
-    /// The epoch of the last read of the object or put of it.
+    /// The log's clock at the last read of the object or put of it.
     used: AtomicU64,
     /// Where the store has the object, once an upload put it there, and whose upload.
     stored: Mutex<Option<(u64, StoreLoc)>>,
@@ -139,11 +142,12 @@ impl Loc {
         self.off + HEADER_LEN + body
     }
 
-    /// Records a read or put of the object in `epoch`. Most reads find it there already, so
-    /// they only load it, and a chunk many readers share is not written by each of them.
-    fn used_in(&self, epoch: u64) {
-        if self.used.load(Ordering::Relaxed) < epoch {
-            self.used.fetch_max(epoch, Ordering::AcqRel);
+    /// Records a read or put of the object at `tick` of the log's clock. Most reads find it
+    /// there already, so they only load it, and a chunk many readers share is not written by
+    /// each of them.
+    fn used_at(&self, tick: u64) {
+        if self.used.load(Ordering::Relaxed) < tick {
+            self.used.fetch_max(tick, Ordering::AcqRel);
         }
     }
 
@@ -315,6 +319,7 @@ impl ObjectLog {
             behind: tokio::sync::Mutex::new(()),
             holds: AtomicU32::new(0),
             epoch: AtomicU64::new(1),
+            clock: AtomicU64::new(0),
             appended: AtomicU64::new(0),
             sweep_after: AtomicU64::new(SWEEP_MIN),
             due: Arc::default(),
@@ -395,7 +400,8 @@ impl ObjectLog {
         Ok(())
     }
 
-    /// Appends `lines` to `<log>.pads` and makes them durable.
+    /// Appends `lines` to `<log>.pads` and makes them durable, cutting off what a failed append
+    /// left past them.
     async fn list_pads(&self, p: &mut Pads, lines: &str) -> Result<()> {
         let f = if let Some(f) = &p.file {
             Arc::clone(f)
@@ -415,6 +421,10 @@ impl ObjectLog {
             u64_from(p.text.len()),
         )
         .await?;
+        let end = u64_from(p.text.len() + lines.len());
+        if f.size().await? > end {
+            f.set_len(end).await?;
+        }
         f.sync_data().await?;
         p.text.push_str(lines);
         Ok(())
@@ -598,7 +608,7 @@ impl ObjectLog {
         let len =
             u32::try_from(b.len()).map_err(|_| Error::Corrupt(format!("object {h} of {} bytes", b.len())))?;
         let at = self.append(h, header(h, len), b).await?;
-        self.index(h, Loc::new(at, len, None, self.epoch()));
+        self.index(h, Loc::new(at, len, None, self.tick()));
         self.live.fetch_add(u64::from(len) + HEADER_LEN, Ordering::AcqRel);
         self.appended(u64::from(len) + HEADER_LEN);
         let n = self
@@ -642,7 +652,7 @@ impl ObjectLog {
             .append(h, header(h, REF_FLAG | plen), Bytes::from(payload))
             .await?;
         let n = u64::from(plen) + HEADER_LEN;
-        self.index(h, Loc::new(at, len, Some((ext, offset)), self.epoch()));
+        self.index(h, Loc::new(at, len, Some((ext, offset)), self.tick()));
         self.appended(n);
         Ok(())
     }
@@ -652,13 +662,23 @@ impl ObjectLog {
         self.epoch.load(Ordering::Acquire)
     }
 
+    /// The log's clock now.
+    fn now(&self) -> u64 {
+        self.clock.load(Ordering::Acquire)
+    }
+
+    /// Advances the log's clock for an object appended, and returns the new reading.
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
     /// Marks object `h` in the current epoch when the log has it.
     fn touch(&self, h: &Hash) -> bool {
         let m = self.shard(h).read();
         match m.get(h).filter(|l| !l.dead()) {
             Some(l) => {
                 l.mark.fetch_max(self.epoch(), Ordering::AcqRel);
-                l.used_in(self.epoch());
+                l.used_at(self.now());
                 true
             }
             None => false,
@@ -705,7 +725,8 @@ impl ObjectLog {
         self.live.load(Ordering::Acquire)
     }
 
-    /// The epoch of the last read or put of object `h`, when the log has it.
+    /// The log's clock at the last read or put of object `h`, when the log has it; a later read
+    /// has a reading at least as high.
     pub(crate) fn used(&self, h: &Hash) -> Option<u64> {
         self.lookup(h).map(|l| l.used.load(Ordering::Acquire))
     }
@@ -746,7 +767,8 @@ impl ObjectLog {
     /// since the last sweep began, then the longest run of the rest of `chunks` from its start
     /// that leaves the log within seven eighths of the budget.
     /// Each run of dropped records becomes padding, and its pages are freed once the padding
-    /// is durable and no read of a dropped record is left.
+    /// is durable and no read of a dropped record is left. When that fails, the next sweep pads
+    /// the runs.
     #[expect(
         clippy::iter_over_hash_type,
         reason = "the sums and sets it builds do not depend on the order"
@@ -830,14 +852,26 @@ impl ObjectLog {
             }
         }
         let dropped = gone.into_iter().map(|(h, _)| h).collect();
+        match self.pad_and_free(&runs).await {
+            Ok(freed) => Ok(Swept { dropped, freed, kept }),
+            Err(e) => {
+                self.orphans.lock().extend(runs);
+                Err(e)
+            }
+        }
+    }
+
+    /// Writes padding over `runs` of dropped records and frees their pages; returns the bytes
+    /// freed. After a failure the runs may be padded in part, and padding them again is safe.
+    async fn pad_and_free(&self, runs: &[(u64, u64)]) -> Result<u64> {
         let mut planned = String::new();
-        for &(a, b) in &runs {
+        for &(a, b) in runs {
             let _ = writeln!(planned, "{a} {b}");
         }
         if !runs.is_empty() {
             let mut p = self.pads.lock().await;
             self.list_pads(&mut p, &planned).await?;
-            self.write_pads(&runs).await?;
+            self.write_pads(runs).await?;
             p.headed = p.text.len();
             if p.text.len() > PADS_MAX {
                 self.file.sync_data().await?;
@@ -846,14 +880,14 @@ impl ObjectLog {
             }
         }
         let mut freed = 0;
-        for (a, b) in runs {
+        for &(a, b) in runs {
             let (from, to) = ((a + HEADER_LEN).next_multiple_of(PAGE), b / PAGE * PAGE);
             if from < to {
                 self.file.punch(from, to - from).await?;
                 freed += to - from;
             }
         }
-        Ok(Swept { dropped, freed, kept })
+        Ok(freed)
     }
 
     /// Turns every record that names `path` into a miss; call it before removing the file.
@@ -884,7 +918,7 @@ impl ObjectLog {
         let Some((f, at)) = self.source(&loc).await else {
             return Ok(None);
         };
-        loc.used_in(self.epoch());
+        loc.used_at(self.now());
         if len < loc.len as usize && !loc.touched.swap(true, Ordering::AcqRel) {
             f.advise(at, u64::from(loc.len), Advice::WillNeed);
         }
@@ -910,7 +944,7 @@ impl ObjectLog {
                 None => return Ok(false),
             },
         };
-        loc.used_in(self.epoch());
+        loc.used_at(self.now());
         Ok(f.read_at_nowait(dst, at + u64_from(inner))? == Some(dst.len()))
     }
 
@@ -1233,6 +1267,72 @@ mod tests {
         let swept = log.sweep(0, below, keep_from, &[], &[]).await.unwrap();
         assert_eq!(swept.dropped, vec![h1], "an append alone marks nothing");
         assert_eq!(log.get(&h2).await.unwrap(), Some(b2));
+    }
+
+    #[tokio::test]
+    async fn a_budget_keeps_the_later_of_two_reads_in_one_epoch() {
+        let fs = SimFs::default();
+        let log = ObjectLog::open(Arc::new(fs.clone()), Path::new("/c/objects"))
+            .await
+            .unwrap();
+        let obj = |i: u8| {
+            let b = Bytes::from(vec![i; 20_000]);
+            (Hash::of(&b), b)
+        };
+        let objs: Vec<(Hash, Bytes)> = (1..=3).map(obj).collect();
+        for (h, b) in &objs[..2] {
+            log.put(*h, b.clone()).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        let all: Vec<Hash> = objs.iter().map(|(h, _)| *h).collect();
+        let epoch = log.next_epoch();
+        log.sweep(0, log.end(), epoch, &[], &all).await.unwrap();
+
+        let epoch = log.next_epoch();
+        log.get(&objs[0].0).await.unwrap();
+        log.put(objs[2].0, objs[2].1.clone()).await.unwrap();
+        log.get(&objs[1].0).await.unwrap();
+        assert_eq!(log.epoch(), epoch);
+        assert!(
+            log.used(&objs[1].0).unwrap() > log.used(&objs[0].0).unwrap(),
+            "the later read stamps later"
+        );
+        let mut wanted: Vec<(u64, Hash)> = all.iter().map(|h| (log.used(h).unwrap(), *h)).collect();
+        wanted.sort_by_key(|&(used, _)| std::cmp::Reverse(used));
+        let wanted: Vec<Hash> = wanted.into_iter().map(|(_, h)| h).collect();
+        let record = 20_000 + HEADER_LEN;
+        log.set_budget(2 * record + record / 2);
+        let swept = log
+            .sweep(0, log.end(), log.next_epoch(), &[], &wanted)
+            .await
+            .unwrap();
+        assert_eq!(swept.dropped, vec![objs[0].0], "the earlier read goes");
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_fails_to_pad_leaves_its_runs_to_the_next() {
+        use crate::ports::LocalImage;
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        for i in 0..4u8 {
+            let b = Bytes::from(vec![i; 20_000]);
+            log.put(Hash::of(&b), b).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        let before = fs.allocated(path).await.unwrap();
+        fs.stop_after(Some(0));
+        let epoch = log.next_epoch();
+        assert!(log.sweep(0, log.end(), epoch, &[], &[]).await.is_err());
+        fs.stop_after(None);
+        let epoch = log.next_epoch();
+        let swept = log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+        assert!(swept.dropped.is_empty(), "the failed sweep dropped them");
+        assert!(swept.freed > 0, "the next sweep frees their pages");
+        assert!(fs.allocated(path).await.unwrap() < before);
+        drop(log);
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(log.live(), 0, "an open finds padding only");
     }
 
     #[tokio::test]

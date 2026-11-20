@@ -118,7 +118,9 @@ have touched. `--cache-budget SIZE` (a global flag, such as `--cache-budget 200G
 last one began, then the tree nodes, then the chunks read most recently, and drops the rest,
 which the next read of them fetches from the store again. A sweep runs whenever the log nears
 the budget, and leaves it within seven eighths of it. Once the log is a quarter past the budget,
-fetches wait for the sweep under way. A read that misses fetches the whole frame its chunk is in,
+fetches wait for the sweep under way. A fetch waits for one sweep at most, and each sweep keeps
+what was fetched since the last one began, so under heavy reads the log still passes the budget
+by what the host fetches while one sweep runs. A read that misses fetches the whole frame its chunk is in,
 up to 1 MiB, so while the chunks a host reads far outgrow the budget, most reads miss and the
 disk's write rate bounds them. Writes not uploaded yet
 always stay, so the log passes the budget while uploads fall behind, and so do the writes a
