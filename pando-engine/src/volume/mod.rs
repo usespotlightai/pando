@@ -42,6 +42,7 @@ mod log;
 use dirty::{Dirty, DirtySet, Under, WRITES_MAX};
 
 pub use log::LogMode;
+pub(crate) use log::seal as seal_log;
 
 const STRIPES: usize = 64;
 const CHUNK: u64 = u64_from(CHUNK_SIZE);
