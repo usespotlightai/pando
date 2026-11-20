@@ -8,5 +8,6 @@
     reason = "a conformance check fails by panicking, and a traced scenario reports to the test's stderr"
 )]
 
+pub mod gc_race;
 pub mod scenario;
 pub mod store_conformance;
