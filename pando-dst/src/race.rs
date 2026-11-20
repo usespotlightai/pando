@@ -1,16 +1,17 @@
 //! Hosts that race for one branch. Each opens it, flushes, publishes, detaches, stops or is lost
-//! at random while the others' background tasks run. Every open must hold a prefix of some
-//! writer's flushes, and every strict flush that returned; the calls on the branch's ref and log
-//! are traced for `specs/WriteLogTrace.tla`.
+//! at random while the others' background tasks run, and now and then the branch is advanced to
+//! an empty branch or to a copy of itself. Every open must hold a prefix of some writer's
+//! flushes, every strict flush that returned since the last advance, and no flush an advance
+//! dropped; the calls on the branch's ref and log are traced for `specs/WriteLogTrace.tla`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use pando_engine::ports::{Rng, Store};
 use pando_engine::sim::{self, SimRng};
-use pando_engine::{Cache, LogMode, Ports, Volume};
+use pando_engine::{Cache, LogMode, Ports, Volume, branch};
 use pando_format::{keys, u64_from, usize_from};
 
 use crate::trace::{self, Event, Kind, Step, TracedStore, Tracer};
@@ -20,6 +21,8 @@ const FLUSHES: u64 = 40;
 const BRANCH: &str = "main";
 /// The hosts, by name.
 pub const HOSTS: [&str; 2] = ["a", "b"];
+/// The host that runs `pando advance`.
+pub const ADVANCER: &str = "x";
 const WAIT: Duration = Duration::from_secs(60);
 
 /// What one race did, and its trace.
@@ -41,6 +44,10 @@ pub struct Race {
     pub refused_appends: usize,
     /// Generation takes another writer beat.
     pub lost_takes: usize,
+    /// Advances that moved the branch.
+    pub advances: usize,
+    /// Seals an advance created.
+    pub advance_seals: usize,
     /// The trace as module `TraceData`, unless a call had no step in the spec.
     pub module: Option<String>,
     /// Why there is no module.
@@ -67,6 +74,16 @@ struct Writer {
 struct World {
     rng: SimRng,
     tracer: Arc<Tracer>,
+    /// The store without a trace, for the branches an advance reads from.
+    ports: Ports,
+    size: u64,
+    advancer: Arc<TracedStore>,
+    advancer_ports: Ports,
+    sources: usize,
+    /// The flushes an advance dropped.
+    dropped: BTreeSet<u64>,
+    /// Each committed flush's number in the trace: the flushes the trace has, counted from 1.
+    traced: BTreeMap<u64, u64>,
     /// Each writer's flushes in order, from the open it took the branch with.
     histories: Vec<Vec<u64>>,
     acked: BTreeSet<u64>,
@@ -136,6 +153,11 @@ impl World {
                 "{at}: the open holds flushes {held:?}, a prefix of no writer's"
             ));
         };
+        if let Some(back) = held.intersection(&self.dropped).next() {
+            return Err(format!(
+                "{at}: the open holds flush {back}, which an advance dropped"
+            ));
+        }
         if let Some(lost) = acked.difference(&held).next() {
             return Err(format!(
                 "{at}: strict flush {lost} returned, and the open does not hold it"
@@ -170,6 +192,7 @@ impl World {
             return;
         }
         self.tracer.insert(at, w.host, Step::Flush);
+        self.traced.insert(id, u64_from(self.traced.len()) + 1);
         self.histories[w.history].push(id);
         self.race.flushes += 1;
         if w.mode == LogMode::Strict && matches!(r, Ok(Ok(()))) {
@@ -188,6 +211,55 @@ impl World {
             }
             self.tracer.push(host.name, Step::Stop);
         }
+    }
+
+    /// The flushes branch `name` holds, read through a host of its own.
+    async fn read_branch(&self, name: &str) -> Result<BTreeSet<u64>, String> {
+        let dir = PathBuf::from(format!("/{name}"));
+        let cache = Arc::new(
+            Cache::open(&self.ports, &dir.join("cache"))
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        let v = Volume::open_logged(&self.ports, cache, &dir, name, LogMode::Off)
+            .await
+            .map_err(|e| e.to_string())?;
+        let held = Self::held(&v).await;
+        v.close().await;
+        held
+    }
+
+    /// Advances the branch to a new empty branch or to a copy of what it published.
+    async fn advance(&mut self, at: &str) -> Result<(), String> {
+        let src = format!("src{}", self.sources);
+        self.sources += 1;
+        let root = if self.below(2) == 0 {
+            Volume::create(&self.ports, &src, self.size)
+                .await
+                .map_err(|e| format!("{at}: create {src}: {e}"))?;
+            Vec::new()
+        } else {
+            branch::copy(&self.ports, BRANCH, &src, None)
+                .await
+                .map_err(|e| format!("{at}: copy to {src}: {e}"))?;
+            let held = self
+                .read_branch(&src)
+                .await
+                .map_err(|e| format!("{at}: read {src}: {e}"))?;
+            self.prefix_of(&held)
+                .ok_or_else(|| format!("{at}: {src} holds flushes {held:?}, a prefix of no writer's"))?
+        };
+        self.advancer
+            .set_root(root.iter().map(|id| self.traced[id]).collect());
+        let r = tokio::time::timeout(WAIT, branch::advance(&self.advancer_ports, BRANCH, &src)).await;
+        if matches!(r, Ok(Ok(()))) {
+            self.race.advances += 1;
+            let kept: BTreeSet<u64> = root.iter().copied().collect();
+            self.dropped
+                .extend((1..self.next).filter(|id| !kept.contains(id)));
+            self.acked.clear();
+        }
+        Ok(())
     }
 
     async fn step(&mut self, host: &mut Host, at: &str) -> Result<(), String> {
@@ -245,6 +317,9 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
         .await
         .map_err(|e| e.to_string())?;
     let tracer = Tracer::new(BRANCH);
+    let advancer = TracedStore::new(Arc::clone(&ports.store), ADVANCER, Arc::clone(&tracer));
+    let mut advancer_ports = ports.clone();
+    advancer_ports.store = Arc::<TracedStore>::clone(&advancer);
     let mut hosts: Vec<Host> = HOSTS
         .iter()
         .map(|&name| {
@@ -264,12 +339,23 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
     let mut w = World {
         rng: SimRng::new(seed ^ 0x7ace),
         tracer: Arc::clone(&tracer),
+        ports: ports.clone(),
+        size,
+        advancer,
+        advancer_ports,
+        sources: 0,
+        dropped: BTreeSet::new(),
+        traced: BTreeMap::new(),
         histories: vec![Vec::new()],
         acked: BTreeSet::new(),
         next: 1,
         race: Race::default(),
     };
     for step in 0..steps {
+        if w.below(25) == 0 {
+            w.advance(&format!("seed {seed} step {step} advance")).await?;
+            continue;
+        }
         let i = usize_from(w.below(u64_from(hosts.len())));
         let at = format!("seed {seed} step {step} host {}", hosts[i].name);
         w.step(&mut hosts[i], &at).await?;
@@ -282,8 +368,8 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
     if race.unsupported.is_none() {
         race.module = Some(trace::module(
             &HOSTS,
-            race.opens,
-            usize_from(w.next - 1),
+            ADVANCER,
+            (race.opens, usize_from(w.next - 1), w.sources),
             &tracer.events(),
         ));
     }
@@ -295,6 +381,10 @@ fn count(race: &mut Race, events: &[Event]) {
     let mut opening: Vec<(&str, bool)> = Vec::new();
     for e in events {
         let host = e.host.as_str();
+        if host == ADVANCER {
+            race.advance_seals += usize::from(matches!(e.step, Step::CreateLog(_, _, Kind::Seal, true)));
+            continue;
+        }
         match e.step {
             Step::GetRef(_) => opening.push((host, false)),
             Step::GetLog(..) => {
@@ -302,7 +392,7 @@ fn count(race: &mut Race, events: &[Event]) {
                     o.1 = true;
                 }
             }
-            Step::UpdateRef(_, _, ok) => {
+            Step::UpdateRef(_, _, ok, _) => {
                 if let Some(i) = opening.iter().position(|o| o.0 == host) {
                     let (_, scanned) = opening.remove(i);
                     race.scans += usize::from(scanned);

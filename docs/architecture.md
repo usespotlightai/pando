@@ -69,9 +69,11 @@ the next open then reads no records. An open that resumes this host's own state 
 nothing: a lock on that state means the process that wrote it has stopped. When that state is
 ahead of the ref, the new writer logs no flush until an upload has published it, since an open
 elsewhere would apply the records to the ref's root, without the flushes the writer resumed.
-[specs/README.md](../specs/README.md) describes the TLA+ specification of the log and how the
-engine's traces are checked against it. Deleting a branch
-deletes its log, so a branch made later under the same name starts with none.
+Deleting a branch deletes its log, so a branch made later under the same name starts with none.
+`pando advance` seals the log and moves the branch to a new writer generation whose log is
+closed: a writer still attached fails its next append or upload, and no open replays its records
+or resumes its state. [specs/README.md](../specs/README.md) describes the TLA+ specification of
+the log and how the engine's traces are checked against it.
 
 With `--log behind`, the default, a flush returns once it is durable on the host, and the shipper
 creates its record within about 50 ms. With `--log strict`, a flush returns once its record is

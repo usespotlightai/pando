@@ -88,7 +88,8 @@ enum Command {
     /// checkpoints it read for the commands sent to it. Devices it serves stop with it;
     /// `attach --recover` takes them over.
     Serve,
-    /// Moves branch DST to the root of branch SRC, as a merge does.
+    /// Moves branch DST to the root of branch SRC, as a merge does. A writer still attached to
+    /// DST is fenced, and what it had not published is dropped.
     Advance { dst: String, src: String },
     /// Deletes a branch; its segments go at the next GC that finds them unreached.
     Delete { name: String },

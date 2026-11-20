@@ -49,8 +49,9 @@ pub enum Step {
     /// A create of a record holding a [`Kind`]; true when no record was there.
     CreateLog(u64, u64, Kind, bool),
     /// A conditional update of the ref to a writer generation and log position; true when the
-    /// ref still had the version the host named.
-    UpdateRef(u64, LogPos, bool),
+    /// ref still had the version the host named. An advance also names the flushes of the
+    /// root it moves the ref to, in the order they were committed.
+    UpdateRef(u64, LogPos, bool, Vec<u64>),
     /// A delete of a record.
     DeleteLog(u64, u64),
     /// A list of the branch's log.
@@ -139,6 +140,7 @@ pub struct TracedStore {
     host: String,
     tracer: Arc<Tracer>,
     mode: Mutex<LogMode>,
+    root: Mutex<Vec<u64>>,
     read_back: Mutex<HashSet<String>>,
 }
 
@@ -150,6 +152,7 @@ impl TracedStore {
             host: host.to_owned(),
             tracer,
             mode: Mutex::new(LogMode::default()),
+            root: Mutex::default(),
             read_back: Mutex::default(),
         })
     }
@@ -157,6 +160,11 @@ impl TracedStore {
     /// The mode the next open on this host logs in.
     pub fn set_mode(&self, mode: LogMode) {
         *self.mode.lock() = mode;
+    }
+
+    /// The flushes of the root the next advance on this host moves the ref to.
+    pub fn set_root(&self, root: Vec<u64>) {
+        *self.root.lock() = root;
     }
 
     fn push(&self, step: Step) {
@@ -261,7 +269,10 @@ impl Store for TracedStore {
             }
         };
         match wanted {
-            Ok(w) => self.push(Step::UpdateRef(w.generation, w.log.unwrap_or_default(), ok)),
+            Ok(w) => {
+                let root = self.root.lock().clone();
+                self.push(Step::UpdateRef(w.generation, w.log.unwrap_or_default(), ok, root));
+            }
             Err(e) => self.tracer.refuse(format!("{key}: {e}")),
         }
         r
@@ -302,10 +313,11 @@ struct Row<'a> {
     ok: bool,
     generation: u64,
     log: LogPos,
+    root: &'a [u64],
 }
 
-impl Row<'_> {
-    fn of(step: &Step) -> Row<'static> {
+impl<'a> Row<'a> {
+    fn of(step: &'a Step) -> Row<'a> {
         let op = |op| Row { op, ..Row::default() };
         match *step {
             Step::GetRef(mode) => Row {
@@ -329,10 +341,11 @@ impl Row<'_> {
                 ok,
                 ..op("create_log")
             },
-            Step::UpdateRef(generation, log, ok) => Row {
+            Step::UpdateRef(generation, log, ok, ref root) => Row {
                 ok,
                 generation,
                 log,
+                root,
                 ..op("update_ref")
             },
             Step::DeleteLog(g, n) => Row {
@@ -353,10 +366,11 @@ impl Row<'_> {
             Some(Kind::Seal) => (true, "seal", 0, 0),
             Some(Kind::Writes { from, to }) => (true, "writes", from, to),
         };
+        let root: Vec<String> = self.root.iter().map(u64::to_string).collect();
         format!(
             "[op |-> \"{}\", host |-> \"{host}\", mode |-> \"{}\", g |-> {}, n |-> {}, found |-> {}, \
              kind |-> \"{kind}\", from |-> {from}, to |-> {to}, ok |-> {}, gen |-> {}, lgen |-> {}, \
-             lflush |-> {}, lnext |-> {}, lclosed |-> {}]",
+             lflush |-> {}, lnext |-> {}, lclosed |-> {}, root |-> <<{}>>]",
             self.op,
             self.mode,
             self.g,
@@ -368,17 +382,22 @@ impl Row<'_> {
             self.log.flush,
             self.log.next,
             tla_bool(self.log.closed),
+            root.join(", "),
         )
     }
 }
 
-/// The trace as module `TraceData`: the hosts, bounds on opens and flushes, and the events.
-pub fn module(hosts: &[&str], opens: usize, flushes: usize, events: &[Event]) -> String {
+/// The trace as module `TraceData`: the hosts, the host that runs advances, bounds on opens,
+/// flushes and advances, and the events.
+pub fn module(hosts: &[&str], advancer: &str, bounds: (usize, usize, usize), events: &[Event]) -> String {
+    let (opens, flushes, advances) = bounds;
     let names: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
     let mut out = String::from("---- MODULE TraceData ----\n");
     let _ = writeln!(out, "TraceHosts == {{{}}}", names.join(", "));
     let _ = writeln!(out, "TraceOpens == {opens}");
     let _ = writeln!(out, "TraceFlushes == {flushes}");
+    let _ = writeln!(out, "TraceAdvancer == \"{advancer}\"");
+    let _ = writeln!(out, "TraceAdvances == {advances}");
     out.push_str("Trace == <<\n");
     for (i, e) in events.iter().enumerate() {
         let sep = if i + 1 == events.len() { "" } else { "," };

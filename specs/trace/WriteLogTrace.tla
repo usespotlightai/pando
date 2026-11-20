@@ -4,9 +4,10 @@
 (* pando-dst/src/trace.rs) against WriteLog. Each call the engine made on  *)
 (* the branch's ref and log is one step of the spec, with the same host,   *)
 (* record numbers, flush numbers, log position and outcome, and so is each *)
-(* flush a writer committed. The steps no call shows (the replay, the      *)
-(* start of a record or an upload, the stop of a log) happen between them  *)
-(* wherever the spec allows.                                               *)
+(* flush a writer committed; the advancer's calls are the steps of an      *)
+(* advance. The steps no call shows (the replay, the start of a record or  *)
+(* an upload, the stop of a log) happen between them wherever the spec     *)
+(* allows.                                                                 *)
 (*                                                                         *)
 (* TLC searches for a behaviour that matches every event. NotAccepted      *)
 (* fails exactly when it finds one, so a reported violation is a trace the *)
@@ -21,7 +22,7 @@ vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, i>>
 
 WL == INSTANCE WriteLog WITH Hosts <- TraceHosts, Modes <- {"behind", "strict"},
                              MaxFlushes <- TraceFlushes, MaxOpens <- TraceOpens,
-                             MaxAdvances <- 0, Depth <- 0
+                             MaxAdvances <- TraceAdvances, Depth <- 0
 
 Init == WL!Init /\ i = 0
 
@@ -45,10 +46,28 @@ CloseWrites(e, p) ==
 
 Moved(e) == e.ok <=> ref' /= ref
 
+\* The calls of branch::advance: the read of the ref, the seal of the writer's
+\* log, and the update of the ref to the root the trace names.
+Advancing(e) ==
+    CASE e.op = "get_ref" -> WL!AdvanceRead
+      [] e.op = "get_log" ->
+            /\ advances.pc = "scan" /\ advances.gen = e.g /\ advances.n = e.n /\ Found(e)
+            /\ WL!AdvanceScan
+      [] e.op = "create_log" ->
+            /\ advances.pc = "seal" /\ advances.gen = e.g /\ advances.n = e.n
+            /\ e.kind = "seal" /\ (e.ok <=> WL!At(e.g, e.n) = {})
+            /\ WL!AdvanceSeal
+      [] e.op = "update_ref" ->
+            /\ advances.pc = "put" /\ e.gen = advances.gen + 1
+            /\ LogIs(e, WL!Pos(advances.gen + 1, 0, 0, TRUE))
+            /\ e.root \in WL!AdvanceRoots
+            /\ WL!AdvancePut(e.root) /\ Moved(e)
+
 Observe(e) ==
     LET h == e.host
         p == proc[h]
-    IN CASE e.op = "get_ref" -> WL!Open(h, e.mode)
+    IN CASE e.host = TraceAdvancer -> Advancing(e)
+         [] e.op = "get_ref" -> WL!Open(h, e.mode)
          [] e.op = "get_log" ->
                 /\ p.pc = "scan" /\ p.g = e.g /\ p.n = e.n /\ Found(e)
                 /\ WL!ScanRead(h)
