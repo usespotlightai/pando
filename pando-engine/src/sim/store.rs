@@ -55,6 +55,7 @@ struct State {
     faults: VecDeque<Fault>,
     refused: Vec<StoreOp>,
     latency: Duration,
+    slow: Vec<(String, Duration)>,
 }
 
 /// An object store in memory, with S3's conditional write rules.
@@ -118,6 +119,14 @@ impl SimStore {
         self.state.lock().latency = latency;
     }
 
+    /// Makes every call on a key that starts with `prefix` take `latency` instead, as calls on
+    /// large objects over a slow link do.
+    pub fn set_latency_under(&self, prefix: &str, latency: Duration) {
+        let mut s = self.state.lock();
+        s.slow.retain(|(p, _)| p != prefix);
+        s.slow.push((prefix.to_string(), latency));
+    }
+
     /// Stops or resumes answering. While stopped, every call waits without failing, as a store
     /// that is down or cut off does; calls in flight finish once it answers again.
     pub fn set_answering(&self, on: bool) {
@@ -144,7 +153,13 @@ impl SimStore {
         let _ = held
             .wait_for(|h| !h.iter().any(|(o, p)| *o == op && key.starts_with(p.as_str())))
             .await;
-        let latency = self.state.lock().latency;
+        let latency = {
+            let s = self.state.lock();
+            s.slow
+                .iter()
+                .find(|(p, _)| key.starts_with(p.as_str()))
+                .map_or(s.latency, |(_, l)| *l)
+        };
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
         }

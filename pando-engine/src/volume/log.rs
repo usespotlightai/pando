@@ -296,6 +296,19 @@ impl Inner {
         self.log.wake.notify_one();
     }
 
+    /// Counts a resumed root the ref does not hold as this writer's first flush, left to the
+    /// uploader: the log takes no flush until an upload published that root, since its
+    /// records would otherwise apply over a root without the flushes it resumed.
+    pub(super) fn resumed_ahead(&self) {
+        let seq = {
+            let mut m = self.mem.lock();
+            m.flush_seq += 1;
+            m.flush_seq
+        };
+        self.committed(seq);
+        self.log.queue.lock().dropped = seq;
+    }
+
     /// Waits until flush `seq` is in the log or published; an error when this writer was
     /// fenced or stopped first.
     pub(super) async fn wait_logged(&self, seq: u64) -> Result<()> {
@@ -936,6 +949,41 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
         a.close().await;
         assert_closed_clean(&ports, &store, 13).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_that_resumes_unlogged_flushes_logs_no_flush_without_them() {
+        let (ports, store, _) = sim::ports(14);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let a = open(&ports, "/a", LogMode::Behind).await;
+        block_uploads(&store);
+        store.refuse(StoreOp::Create);
+        a.write_at(&data(14), 1000).await.unwrap();
+        a.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        a.close().await;
+        drop(a);
+        store.accept();
+        store.clear_faults();
+        store.hold(StoreOp::Create, keys::SEGMENTS);
+
+        let resumed = open(&ports, "/a", LogMode::Behind).await;
+        let later = 1000 + CHUNK_SIZE as u64 * 3;
+        resumed.write_at(&data(15)[..100], later).await.unwrap();
+        resumed.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let b = open(&ports, "/b", LogMode::Behind).await;
+        let first = read(&b, data(14).len()).await == data(14);
+        let mut got = vec![0; 100];
+        b.read_at(&mut got, later).await.unwrap();
+        store.release(StoreOp::Create, keys::SEGMENTS);
+        resumed.close().await;
+        assert!(
+            first || got != data(15)[..100],
+            "the later flush is there without the one before it"
+        );
+        b.close().await;
     }
 
     #[tokio::test(start_paused = true)]

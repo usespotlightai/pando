@@ -436,6 +436,9 @@ impl Volume {
         inner.cache.register(&inner.state_path, roots).await?;
         inner.cache.start_sweeps();
         inner.start_journal(resume).await?;
+        if resume.is_some_and(|s| s.root.hash != r.root.hash) {
+            inner.resumed_ahead();
+        }
         let grown = size != r.size;
         let v = Volume {
             tasks: Mutex::new(inner.start(r, version)),
@@ -812,6 +815,21 @@ impl Volume {
     pub async fn close(&self) {
         self.inner.stop.send_replace(true);
         let tasks = std::mem::take(&mut *self.tasks.lock());
+        for t in tasks {
+            let _ = t.await;
+        }
+        drop(self.inner.state_lock.lock().take());
+    }
+
+    /// Ends the volume's tasks where they are, as a killed process does: a store call in flight
+    /// may or may not have happened. Then releases the local state for another open.
+    #[cfg(feature = "sim")]
+    pub async fn kill(&self) {
+        self.inner.stop.send_replace(true);
+        let tasks = std::mem::take(&mut *self.tasks.lock());
+        for t in &tasks {
+            t.abort();
+        }
         for t in tasks {
             let _ = t.await;
         }

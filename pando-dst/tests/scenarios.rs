@@ -78,3 +78,45 @@ async fn a_store_outage_fails_io_in_time_and_loses_nothing() {
         "{total:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn racing_hosts_open_prefixes_and_keep_strict_flushes() {
+    use pando_dst::race;
+    let seeds: u64 = std::env::var("PANDO_DST_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let first: u64 = std::env::var("PANDO_DST_FIRST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let traces = std::env::var_os("PANDO_TLA_TRACES").map(std::path::PathBuf::from);
+    let mut total = race::Race::default();
+    for seed in first..first + seeds {
+        let r = race::race(seed, 160).await.unwrap_or_else(|e| panic!("{e}"));
+        if let (Some(dir), Some(m)) = (&traces, &r.module) {
+            let dir = dir.join(format!("race-{seed}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("TraceData.tla"), m).unwrap();
+        }
+        assert!(r.unsupported.is_none(), "seed {seed}: {:?}", r.unsupported);
+        total.opens += r.opens;
+        total.taken += r.taken;
+        total.flushes += r.flushes;
+        total.strict += r.strict;
+        total.scans += r.scans;
+        total.seals += r.seals;
+        total.refused_appends += r.refused_appends;
+        total.lost_takes += r.lost_takes;
+    }
+    eprintln!("{total:?}");
+    assert!(
+        total.scans > 0
+            && total.seals > 0
+            && total.strict > 0
+            && total.refused_appends > 0
+            && total.lost_takes > 0
+            && total.taken < total.opens,
+        "{total:?}"
+    );
+}

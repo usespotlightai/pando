@@ -1,8 +1,9 @@
 name: deep
 
 # The slow checks. Each night: every fuzz target for ten minutes, growing a corpus kept in the
-# Actions cache. Each Sunday: mutation testing of the workspace in four shards. Start either by
-# hand from the Actions tab.
+# Actions cache, and the nightly TLA+ models of the write log with 400 traces of the engine
+# checked against them. Each Sunday: mutation testing of the workspace in four shards. Start
+# either by hand from the Actions tab.
 
 on:
   schedule:
@@ -59,6 +60,43 @@ jobs:
         with:
           name: fuzz-artifacts-${{ github.run_id }}
           path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  tla:
+    name: TLA+ models and traces
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '41 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: tla
+
+      - name: Traces of 400 races, from a seed that changes with each run, against the spec
+        env:
+          PANDO_DST_SEEDS: "400"
+          PANDO_TLA_TRACES: ${{ runner.temp }}/tla-traces
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          PANDO_DST_FIRST=$((1000000 + RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios racing
+          PATH=$JAVA_HOME_21_X64/bin:$PATH tools/tlc.sh traces "$PANDO_TLA_TRACES"
+
+      - name: The nightly models
+        if: success() || failure()
+        run: PATH=$JAVA_HOME_21_X64/bin:$PATH tools/tlc.sh nightly
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: tla-traces-${{ github.run_id }}
+          path: ${{ runner.temp }}/tla-traces
           if-no-files-found: ignore
 
   mutants:

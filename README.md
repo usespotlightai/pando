@@ -82,6 +82,8 @@ cargo test --workspace
 (`tools/Dockerfile`, `tools/install.sh`): with no arguments it runs the lints, the supply-chain
 checks and the tests. It also takes `asan`, `fuzz [seconds]`, `coverage`, `mutants`, or any
 single check by name, such as `clippy` or `shellcheck`. The fuzz targets are in `fuzz/`.
+`tools/tlc.sh` model-checks the TLA+ specification of the write log in `specs/` and checks
+traces of the engine against it ([specs/README.md](specs/README.md)).
 
 Dependabot proposes weekly updates for the crates, actions, base images and Terraform providers
 (`.github/dependabot.yml`). A crate update passes `vet` only once each new version has an audit

@@ -66,7 +66,11 @@ fails its next append and stops. Once the new writer publishes, it deletes what 
 left in the log except those seals. A record that would leave a gap is not applied, nor anything
 after it: an open always sees a prefix of the flushes. A detach marks the ref's log as closed, and
 the next open then reads no records. An open that resumes this host's own state reads and seals
-nothing: a lock on that state means the process that wrote it has stopped. Deleting a branch
+nothing: a lock on that state means the process that wrote it has stopped. When that state is
+ahead of the ref, the new writer logs no flush until an upload has published it, since an open
+elsewhere would apply the records to the ref's root, without the flushes the writer resumed.
+[specs/README.md](../specs/README.md) describes the TLA+ specification of the log and how the
+engine's traces are checked against it. Deleting a branch
 deletes its log, so a branch made later under the same name starts with none.
 
 With `--log behind`, the default, a flush returns once it is durable on the host, and the shipper
