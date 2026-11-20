@@ -42,6 +42,7 @@ mod log;
 use dirty::{Dirty, DirtySet, Under, WRITES_MAX};
 
 pub use log::LogMode;
+pub(crate) use log::seal as seal_log;
 
 const STRIPES: usize = 64;
 const CHUNK: u64 = u64_from(CHUNK_SIZE);
@@ -463,6 +464,13 @@ impl Volume {
     /// The branch this one was copied from.
     pub fn copied_from(&self) -> Option<&str> {
         self.inner.from.as_deref()
+    }
+
+    /// The bytes of chunks under the current root that no upload has put in the store yet, as
+    /// 64 KiB chunks; zero once every flush is uploaded.
+    pub async fn unuploaded_bytes(&self) -> Result<u64> {
+        let (tree, root) = self.tree_and_root();
+        Ok(tree.pending_count(&root).await? * CHUNK)
     }
 
     /// The tree of the current root; a grow past its depth replaces it.
@@ -1927,6 +1935,27 @@ mod tests {
         );
         assert_eq!(read(&other, SIZE - 10, 10).await, vec![0; 10]);
         other.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unuploaded_bytes_count_the_flushed_chunks_until_an_upload_puts_them() {
+        let (ports, _, _) = sim::ports(1);
+        branch(&ports, "main").await;
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        assert_eq!(v.generation(), 1);
+        assert_eq!(v.unuploaded_bytes().await.unwrap(), 0);
+        v.write_at(&data(1, 200_000), 30_000).await.unwrap();
+        v.flush().await.unwrap();
+        let pending = v.unuploaded_bytes().await.unwrap();
+        assert!(
+            pending > 0 && pending <= 4 * CHUNK && pending % CHUNK == 0,
+            "{pending}"
+        );
+        v.checkpoint().await.unwrap();
+        assert_eq!(v.unuploaded_bytes().await.unwrap(), 0);
+        v.close().await;
     }
 
     #[tokio::test(start_paused = true)]

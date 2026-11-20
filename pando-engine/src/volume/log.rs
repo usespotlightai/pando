@@ -261,6 +261,35 @@ pub(super) async fn scan(remote: &Remote, cpu: &Arc<dyn Cpu>, name: &str, r: &Re
     Ok(out)
 }
 
+/// Seals the log of the writer that ref `r` of branch `name` names, at its first free number,
+/// so that writer fails its next append. Nothing to seal when no writer took the branch or
+/// the writer closed its log. Returns once the log ends in a seal, whoever created it.
+pub(crate) async fn seal(remote: &Remote, cpu: &Arc<dyn Cpu>, name: &str, r: &Ref) -> Result<()> {
+    let start = log_start(r);
+    let g = r.generation;
+    if g == 0 || (start.closed && start.generation == g) {
+        return Ok(());
+    }
+    let mut n = if start.generation == g { start.next } else { 0 };
+    for _ in 0..REPLAY_MAX {
+        let Some(b) = retried(|| remote.get_log_record(name, g, n)).await? else {
+            let body = Bytes::from(LogRecord::encode_seal(g, n));
+            if retried(|| remote.create_log_record(name, g, n, body.clone())).await? {
+                return Ok(());
+            }
+            continue;
+        };
+        let rec = on_cpu(cpu.as_ref(), CpuClass::Foreground, move || LogRecord::decode(&b)).await?;
+        if matches!(rec.body, LogBody::Seal) {
+            return Ok(());
+        }
+        n += 1;
+    }
+    Err(Error::Corrupt(format!(
+        "{name}: more than {REPLAY_MAX} log records to read"
+    )))
+}
+
 /// `f`, tried again while the store fails transiently, a few times.
 async fn retried<T, F: Future<Output = Result<T>>>(mut f: impl FnMut() -> F) -> Result<T> {
     let mut tries = 1;
@@ -600,14 +629,25 @@ mod tests {
     use crate::sim::{self, Fault, SimStore, StoreOp};
 
     const SIZE: u64 = 16 << 20;
+    const LATER: u64 = 1000 + CHUNK_SIZE as u64 * 3;
 
     async fn open(ports: &Ports, dir: &str, mode: LogMode) -> Volume {
+        open_branch(ports, dir, "main", mode).await
+    }
+
+    async fn open_branch(ports: &Ports, dir: &str, name: &str, mode: LogMode) -> Volume {
         let cache = Arc::new(Cache::open(ports, &Path::new(dir).join("cache")).await.unwrap());
-        let v = Volume::open_logged(ports, cache, Path::new(dir), "main", mode)
+        let v = Volume::open_logged(ports, cache, Path::new(dir), name, mode)
             .await
             .unwrap();
         v.wait_generation().await.unwrap();
         v
+    }
+
+    async fn read_later(v: &Volume) -> Vec<u8> {
+        let mut b = vec![0; 100];
+        v.read_at(&mut b, LATER).await.unwrap();
+        b
     }
 
     fn data(seed: u8) -> Vec<u8> {
@@ -983,6 +1023,72 @@ mod tests {
             first || got != data(15)[..100],
             "the later flush is there without the one before it"
         );
+        b.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_advance_drops_and_fences_a_running_writer() {
+        let (ports, store, _) = sim::ports(15);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        Volume::create(&ports, "other", SIZE).await.unwrap();
+        let o = open_branch(&ports, "/o", "other", LogMode::Behind).await;
+        o.write_at(&data(30), 1000).await.unwrap();
+        o.checkpoint().await.unwrap();
+        o.close().await;
+
+        let a = open(&ports, "/a", LogMode::Strict).await;
+        store.hold(StoreOp::Create, keys::SEGMENTS);
+        a.write_at(&data(31)[..100], LATER).await.unwrap();
+        a.flush().await.unwrap();
+        crate::branch::advance(&ports, "main", "other").await.unwrap();
+        a.write_at(&data(32)[..100], LATER + CHUNK_SIZE as u64)
+            .await
+            .unwrap();
+        assert!(
+            a.flush().await.is_err(),
+            "a strict flush after the advance returned"
+        );
+        store.release(StoreOp::Create, keys::SEGMENTS);
+        a.close().await;
+
+        let b = open(&ports, "/b", LogMode::Behind).await;
+        assert_eq!(read(&b, data(30).len()).await, data(30));
+        assert_eq!(
+            read_later(&b).await,
+            [0; 100],
+            "the advance kept a flush of main's writer"
+        );
+        b.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_does_not_resume_what_an_advance_dropped() {
+        let (ports, store, _) = sim::ports(16);
+        Volume::create(&ports, "main", SIZE).await.unwrap();
+        let a = open(&ports, "/a", LogMode::Behind).await;
+        a.write_at(&data(33), 1000).await.unwrap();
+        a.checkpoint().await.unwrap();
+        crate::branch::copy(&ports, "main", "other", None).await.unwrap();
+        block_uploads(&store);
+        a.write_at(&data(34)[..100], LATER).await.unwrap();
+        a.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        a.close().await;
+        drop(a);
+        store.clear_faults();
+        crate::branch::advance(&ports, "main", "other").await.unwrap();
+
+        let again = open(&ports, "/a", LogMode::Behind).await;
+        assert_eq!(read(&again, data(33).len()).await, data(33));
+        assert_eq!(
+            read_later(&again).await,
+            [0; 100],
+            "the host resumed a flush the advance dropped"
+        );
+        again.checkpoint().await.unwrap();
+        again.close().await;
+        let b = open(&ports, "/b", LogMode::Behind).await;
+        assert_eq!(read_later(&b).await, [0; 100]);
         b.close().await;
     }
 

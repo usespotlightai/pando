@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Entry point of the kernel test image: starts MinIO as the store, over TLS with a certificate
 # made for this run, then runs each test named in the arguments (fio-verify, crash, discard,
-# drain, outage, diskfull, budget, xfstests, log-writes, soak).
+# drain, outage, diskfull, budget, cli, xfstests, log-writes, soak).
 # With KEEP_STORE set, the store's data and its credentials in /data stay from the run before,
 # so a soak segment finds what the last one left. Exits non-zero when one fails. Runs in a mount namespace of its own, so a mount a test leaves
 # never holds a device open in the container's first namespace.

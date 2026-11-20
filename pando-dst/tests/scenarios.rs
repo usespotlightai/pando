@@ -108,6 +108,8 @@ async fn racing_hosts_open_prefixes_and_keep_strict_flushes() {
         total.seals += r.seals;
         total.refused_appends += r.refused_appends;
         total.lost_takes += r.lost_takes;
+        total.advances += r.advances;
+        total.advance_seals += r.advance_seals;
     }
     eprintln!("{total:?}");
     assert!(
@@ -116,6 +118,8 @@ async fn racing_hosts_open_prefixes_and_keep_strict_flushes() {
             && total.strict > 0
             && total.refused_appends > 0
             && total.lost_takes > 0
+            && total.advances > 0
+            && total.advance_seals > 0
             && total.taken < total.opens,
         "{total:?}"
     );

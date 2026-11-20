@@ -1,8 +1,9 @@
 ------------------------------ MODULE WriteLog ------------------------------
 (***************************************************************************)
 (* The write log of one branch, as pando-engine/src/volume/log.rs and the  *)
-(* open, generation take, upload and close in volume/mod.rs run it, with   *)
-(* hosts that crash, lose their disk, and race each other on the store.    *)
+(* open, generation take, upload and close in volume/mod.rs run it, and    *)
+(* as branch::advance moves the branch elsewhere, with hosts that crash,   *)
+(* lose their disk, and race each other on the store.                      *)
 (*                                                                         *)
 (* A branch's contents are modelled by their history: the sequence of the  *)
 (* flushes that made them. A writes record holds the history of its        *)
@@ -16,7 +17,7 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 CONSTANTS
     Hosts,          \* hosts that open the branch, one process each at a time
     Modes,          \* the log modes an open may take: "behind", "strict"
-    MaxFlushes,     \* flushes the writers commit in all
+    MaxWrites,      \* writes the writers make in all, each a flush once committed
     MaxOpens,       \* opens in all
     MaxAdvances,    \* `pando advance` runs onto the branch
     Depth           \* the longest behaviour checked, in steps; 0 for every behaviour
@@ -28,13 +29,15 @@ VARIABLES
     proc,       \* each host's process
     nextId,     \* the next flush id
     opens,      \* opens so far
-    advances,   \* advances so far
+    advances,   \* `pando advance`: how many ran, the one running, and the first flush
+                \* not dropped by the last one
     acked,      \* strict flushes some writer returned from
     histories   \* every history a writer committed or a ref held
 
 vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories>>
 
 Max(a, b) == IF a >= b THEN a ELSE b
+Last(s) == s[Len(s)]
 Range(s) == {s[i] : i \in DOMAIN s}
 IsPrefix(a, b) == Len(a) <= Len(b) /\ SubSeq(b, 1, Len(a)) = a
 
@@ -47,7 +50,11 @@ Writes(g, n, from, to, base, hist) ==
 
 At(g, n) == {r \in store : r.g = g /\ r.n = n}
 
-NoDisk == [present |-> FALSE, root |-> <<>>, published |-> <<>>, publishing |-> <<>>, gen |-> 0]
+\* A host's local state: the root it committed last, the writes its journal
+\* holds since, and what it published.
+NoDisk ==
+    [present |-> FALSE, root |-> <<>>, pending |-> <<>>, published |-> <<>>,
+     publishing |-> <<>>, gen |-> 0]
 
 Idle ==
     [pc |-> "idle",
@@ -58,19 +65,26 @@ Idle ==
      replayed |-> FALSE,
      \* the writer
      gen |-> 0, mode |-> "behind", hists |-> <<<<>>>>, seq |-> 0, opened |-> <<>>,
+     \* the writes in memory no commit has taken yet
+     pending |-> <<>>,
      logged |-> 0, uploaded |-> 0, upRoot |-> <<>>, dropped |-> 0, records |-> <<>>,
      batching |-> FALSE, shipping |-> FALSE, shipN |-> 0, shipFrom |-> 0, shipTo |-> 0,
      refused |-> FALSE, shipperDone |-> FALSE,
      upping |-> FALSE, upSeq |-> 0, ver |-> 0,
      covered |-> 0, published |-> FALSE, olderTrimmed |-> FALSE,
      toDelete |-> {}, stopped |-> FALSE, closing |-> FALSE, closeSeq |-> 0,
-     fenced |-> FALSE, waiting |-> {}, ackedAtTake |-> {}]
+     fenced |-> FALSE, waiting |-> {}, ackedAtTake |-> {},
+     \* the last advance before the take: its root and first flush not dropped
+     advRoot |-> <<>>, advFloor |-> 0]
 
 \* The state after flush i of writer p.
 H(p, i) == p.hists[i + 1]
 
 \* Log.records.partition_point: the records whose last flush is at or below s.
 Covering(p, s) == Len(SelectSeq(p.records, LAMBDA t : t <= s))
+
+NoAdvance ==
+    [count |-> 0, pc |-> "idle", ver |-> 0, gen |-> 0, n |-> 0, floor |-> 0, root |-> <<>>]
 
 Init ==
     /\ ref = [root |-> <<>>, gen |-> 0, log |-> Pos(0, 0, 0, FALSE), ver |-> 0]
@@ -79,7 +93,7 @@ Init ==
     /\ proc = [h \in Hosts |-> Idle]
     /\ nextId = 1
     /\ opens = 0
-    /\ advances = 0
+    /\ advances = NoAdvance
     /\ acked = {}
     /\ histories = {<<>>}
 
@@ -109,9 +123,10 @@ FirstGen(start) ==
 \* uploader (Inner::resumed_ahead).
 Resumed(p, d) ==
     IF d.root = p.rroot
-    THEN [p EXCEPT !.pc = "take", !.hists = <<d.root>>, !.opened = d.root, !.st = d.root]
+    THEN [p EXCEPT !.pc = "take", !.hists = <<d.root>>, !.opened = d.root, !.st = d.root,
+                   !.pending = d.pending]
     ELSE [p EXCEPT !.pc = "take", !.hists = <<p.rroot, d.root>>, !.seq = 1, !.dropped = 1,
-                   !.opened = d.root, !.st = d.root]
+                   !.opened = d.root, !.st = d.root, !.pending = d.pending]
 
 \* An open reads the ref, and either resumes this host's state or scans the log.
 Open(h, m) ==
@@ -172,7 +187,7 @@ Replay(h) ==
                     [p EXCEPT !.pc = "take", !.hists = hists, !.seq = Len(hists) - 1,
                               !.opened = p.st]]
        /\ disk' = [disk EXCEPT ![h] =
-                    [present |-> TRUE, root |-> p.st, published |-> p.rroot,
+                    [present |-> TRUE, root |-> p.st, pending |-> <<>>, published |-> p.rroot,
                      publishing |-> <<>>, gen |-> p.rgen]]
        /\ UNCHANGED <<ref, store, nextId, opens, advances, acked, histories>>
 
@@ -184,6 +199,7 @@ Take(h) ==
           THEN /\ ref' = [ref EXCEPT !.gen = p.gen, !.log = p.start, !.ver = @ + 1]
                /\ proc' = [proc EXCEPT ![h] =
                             [p EXCEPT !.pc = "run", !.ver = ref.ver + 1, !.ackedAtTake = acked,
+                                      !.advRoot = advances.root, !.advFloor = advances.floor,
                                       !.rroot = <<>>, !.rgen = 0, !.rver = 0,
                                       !.start = Pos(0, 0, 0, FALSE), !.g = 0, !.n = 0,
                                       !.have = 0, !.gap = FALSE, !.st = <<>>,
@@ -200,24 +216,35 @@ Take(h) ==
 Running(h) == proc[h].pc = "run"
 Live(h) == Running(h) /\ ~proc[h].fenced
 
-\* A flush commits locally and durably. A flush that bounds memory, or is too
-\* large for a record, is left to the uploader: the queue drops it and what
-\* waits before it.
-Flush(h, logged) ==
+\* A write lands in the process's memory and, unless the host fails first, in
+\* its journal. It takes the next flush id.
+Write(h, kept) ==
+    /\ Running(h)
+    /\ nextId <= MaxWrites
+    /\ proc' = [proc EXCEPT ![h].pending = Append(@, nextId)]
+    /\ disk' = IF kept THEN [disk EXCEPT ![h].pending = Append(@, nextId)] ELSE disk
+    /\ nextId' = nextId + 1
+    /\ UNCHANGED <<ref, store, opens, advances, acked, histories>>
+
+\* A commit takes every write in memory, locally and durably. A flush is a commit
+\* that returns to its caller, who waits for the log in strict mode; a commit
+\* with no caller is a checkpoint's or a detach's. A commit that bounds memory,
+\* or is too large for a record, is left to the uploader: the queue drops it and
+\* what waits before it.
+Commit(h, logged, flush) ==
     LET p == proc[h]
-        now == Append(H(p, p.seq), nextId)
+        now == H(p, p.seq) \o p.pending
     IN /\ Live(h)
-       /\ nextId <= MaxFlushes
+       /\ p.pending /= <<>>
        /\ proc' = [proc EXCEPT ![h] =
-                    [p EXCEPT !.hists = Append(p.hists, now), !.seq = p.seq + 1,
+                    [p EXCEPT !.hists = Append(p.hists, now), !.seq = p.seq + 1, !.pending = <<>>,
                               !.dropped = IF logged THEN p.dropped ELSE p.seq + 1,
-                              !.waiting = IF p.mode = "strict"
-                                          THEN p.waiting \cup {<<p.seq + 1, nextId>>}
+                              !.waiting = IF flush /\ p.mode = "strict"
+                                          THEN p.waiting \cup {<<p.seq + 1, Last(p.pending)>>}
                                           ELSE p.waiting]]
-       /\ disk' = [disk EXCEPT ![h].root = now]
-       /\ nextId' = nextId + 1
+       /\ disk' = [disk EXCEPT ![h].root = now, ![h].pending = <<>>]
        /\ histories' = histories \cup {now}
-       /\ UNCHANGED <<ref, store, opens, advances, acked>>
+       /\ UNCHANGED <<ref, store, nextId, opens, advances, acked>>
 
 ShipBase(p) == Max(p.logged, p.uploaded)
 
@@ -389,7 +416,7 @@ Ack(h, w) ==
     /\ Running(h)
     /\ w \in proc[h].waiting
     /\ proc[h].logged >= w[1] \/ proc[h].uploaded >= w[1]
-    /\ acked' = acked \cup {w[2]}
+    /\ acked' = IF w[2] >= advances.floor THEN acked \cup {w[2]} ELSE acked
     /\ proc' = [proc EXCEPT ![h].waiting = @ \ {w}]
     /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, histories>>
 
@@ -409,33 +436,79 @@ Lose(h) ==
     /\ disk' = [disk EXCEPT ![h] = NoDisk]
     /\ UNCHANGED <<ref, store, nextId, opens, advances, acked, histories>>
 
-\* branch::advance moves the ref to another branch's root and keeps the rest;
-\* what the branch held is meant to go, strict flushes included.
-Advance ==
-    LET root == <<MaxFlushes + 1 + advances>>
-    IN /\ advances < MaxAdvances
-       /\ ref' = [ref EXCEPT !.root = root, !.ver = @ + 1]
-       /\ advances' = advances + 1
-       /\ histories' = histories \cup {root}
-       /\ acked' = {}
-       /\ UNCHANGED <<store, disk, proc, nextId, opens>>
+\* branch::advance reads the ref, seals the writer's log, and moves the ref to
+\* another branch's root under a new generation whose log is closed. What the
+\* branch held is meant to go, strict flushes included: a flush that returns
+\* after it counts only if it is newer than the advance.
+AdvanceRead ==
+    /\ advances.pc = "idle"
+    /\ advances.count < MaxAdvances
+    /\ advances' = [advances EXCEPT
+                       !.count = @ + 1, !.ver = ref.ver, !.gen = ref.gen,
+                       !.n = IF ref.log.gen = ref.gen THEN ref.log.next ELSE 0,
+                       !.pc = IF ref.gen = 0 \/ (ref.log.closed /\ ref.log.gen = ref.gen)
+                              THEN "put" ELSE "scan"]
+    /\ UNCHANGED <<ref, store, disk, proc, nextId, opens, acked, histories>>
+
+\* log::seal: one GET of the writer's record n; a seal ends the log.
+AdvanceScan ==
+    LET found == At(advances.gen, advances.n)
+    IN /\ advances.pc = "scan"
+       /\ advances' = [advances EXCEPT
+                          !.pc = IF found = {} THEN "seal"
+                                 ELSE IF (CHOOSE r \in found : TRUE).kind = "seal" THEN "put"
+                                 ELSE "scan",
+                          !.n = IF found = {} THEN @ ELSE @ + 1]
+       /\ UNCHANGED <<ref, store, disk, proc, nextId, opens, acked, histories>>
+
+AdvanceSeal ==
+    /\ advances.pc = "seal"
+    /\ IF At(advances.gen, advances.n) = {}
+       THEN /\ store' = store \cup {Seal(advances.gen, advances.n)}
+            /\ advances' = [advances EXCEPT !.pc = "put"]
+       ELSE /\ advances' = [advances EXCEPT !.pc = "scan"]
+            /\ UNCHANGED store
+    /\ UNCHANGED <<ref, disk, proc, nextId, opens, acked, histories>>
+
+\* The conditional PUT, to a root no writer made or to one some writer did.
+AdvancePut(root) ==
+    /\ advances.pc = "put"
+    /\ IF ref.ver = advances.ver
+       THEN /\ ref' = [root |-> root, gen |-> advances.gen + 1,
+                       log |-> Pos(advances.gen + 1, 0, 0, TRUE), ver |-> ref.ver + 1]
+            /\ histories' = histories \cup {root}
+            /\ acked' = {}
+            /\ advances' = [advances EXCEPT !.pc = "idle", !.floor = nextId, !.root = root]
+       ELSE /\ advances' = [advances EXCEPT !.pc = "idle"]
+            /\ UNCHANGED <<ref, histories, acked>>
+    /\ UNCHANGED <<store, disk, proc, nextId, opens>>
+
+AdvanceRoots == histories \cup {<<MaxWrites + advances.count>>}
+
+\* The advance's process ends before it moved the ref.
+AdvanceStop ==
+    /\ advances.pc /= "idle"
+    /\ advances' = [advances EXCEPT !.pc = "idle"]
+    /\ UNCHANGED <<ref, store, disk, proc, nextId, opens, acked, histories>>
 
 Next ==
     \/ \E h \in Hosts :
         \/ \E m \in Modes : Open(h, m)
         \/ ScanRead(h) \/ ScanSeal(h) \/ Replay(h) \/ Take(h)
-        \/ \E logged \in BOOLEAN : Flush(h, logged)
-        \/ \E to \in 1..MaxFlushes + 1 : ShipBatch(h, to)
+        \/ \E kept \in BOOLEAN : Write(h, kept)
+        \/ \E logged, flush \in BOOLEAN : Commit(h, logged, flush)
+        \/ \E to \in 1..MaxWrites + 1 : ShipBatch(h, to)
         \/ ShipNumber(h) \/ ShipCovered(h) \/ ShipCreate(h) \/ ShipFence(h)
         \/ ShipAbandon(h)
         \/ UploadStart(h) \/ UploadPut(h)
-        \/ \E n \in 0..MaxFlushes + 1 : TrimOwn(h, n)
+        \/ \E n \in 0..MaxWrites + 1 : TrimOwn(h, n)
         \/ TrimListOlder(h)
         \/ \E k \in proc[h].toDelete : TrimDeleteOlder(h, k)
         \/ CloseStop(h) \/ ClosePut(h)
         \/ \E w \in proc[h].waiting : Ack(h, w)
         \/ Stop(h) \/ Lose(h)
-    \/ Advance
+    \/ AdvanceRead \/ AdvanceScan \/ AdvanceSeal \/ AdvanceStop
+    \/ \E root \in AdvanceRoots : AdvancePut(root)
 
 Spec == Init /\ [][Next]_vars
 
@@ -453,6 +526,14 @@ OpenSeesAPrefix ==
 \* from before.
 StrictFlushesSurvive ==
     \A h \in Hosts : Running(h) => proc[h].ackedAtTake \subseteq Range(proc[h].opened)
+
+\* A flush an advance dropped stays dropped: a writer that takes the branch
+\* after it holds no flush older than the advance unless the advance's root did.
+AdvanceDropsWhatItReplaced ==
+    \A h \in Hosts :
+        Running(h) =>
+            \A i \in Range(proc[h].opened) :
+                i >= proc[h].advFloor \/ i \in Range(proc[h].advRoot)
 
 \* The ref only ever holds a state some writer committed.
 RefHoldsAWriterState == ref.root \in histories

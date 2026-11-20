@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pando_format::{Checkpoint, Ref};
+use pando_format::{Checkpoint, LogPos, Ref};
 
 use crate::remote::Remote;
+use crate::volume::seal_log;
 use crate::{Error, Ports, Result};
 
 /// Makes branch `dst` a copy of `src`, forked from it. A copy slower than `max_age` is undone:
@@ -163,7 +164,15 @@ fn copy_of(c: &Checkpoint) -> Ref {
     }
 }
 
-/// Moves branch `dst` to the published root of `src`, unless `dst` changed meanwhile.
+/// Moves branch `dst` to the published root of `src`, unless `dst` changed meanwhile. What
+/// `dst` held goes, flushes its writer had not published included: the writer's log is sealed,
+/// so a writer still running fails its next append, and `dst` moves to a new writer generation
+/// whose log is closed, so no open replays the old log or resumes the old writer's state.
+///
+/// The seal comes before the ref moves, so no strict flush the writer logs returns after the
+/// advance. When `dst` changed meanwhile, the advance fails with its writer fenced all the
+/// same, as when an open seals the log and loses the take: what the writer logged stays for the
+/// next open, and running the advance again is safe.
 pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
     let remote = Remote::new(Arc::clone(&ports.store));
     let (from, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
@@ -174,7 +183,16 @@ pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
             to.size, from.size
         )));
     }
+    seal_log(&remote, &ports.cpu, dst, &to).await?;
+    let generation = to.generation + 1;
     to.root = from.root;
+    to.generation = generation;
+    to.log = Some(LogPos {
+        generation,
+        flush: 0,
+        next: 0,
+        closed: true,
+    });
     remote.put_ref(dst, &to, &version).await.map(drop)
 }
 
