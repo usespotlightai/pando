@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# GC on a bucket of its own, with a branch that stays and one deleted. `gc --delete` refuses the
-# bucket while it keeps no earlier versions. Once versioning is on, GC deletes what only the
-# deleted branch reached, and the restore in docs/hosts.md, deleting the delete markers, brings
-# the branch back: a fresh host reads it whole. ublk id 79.
+# GC on a bucket of its own, with two branches. `gc --delete` refuses the bucket while it keeps
+# no earlier versions. Once versioning is on, one branch is deleted and GC deletes what only it
+# reached; the restore in docs/hosts.md, deleting the delete markers, brings the branch back: a
+# fresh host reads it whole. ublk id 79.
 TEST=gc
 # shellcheck source=SCRIPTDIR/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -59,25 +59,38 @@ collect() { pando "$W/gc" gc --delete --keep-young 0s --validate 1s >"$W/gc.out"
 head -c $((8 * MiB)) /dev/urandom >"$W/keep.img"
 head -c $((8 * MiB)) /dev/urandom >"$W/gone.img"
 if pando "$W/c" import keep "$W/keep.img" >"$W/import.out" 2>&1 &&
-	pando "$W/c" import gone "$W/gone.img" >>"$W/import.out" 2>&1 &&
-	pando "$W/c" delete gone >>"$W/import.out" 2>&1; then
-	check "import two branches and delete one" ok
+	pando "$W/c" import gone "$W/gone.img" >>"$W/import.out" 2>&1; then
+	check "import two branches" ok
 else
-	check "import two branches and delete one" "$(tail -1 "$W/import.out" || true)"
+	check "import two branches" "$(tail -1 "$W/import.out" || true)"
 fi
 
-if collect; then
+# segments: how many segments the store holds.
+segments() { pando "$W/gc" stat 2>/dev/null | grep -o '[0-9]* segments' | cut -d' ' -f1 || true; }
+
+before=$(segments)
+collect
+ran=$?
+after=$(segments)
+if [[ $ran = 0 ]]; then
 	check "gc --delete refuses a bucket without versioning" "it ran: $(tail -1 "$W/gc.out" || true)"
-elif grep -q -- "--unversioned" "$W/gc.out"; then
-	check "gc --delete refuses a bucket without versioning" ok
-else
+elif ! grep -q -- "--unversioned" "$W/gc.out"; then
 	check "gc --delete refuses a bucket without versioning" "$(tail -1 "$W/gc.out" || true)"
+elif [[ -z $before || $after != "$before" ]]; then
+	check "gc --delete refuses a bucket without versioning" "segments went from ${before:-?} to ${after:-?}"
+else
+	check "gc --delete refuses a bucket without versioning" "ok, $before segments kept"
 fi
 
 versioning='<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>'
 if ! s3 -X PUT --data "$versioning" "$bucket?versioning" >/dev/null; then
 	say "could not turn on versioning for $S3_BUCKET"
 	exit 1
+fi
+if pando "$W/c" delete gone >"$W/delete.out" 2>&1; then
+	check "delete a branch" ok
+else
+	check "delete a branch" "$(tail -1 "$W/delete.out" || true)"
 fi
 dead=0
 if collect; then

@@ -257,6 +257,12 @@ impl S3Store {
     }
 }
 
+/// Whether `id`, a version ID the store answered with, names a version it keeps: a store with
+/// versioning suspended answers `null`.
+fn names_a_version(id: &str) -> bool {
+    !id.is_empty() && id != "null"
+}
+
 /// A client error the store answered that the same request gets again.
 #[derive(Debug, thiserror::Error)]
 #[error("the store refused the request: {status} {reason}: {body}")]
@@ -479,14 +485,18 @@ impl Store for S3Store {
 
     async fn keeps_versions(&self) -> Result<bool, StoreError> {
         let key = keys::VERSIONS;
-        let r = self
-            .inner
-            .get(key)
-            .await?
-            .put(&self.path(key), PutPayload::new())
+        let path = self.path(key);
+        let client = self.inner.get(key).await?;
+        match client.head(&path).await {
+            Ok(m) if m.version.as_deref().is_some_and(names_a_version) => return Ok(true),
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(map_err(key, e)),
+        }
+        let r = client
+            .put(&path, PutPayload::new())
             .await
             .map_err(|e| map_err(key, e))?;
-        Ok(r.version.is_some_and(|v| !v.is_empty() && v != "null"))
+        Ok(r.version.as_deref().is_some_and(names_a_version))
     }
 }
 
@@ -598,12 +608,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_put_answered_with_a_version_id_means_the_store_keeps_versions() {
-        let (s, _) = answering_with("200 OK", "etag: \"e\"\r\nx-amz-version-id: 3HL4kqtJ\r\n", "").await;
+    async fn a_version_id_means_the_store_keeps_versions() {
+        const MODIFIED: &str = "last-modified: Wed, 21 Oct 2026 07:28:00 GMT\r\netag: \"e\"\r\n";
+        let (s, seen) = answering_with(
+            "200 OK",
+            "last-modified: Wed, 21 Oct 2026 07:28:00 GMT\r\netag: \"e\"\r\nx-amz-version-id: 3HL4kqtJ\r\n",
+            "",
+        )
+        .await;
         assert!(s.keeps_versions().await.unwrap());
-        let (s, _) = answering_with("200 OK", "etag: \"e\"\r\nx-amz-version-id: null\r\n", "").await;
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a versioned marker needs no put");
+        let (s, seen) = answering_with(
+            "200 OK",
+            "last-modified: Wed, 21 Oct 2026 07:28:00 GMT\r\netag: \"e\"\r\nx-amz-version-id: null\r\n",
+            "",
+        )
+        .await;
         assert!(!s.keeps_versions().await.unwrap());
-        let (s, _) = answering_with("200 OK", "etag: \"e\"\r\n", "").await;
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        let (s, _) = answering_with("200 OK", MODIFIED, "").await;
         assert!(!s.keeps_versions().await.unwrap());
     }
 

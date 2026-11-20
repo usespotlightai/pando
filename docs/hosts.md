@@ -34,7 +34,7 @@ repository's release workflow from a commit on main.
 | `/etc/systemd/system/pando-gc.service`, `pando-gc.timer` | the daily GC of the store, off until enabled (see [GC](#gc)) |
 | `/etc/pando/pando.env` | the host's settings, mode 0600: `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_SESSION_TOKEN`, or `S3_CREDENTIALS=instance` for the instance role, and `PANDO_ARGS` for global flags such as `--cache` |
 | `/etc/pando/attach/<name>.env` | one branch: `PANDO_BRANCH`, `PANDO_DEVICE` (`/dev/ublkbN`), and `PANDO_ATTACH_ARGS` for the other `attach` flags, such as `--remote`, `--dm`, `--images` and `--state` |
-| `/etc/pando/gc.env` | optional: `PANDO_GC_ARGS` for the `gc` flags of `pando-gc.service`, such as `--remote` and `--delete` |
+| `/etc/pando/gc.env` | optional: `PANDO_GC_ARGS` for the `gc` flags of `pando-gc.service`, such as `--delete` |
 | `/var/cache/pando-gc/` | the cache of `pando-gc.service` |
 
 Credentials go in the env file, never in `PANDO_ARGS` or `PANDO_ATTACH_ARGS`: those end up on
@@ -157,8 +157,9 @@ it is younger than `--keep-young`, and what a branch reached again between its t
 the write logs of deleted branches. Run it from one host per store.
 
 **Versioning.** `gc --delete` refuses a store whose bucket keeps no earlier versions of what is
-replaced or deleted, so that a wrong delete can be undone. It finds out by putting an empty
-object, `versions`, at the store's root. `--unversioned` deletes anyway, for a store such as R2
+replaced or deleted, so that a wrong delete can be undone. It finds out from an empty object,
+`versions`, at the store's root: it puts one unless one with a version ID is already there, so
+it needs write access. `--unversioned` deletes anyway, for a store such as R2
 that has no versioning. Turn versioning on, and let earlier versions expire after 14 days:
 
 ```bash
@@ -172,11 +173,11 @@ aws s3api put-bucket-lifecycle-configuration --bucket BUCKET --lifecycle-configu
 With MinIO, `mc version enable ALIAS/BUCKET`. A deleted segment stays in the bucket, and is
 billed, for those 14 days; each publish of a branch keeps the ref it replaced for as long.
 
-**Schedule.** `pando-gc.service` runs `pando gc` with a cache of its own, and `pando-gc.timer`
+**Schedule.** `pando-gc.service` runs `pando gc` on the store `pando.env` names, with the
+global flags of `PANDO_ARGS` (such as `--remote`) but a cache of its own, and `pando-gc.timer`
 runs it once a day. Enable the timer on one host: `systemctl enable --now pando-gc.timer`. The
-report is one line in the journal: `journalctl -u pando-gc`. Put the flags in
-`/etc/pando/gc.env`, such as `PANDO_GC_ARGS="--remote s3://org"` for a store under a prefix.
-The unit only reports until `--delete` is added there. Add it once the reports have matched
+report is one line in the journal: `journalctl -u pando-gc`. The unit only reports until
+`/etc/pando/gc.env` adds `--delete`: `PANDO_GC_ARGS=--delete`. Add it once the reports have matched
 what you expect for two weeks: `dead` grows with the branches and checkpoints deleted and the
 writes replaced, and `revived` stays near zero. A `revived` that grows means branch copies
 come close to the `--validate` delay.

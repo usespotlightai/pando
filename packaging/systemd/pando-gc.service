@@ -11,6 +11,6 @@ EnvironmentFile=-/etc/pando/gc.env
 UnsetEnvironment=PANDO_SOCKET
 CacheDirectory=pando-gc
 CacheDirectoryMode=0700
-ExecStart=/usr/local/bin/pando --cache /var/cache/pando-gc gc $PANDO_GC_ARGS
+ExecStart=/usr/local/bin/pando $PANDO_ARGS --cache /var/cache/pando-gc gc $PANDO_GC_ARGS
 Nice=10
 IOSchedulingClass=idle

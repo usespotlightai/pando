@@ -29,7 +29,11 @@ use tokio::sync::{OnceCell, watch};
 const DEFAULT_CACHE: &str = "/data/cache";
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Branchable copy-on-write block devices on object storage")]
+#[command(
+    version,
+    about = "Branchable copy-on-write block devices on object storage",
+    args_override_self = true
+)]
 struct Cli {
     #[command(flatten)]
     store: config::StoreArgs,
@@ -660,7 +664,11 @@ async fn checkpoints(ports: &Ports, out: &Out) -> Result<()> {
 
 /// Fails unless `store` keeps the earlier versions of what GC deletes.
 async fn versions_kept(store: &dyn pando_engine::ports::Store) -> Result<()> {
-    if !store.keeps_versions().await? {
+    if !store
+        .keeps_versions()
+        .await
+        .context("finding out whether the store keeps earlier versions, which needs write access")?
+    {
         bail!(
             "the store keeps no earlier versions, so a wrong delete could not be undone: turn on \
              versioning for the bucket (docs/hosts.md), or pass --unversioned"
@@ -716,6 +724,8 @@ mod tests {
         s.set_versioned(true);
         versions_kept(&s).await.unwrap();
         assert!(Cli::try_parse_from(["pando", "gc", "--unversioned"]).is_err());
+        let cli = Cli::try_parse_from(["pando", "--cache", "/a", "--cache", "/b", "gc"]).unwrap();
+        assert_eq!(cli.cache.as_deref(), Some(Path::new("/b")), "a later flag wins");
         assert!(Cli::try_parse_from(["pando", "gc", "--delete", "--unversioned"]).is_ok());
     }
 
