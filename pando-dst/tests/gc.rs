@@ -37,10 +37,7 @@ async fn gc_never_deletes_what_a_branch_a_checkpoint_or_a_writer_needs() {
 async fn a_slow_copy_left_in_place_names_what_gc_deleted() {
     for seed in 0..40 {
         if let Err(e) = gc_race::gc_races(seed, 24, None).await {
-            assert!(
-                e.contains("does not read whole") || e.contains("gc:"),
-                "seed {seed}: {e}"
-            );
+            assert!(e.contains("does not read whole"), "seed {seed}: {e}");
             return;
         }
     }
