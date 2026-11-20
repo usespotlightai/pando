@@ -3,8 +3,10 @@
 //! an empty branch or to a copy of itself. Every open must hold a prefix of some writer's
 //! flushes, every strict flush that returned since the last advance, and no flush an advance
 //! dropped. A fenced writer's last write, whose flush failed, may follow its flushes: its
-//! journal may keep it, and an open that resumes its state then holds it. The calls on the
-//! branch's ref and log, and each write and flush, are traced for `specs/WriteLogTrace.tla`.
+//! journal may keep it, and an open that resumes its state then holds it. A write whose
+//! `write_at` failed is in no journal: each write has a chunk of its own, so it fails before the
+//! journal append if at all. The calls on the branch's ref and log, and each write and flush,
+//! are traced for `specs/WriteLogTrace.tla`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

@@ -17,7 +17,7 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 CONSTANTS
     Hosts,          \* hosts that open the branch, one process each at a time
     Modes,          \* the log modes an open may take: "behind", "strict"
-    MaxFlushes,     \* writes the writers make in all, each a flush once committed
+    MaxWrites,      \* writes the writers make in all, each a flush once committed
     MaxOpens,       \* opens in all
     MaxAdvances,    \* `pando advance` runs onto the branch
     Depth           \* the longest behaviour checked, in steps; 0 for every behaviour
@@ -220,7 +220,7 @@ Live(h) == Running(h) /\ ~proc[h].fenced
 \* its journal. It takes the next flush id.
 Write(h, kept) ==
     /\ Running(h)
-    /\ nextId <= MaxFlushes
+    /\ nextId <= MaxWrites
     /\ proc' = [proc EXCEPT ![h].pending = Append(@, nextId)]
     /\ disk' = IF kept THEN [disk EXCEPT ![h].pending = Append(@, nextId)] ELSE disk
     /\ nextId' = nextId + 1
@@ -483,7 +483,7 @@ AdvancePut(root) ==
             /\ UNCHANGED <<ref, histories, acked>>
     /\ UNCHANGED <<store, disk, proc, nextId, opens>>
 
-AdvanceRoots == histories \cup {<<MaxFlushes + advances.count>>}
+AdvanceRoots == histories \cup {<<MaxWrites + advances.count>>}
 
 \* The advance's process ends before it moved the ref.
 AdvanceStop ==
@@ -497,11 +497,11 @@ Next ==
         \/ ScanRead(h) \/ ScanSeal(h) \/ Replay(h) \/ Take(h)
         \/ \E kept \in BOOLEAN : Write(h, kept)
         \/ \E logged, flush \in BOOLEAN : Commit(h, logged, flush)
-        \/ \E to \in 1..MaxFlushes + 1 : ShipBatch(h, to)
+        \/ \E to \in 1..MaxWrites + 1 : ShipBatch(h, to)
         \/ ShipNumber(h) \/ ShipCovered(h) \/ ShipCreate(h) \/ ShipFence(h)
         \/ ShipAbandon(h)
         \/ UploadStart(h) \/ UploadPut(h)
-        \/ \E n \in 0..MaxFlushes + 1 : TrimOwn(h, n)
+        \/ \E n \in 0..MaxWrites + 1 : TrimOwn(h, n)
         \/ TrimListOlder(h)
         \/ \E k \in proc[h].toDelete : TrimDeleteOlder(h, k)
         \/ CloseStop(h) \/ ClosePut(h)

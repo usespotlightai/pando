@@ -391,14 +391,14 @@ impl<'a> Row<'a> {
 }
 
 /// The trace as module `TraceData`: the hosts, the host that runs advances, bounds on opens,
-/// flushes and advances, and the events.
+/// writes and advances, and the events.
 pub fn module(hosts: &[&str], advancer: &str, bounds: (usize, usize, usize), events: &[Event]) -> String {
-    let (opens, flushes, advances) = bounds;
+    let (opens, writes, advances) = bounds;
     let names: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
     let mut out = String::from("---- MODULE TraceData ----\n");
     let _ = writeln!(out, "TraceHosts == {{{}}}", names.join(", "));
     let _ = writeln!(out, "TraceOpens == {opens}");
-    let _ = writeln!(out, "TraceFlushes == {flushes}");
+    let _ = writeln!(out, "TraceWrites == {writes}");
     let _ = writeln!(out, "TraceAdvancer == \"{advancer}\"");
     let _ = writeln!(out, "TraceAdvances == {advances}");
     out.push_str("Trace == <<\n");

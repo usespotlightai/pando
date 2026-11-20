@@ -21,7 +21,7 @@ VARIABLES ref, store, disk, proc, nextId, opens, advances, acked, histories, i
 vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, i>>
 
 WL == INSTANCE WriteLog WITH Hosts <- TraceHosts, Modes <- {"behind", "strict"},
-                             MaxFlushes <- TraceFlushes, MaxOpens <- TraceOpens,
+                             MaxWrites <- TraceWrites, MaxOpens <- TraceOpens,
                              MaxAdvances <- TraceAdvances, Depth <- 0
 
 Init == WL!Init /\ i = 0
@@ -98,7 +98,7 @@ Hidden ==
     /\ \E h \in TraceHosts :
         \/ WL!Replay(h)
         \/ WL!Commit(h, TRUE, FALSE)
-        \/ \E to \in 1..TraceFlushes + 1 : WL!ShipBatch(h, to)
+        \/ \E to \in 1..TraceWrites + 1 : WL!ShipBatch(h, to)
         \/ WL!ShipNumber(h)
         \/ WL!ShipCovered(h)
         \/ WL!ShipFence(h)
