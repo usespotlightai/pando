@@ -57,6 +57,7 @@ check() {
 	local what=$1 got=$2
 	case $got in
 	ok*) say "segment $SEG: $what: $got" ;;
+	skipped*) say "segment $SEG: $what: SKIPPED: ${got#skipped, }" ;;
 	*)
 		say "segment $SEG: $what: FAILED: $got"
 		fails=$((fails + 1))
@@ -200,13 +201,13 @@ else
 	fi
 	pid=
 	# mean <segment> <column>: the mean of a sampled column over the second half of a segment's
-	# samples from 30 s after its attach, once the log has filled to the budget.
+	# samples from 30 s after its attach.
 	mean() { awk -F, -v s="$1" -v c="$2" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] { v[n++] = $c } END { for (i = int(n / 2); i < n; i++) t += v[i]; if (n) printf "%d", t / (n - int(n / 2)); else print 0 }' "$W/settled.csv" "$W/samples.csv"; }
-	settled=$(awk -F, 'FNR == NR { from[$1] = $2; next } $1 == 1 && $2 >= from[1] { n++ } END { print n + 0 }' "$W/settled.csv" "$W/samples.csv")
+	span=$(awk -F, 'FNR == NR { from[$1] = $2; next } $1 == 1 && $2 >= from[1] { if (!a) a = $2; b = $2 } END { print b - a }' "$W/settled.csv" "$W/samples.csv")
 	first=$(mean 1 3)
 	last=$(mean "$SEG" 3)
-	if ((settled < 360)); then
-		check "the log does not grow across segments" "ok, not compared: segment 1 has $((settled / 6)) minutes of samples, under 60"
+	if ((span < 3600)); then
+		check "the log does not grow across segments" "skipped, segment 1 has $((span / 60)) minutes of samples, under 60: mean $((first / MiB)) MiB in segment 1, $((last / MiB)) MiB in segment $SEG"
 	elif ((first > 0 && last > 0 && last <= first + first / 4 + 32 * MiB)); then
 		check "the log does not grow across segments" "ok, mean $((first / MiB)) MiB in segment 1, $((last / MiB)) MiB in segment $SEG"
 	else
