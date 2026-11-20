@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
 pando-engine.workspace = true
 pando-host.workspace = true
 pando-format.workspace = true
@@ -22,6 +23,8 @@ pando-linux.workspace = true
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
+bytes.workspace = true
+object_store.workspace = true
 pando-engine = { workspace = true, features = ["sim"] }
 tempfile.workspace = true
 

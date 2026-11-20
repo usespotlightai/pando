@@ -1,9 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use clap::Args;
 use pando_engine::ports::Store;
-use pando_s3::{Credentials, S3Config, S3Store};
+use pando_s3::{AWS_CHAIN_VARS, Credentials, S3Config, S3Store};
 
 /// Which store to use. S3 settings come from flags or the S3_* variables; their values never
 /// show in help or errors.
@@ -28,33 +29,12 @@ pub(crate) struct StoreArgs {
         global = true
     )]
     region: String,
-    #[arg(
-        long,
-        env = "S3_ACCESS_KEY_ID",
-        hide_env_values = true,
-        hide = true,
-        global = true
-    )]
-    access_key_id: Option<String>,
-    #[arg(
-        long,
-        env = "S3_SECRET_ACCESS_KEY",
-        hide_env_values = true,
-        hide = true,
-        global = true
-    )]
-    secret_access_key: Option<String>,
-    #[arg(
-        long,
-        env = "S3_SESSION_TOKEN",
-        hide_env_values = true,
-        hide = true,
-        global = true
-    )]
-    session_token: Option<String>,
     /// Where S3 credentials come from: keys, the S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY and
-    /// S3_SESSION_TOKEN variables; instance, the role of this instance or AgentCore microVM from
-    /// the instance metadata service, refreshed before it expires.
+    /// S3_SESSION_TOKEN variables (never flags); instance, the role of this instance or AgentCore
+    /// microVM from the instance metadata service; aws, the AWS chain: web identity
+    /// (AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN), ECS or EKS Pod Identity container
+    /// credentials, then the instance; file, a JSON file another process keeps current
+    /// (--credentials-file). All but keys are fetched again before they expire.
     #[expect(
         clippy::doc_markdown,
         reason = "the comment is the help text, where backticks would show"
@@ -67,6 +47,15 @@ pub(crate) struct StoreArgs {
         global = true
     )]
     credentials: Source,
+    /// With --credentials file: the file, in the form credential_process prints (AccessKeyId,
+    /// SecretAccessKey, SessionToken, Expiration). Replace it, by a rename, before the key in it
+    /// expires.
+    #[expect(
+        clippy::doc_markdown,
+        reason = "the comment is the help text, where backticks would show"
+    )]
+    #[arg(long, env = "S3_CREDENTIALS_FILE", global = true)]
+    credentials_file: Option<PathBuf>,
     /// The instance metadata service [default: http://169.254.169.254].
     #[expect(
         clippy::doc_markdown,
@@ -81,6 +70,8 @@ pub(crate) struct StoreArgs {
 pub(crate) enum Source {
     Keys,
     Instance,
+    Aws,
+    File,
 }
 
 impl StoreArgs {
@@ -108,25 +99,49 @@ impl StoreArgs {
     }
 
     fn credentials(&self) -> Result<Credentials> {
-        match self.credentials {
-            Source::Instance => Ok(Credentials::Instance {
+        self.credentials_from(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    }
+
+    /// The credentials, with `var` reading the environment.
+    pub(crate) fn credentials_from(&self, var: impl Fn(&str) -> Option<String>) -> Result<Credentials> {
+        Ok(match self.credentials {
+            Source::Instance => Credentials::Instance {
                 endpoint: self.metadata_endpoint.clone().filter(|e| !e.is_empty()),
-            }),
+            },
+            Source::Aws => Credentials::Aws {
+                vars: AWS_CHAIN_VARS
+                    .iter()
+                    .filter_map(|k| Some(((*k).to_string(), var(k)?)))
+                    .collect(),
+            },
+            Source::File => {
+                let Some(path) = &self.credentials_file else {
+                    bail!("S3_CREDENTIALS=file needs S3_CREDENTIALS_FILE or --credentials-file");
+                };
+                Credentials::File { path: path.clone() }
+            }
             Source::Keys => {
                 let (Some(access_key_id), Some(secret_access_key)) =
-                    (&self.access_key_id, &self.secret_access_key)
+                    (var("S3_ACCESS_KEY_ID"), var("S3_SECRET_ACCESS_KEY"))
                 else {
                     bail!(
                         "an s3:// store needs S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY, \
-                         or S3_CREDENTIALS=instance"
+                         or S3_CREDENTIALS=instance, aws or file"
                     );
                 };
-                Ok(Credentials::Keys {
-                    access_key_id: access_key_id.clone(),
-                    secret_access_key: secret_access_key.clone(),
-                    session_token: self.session_token.clone().filter(|t| !t.is_empty()),
-                })
+                Credentials::Keys {
+                    access_key_id,
+                    secret_access_key,
+                    session_token: var("S3_SESSION_TOKEN"),
+                }
             }
+        })
+    }
+
+    /// Makes the credentials file absolute, against `cwd` where it is relative.
+    pub(crate) fn resolve(&mut self, cwd: &std::path::Path) {
+        if let Some(f) = &mut self.credentials_file {
+            *f = cwd.join(&*f);
         }
     }
 
@@ -141,7 +156,15 @@ impl StoreArgs {
             "{}|{}|{}",
             self.endpoint.as_deref().unwrap_or_default(),
             self.bucket.as_deref().unwrap_or_default(),
-            self.remote.as_deref().unwrap_or(remote)
+            normal(self.remote.as_deref().unwrap_or(remote))
         )
+    }
+}
+
+/// `remote` with the slashes around its prefix trimmed, so `s3://a/` and `s3://a` name one store.
+fn normal(remote: &str) -> String {
+    match remote.strip_prefix("s3://") {
+        Some(p) => format!("s3://{}", p.trim_matches('/')),
+        None => remote.to_owned(),
     }
 }

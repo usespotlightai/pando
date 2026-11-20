@@ -20,6 +20,7 @@ pando-s3 = { path = "pando-s3" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 getrandom = "0.4.3"

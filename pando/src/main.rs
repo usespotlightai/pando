@@ -10,6 +10,7 @@
 mod config;
 mod device;
 mod exit;
+mod scope;
 mod serve;
 
 use std::path::{Path, PathBuf};
@@ -166,18 +167,30 @@ enum Command {
     /// and the loop devices and FUSE of `attach --fuse`, each with what to do about it. Exits
     /// with 6 when neither `attach --device` nor `attach --fuse` can work here.
     CheckHost,
+    /// Deletes everything under the store's prefix (its branches, checkpoints, segments, logs
+    /// and format marker), as when an org leaves. Detach the prefix's branches on every host
+    /// first: it fails if objects appear while it runs. It never deletes a whole bucket. In a
+    /// versioned bucket the noncurrent versions stay until the bucket's lifecycle rule expires
+    /// them.
+    Purge {
+        /// The prefix of --remote again, so that the command names what it deletes twice.
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 impl Command {
-    /// How the command uses the store; `None` when it only talks to an attached device's
-    /// daemon, or runs other commands that each say for themselves.
+    /// How the command uses the store's format; `None` when it only talks to an attached
+    /// device's daemon, runs other commands that each say for themselves, or deletes the store
+    /// whatever its format.
     fn access(&self) -> Option<Access> {
         match self {
             Command::Detach(_)
             | Command::Resize(_)
             | Command::Status(_)
             | Command::CheckHost
-            | Command::Serve => None,
+            | Command::Serve
+            | Command::Purge { .. } => None,
             Command::Refs | Command::Stat | Command::Checkpoints | Command::Gc { delete: false, .. } => {
                 Some(Access::Read)
             }
@@ -216,6 +229,7 @@ impl Cli {
         if let Some(c) = &mut self.cache {
             abs(c);
         }
+        self.store.resolve(cwd);
         match &mut self.command {
             Command::Import { image, .. } => abs(image),
             Command::Base { dir, .. } | Command::Follow { dir, .. } => abs(dir),
@@ -257,7 +271,8 @@ impl Cli {
             | Command::Delete { .. }
             | Command::Gc { .. }
             | Command::Stat
-            | Command::CheckHost => {}
+            | Command::CheckHost
+            | Command::Purge { .. } => {}
         }
     }
 }
@@ -425,6 +440,7 @@ impl Host {
         let c = self
             .cache
             .get_or_try_init(|| async {
+                scope::bind(&self.cache_dir, &self.identity)?;
                 let c = Cache::open(&self.ports, &self.cache_dir).await?;
                 c.set_budget(self.cache_budget);
                 Ok::<_, anyhow::Error>(Arc::new(c))
@@ -616,6 +632,7 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
         }
         Command::Attach(a) => {
             let _busy = host.attaching();
+            scope::bind(&a.state, &host.identity)?;
             let ended = device::attach(ports, cache().await?, a, host.identity.clone(), out).await?;
             host.ended(ended)
         }
@@ -624,6 +641,9 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
         Command::Status(s) => device::status(s, out).await,
         Command::CheckHost => device::check_host(out).await,
         Command::Stat => stat(&cache().await?, out).await,
+        Command::Purge { confirm } => {
+            scope::run_purge(ports.store.as_ref(), &host.remote, &confirm, out).await
+        }
     }
 }
 
@@ -883,6 +903,68 @@ mod tests {
             panic!("not base")
         };
         assert_eq!(dir, Path::new("/abs"));
+    }
+
+    #[test]
+    fn credentials_come_from_the_environment_and_never_from_flags() {
+        for flag in ["--access-key-id", "--secret-access-key", "--session-token"] {
+            assert!(
+                Cli::try_parse_from(["pando", flag, "x", "refs"]).is_err(),
+                "{flag}"
+            );
+        }
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_string())
+        };
+        let cli = Cli::try_parse_from(["pando", "refs"]).unwrap();
+        let keys = cli
+            .store
+            .credentials_from(env(&[
+                ("S3_ACCESS_KEY_ID", "AKID"),
+                ("S3_SECRET_ACCESS_KEY", "s3cr3t"),
+            ]))
+            .unwrap();
+        assert_eq!(format!("{keys:?}"), "Keys { temporary: false, .. }");
+        let e = cli
+            .store
+            .credentials_from(env(&[("S3_ACCESS_KEY_ID", "AKID")]))
+            .unwrap_err();
+        assert!(!e.to_string().contains("AKID"), "{e}");
+        let cli = Cli::try_parse_from(["pando", "--credentials", "aws", "refs"]).unwrap();
+        let aws = cli
+            .store
+            .credentials_from(env(&[
+                ("AWS_ROLE_ARN", "arn:aws:iam::1:role/r"),
+                ("AWS_SECRET_ACCESS_KEY", "s3cr3t"),
+            ]))
+            .unwrap();
+        assert_eq!(format!("{aws:?}"), r#"Aws { vars: ["AWS_ROLE_ARN"] }"#);
+        let mut cli = Cli::try_parse_from([
+            "pando",
+            "--credentials",
+            "file",
+            "--credentials-file",
+            "k.json",
+            "refs",
+        ])
+        .unwrap();
+        cli.resolve(Path::new("/home/u"));
+        let file = cli.store.credentials_from(env(&[])).unwrap();
+        assert_eq!(format!("{file:?}"), r#"File { path: "/home/u/k.json" }"#);
+        let cli = Cli::try_parse_from(["pando", "--credentials", "file", "refs"]).unwrap();
+        assert!(cli.store.credentials_from(env(&[])).is_err());
+    }
+
+    #[test]
+    fn a_trailing_slash_names_the_same_store() {
+        let id = |remote: &str| {
+            Cli::try_parse_from(["pando", "--remote", remote, "refs"])
+                .unwrap()
+                .store
+                .identity()
+        };
+        assert_eq!(id("s3://org-a/"), id("s3://org-a"));
+        assert_ne!(id("s3://org-a"), id("s3://org-ab"));
     }
 
     #[test]

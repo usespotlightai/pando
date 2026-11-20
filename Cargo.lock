@@ -1145,7 +1145,10 @@ name = "pando"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "futures",
+ "object_store",
  "pando-engine",
  "pando-format",
  "pando-host",
@@ -1232,11 +1235,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "object_store",
  "pando-engine",
  "pando-format",
  "parking_lot 0.13.0",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

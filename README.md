@@ -49,6 +49,11 @@ sharing one root system.
   reports each attached branch's upload lag and unuploaded bytes, `check-host` says whether a
   host can attach, and exit statuses tell in use, store unreachable, fenced and unsupported
   apart. [docs/cli.md](docs/cli.md) lists them.
+- **A store per org.** Each org's branches live under a prefix of their own, with credentials
+  that reach only that prefix: from the AWS chain, or from a file another process refreshes, such
+  as R2 temporary credentials. A host's cache never serves two stores, and `pando purge` deletes a
+  prefix. [docs/tenancy.md](docs/tenancy.md) has the policies and the steps for an org that
+  leaves.
 
 ## Crates
 
