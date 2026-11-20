@@ -156,7 +156,15 @@ impl StoreArgs {
             "{}|{}|{}",
             self.endpoint.as_deref().unwrap_or_default(),
             self.bucket.as_deref().unwrap_or_default(),
-            self.remote.as_deref().unwrap_or(remote)
+            normal(self.remote.as_deref().unwrap_or(remote))
         )
+    }
+}
+
+/// `remote` with the slashes around its prefix trimmed, so `s3://a/` and `s3://a` name one store.
+fn normal(remote: &str) -> String {
+    match remote.strip_prefix("s3://") {
+        Some(p) => format!("s3://{}", p.trim_matches('/')),
+        None => remote.to_owned(),
     }
 }

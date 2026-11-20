@@ -22,10 +22,11 @@ The file has the form that `credential_process` prints:
 {"Version":1,"AccessKeyId":"…","SecretAccessKey":"…","SessionToken":"…","Expiration":"2026-11-20T18:00:00Z"}
 ```
 
-Each request to the store checks the file's size and modification time, and reads it again if
-either changed. Write the new key to a file next to it, then rename it over the old one, before
-the old key expires. If the key in the file has expired and the file has not changed, requests
-fail as transient: uploads wait and retry until the file changes, and the branch reports
+Each request to the store checks the file's size, modification time and inode, and reads it
+again if any changed, or every 5 seconds regardless. Write the new key to a file next to it, then
+rename it over the old one, more than a minute before the old key expires. A key counts as
+expired a minute before its `Expiration`. If the key in the file has expired and the file has not
+changed, requests fail as transient: uploads wait and retry until the file changes, and the branch reports
 `lagging` meanwhile. Keep the file mode 0600, owned by root.
 
 ## A prefix per org
@@ -110,7 +111,9 @@ each org:
    ```
 
    It deletes the refs first, so no host can open a branch of the org from then on. Then it
-   deletes everything else under `ORG/` and reports the number of objects and the bytes. It
+   deletes the checkpoints, the write logs, the change lists, the segments and anything else
+   under `ORG/`. It lists one part at a time, so it holds no more in memory than GC does, and
+   reports each part as it finishes, then the objects and bytes in all. It
    lists the prefix again at the end and fails if anything is there, which means a host still
    writes. In that case, detach that host and purge again. It refuses an empty prefix: it never
    deletes a whole bucket.

@@ -325,10 +325,33 @@ struct FileCredentials {
     last: Mutex<Option<FromFile>>,
 }
 
+/// A key in a credentials file counts as expired this long before its `Expiration`, so a
+/// request it signs reaches the store before the key ends.
+const EXPIRY_MARGIN: Duration = Duration::from_mins(1);
+/// A credentials file is read again at least this often, even when its size, modification
+/// time and inode stay the same.
+const REREAD: Duration = Duration::from_secs(5);
+
 struct FromFile {
-    stamp: (Option<SystemTime>, u64),
+    stamp: Stamp,
+    read: std::time::Instant,
     credential: Arc<AwsCredential>,
     expires: Option<SystemTime>,
+}
+
+/// What tells one version of a file from another without reading it: modification time, size
+/// and, on Unix, the inode a rename brings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp(Option<SystemTime>, u64, u64);
+
+impl Stamp {
+    fn of(m: &std::fs::Metadata) -> Stamp {
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(m);
+        #[cfg(not(unix))]
+        let ino = 0;
+        Stamp(m.modified().ok(), m.len(), ino)
+    }
 }
 
 impl std::fmt::Debug for FileCredentials {
@@ -349,8 +372,8 @@ impl FileCredentials {
 
     fn current(&self, f: &FromFile) -> object_store::Result<Arc<AwsCredential>> {
         match f.expires {
-            Some(t) if t <= SystemTime::now() => Err(self.error(&format!(
-                "expired at {}, and the file has not changed since",
+            Some(t) if t <= SystemTime::now() + EXPIRY_MARGIN => Err(self.error(&format!(
+                "expires at {}, in less than {EXPIRY_MARGIN:?}, and the file has not changed since",
                 chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
             ))),
             _ => Ok(Arc::clone(&f.credential)),
@@ -366,8 +389,13 @@ impl CredentialProvider for FileCredentials {
         let meta = tokio::fs::metadata(&self.path)
             .await
             .map_err(|e| self.error(&e.to_string()))?;
-        let stamp = (meta.modified().ok(), meta.len());
-        if let Some(f) = self.last.lock().as_ref().filter(|f| f.stamp == stamp) {
+        let stamp = Stamp::of(&meta);
+        if let Some(f) = self
+            .last
+            .lock()
+            .as_ref()
+            .filter(|f| f.stamp == stamp && f.read.elapsed() < REREAD)
+        {
             return self.current(f);
         }
         let text = tokio::fs::read(&self.path)
@@ -376,6 +404,7 @@ impl CredentialProvider for FileCredentials {
         let (credential, expires) = parse_credentials(&text).map_err(|e| self.error(&e))?;
         let f = FromFile {
             stamp,
+            read: std::time::Instant::now(),
             credential: Arc::new(credential),
             expires,
         };
@@ -938,11 +967,11 @@ mod tests {
         write(
             &path,
             &format!(
-                r#"{{"Version":1,"AccessKeyId":"ASIATWOTWO","SecretAccessKey":"s3cr3t2","SessionToken":"t2","Expiration":"{soon}"}}"#
+                r#"{{"Version":1,"AccessKeyId":"ASIATWO","SecretAccessKey":"s3cr3t2","SessionToken":"t2","Expiration":"{soon}"}}"#
             ),
         );
         s.put("k", Bytes::from_static(b"v")).await.unwrap();
-        assert_eq!(signed_by(&heads, "/b/k"), ["asiaone", "asiaone", "asiatwotwo"]);
+        assert_eq!(signed_by(&heads, "/b/k"), ["asiaone", "asiaone", "asiatwo"]);
         let last = heads.lock().unwrap().last().unwrap().clone();
         assert!(last.contains("x-amz-security-token: t2\r\n"), "{last}");
     }
@@ -952,7 +981,7 @@ mod tests {
         let (addr, heads) = serving(Box::new(|_| ("200 OK", "v".into()))).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.json");
-        let past = rfc3339(SystemTime::now() - Duration::from_secs(1));
+        let past = rfc3339(SystemTime::now() + EXPIRY_MARGIN - Duration::from_secs(5));
         write(
             &path,
             &format!(
@@ -963,7 +992,7 @@ mod tests {
         let e = s.get("k").await.unwrap_err();
         assert!(matches!(e, StoreError::Transient { .. }), "{e}");
         let text = format!("{e} {e:?}");
-        assert!(text.contains("expired"), "{text}");
+        assert!(text.contains("expires at"), "{text}");
         for secret in ["ASIAOLD", "s3cr3t", "tok\""] {
             assert!(!text.contains(secret), "{text}");
         }
@@ -1093,7 +1122,8 @@ mod tests {
         let f = FileCredentials {
             path: "/run/pando/credentials.json".into(),
             last: Mutex::new(Some(FromFile {
-                stamp: (None, 0),
+                stamp: Stamp(None, 0, 0),
+                read: std::time::Instant::now(),
                 credential: Arc::new(AwsCredential {
                     key_id: "AKIDEXAMPLE".into(),
                     secret_key: "s3cr3t".into(),

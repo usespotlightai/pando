@@ -21,27 +21,43 @@ const PARALLEL_DELETES: usize = 32;
 
 /// Ties `dir` to the store `identity`: the first use writes `dir/store`, and a use with any
 /// other store fails before anything in `dir` is read, so what a host keeps for one store never
-/// serves another.
+/// serves another. Of two processes that bind a new directory at once, one writes the file and
+/// the other checks against it.
 pub(crate) fn bind(dir: &Path, identity: &str) -> Result<()> {
     let path = dir.join(STORE_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(had) if had.trim_end() == identity => Ok(()),
-        Ok(had) => bail!(
-            "{} holds the data of the store {}, not of {identity}: give each store a directory of its own",
-            dir.display(),
-            had.trim_end()
-        ),
+        Ok(had) => same(dir, &had, identity),
         Err(e) if e.kind() == ErrorKind::NotFound => {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-            let tmp = dir.join(format!(".{STORE_FILE}.new"));
+            let tmp = dir.join(format!(".{STORE_FILE}.{}", std::process::id()));
             std::fs::write(&tmp, format!("{identity}\n"))
                 .with_context(|| format!("write {}", tmp.display()))?;
             std::fs::File::open(&tmp)?.sync_all()?;
-            std::fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))?;
-            Ok(())
+            let linked = std::fs::hard_link(&tmp, &path);
+            let _ = std::fs::remove_file(&tmp);
+            match linked {
+                Ok(()) => Ok(std::fs::File::open(dir)?.sync_all()?),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let had =
+                        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+                    same(dir, &had, identity)
+                }
+                Err(e) => Err(e).with_context(|| format!("write {}", path.display())),
+            }
         }
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
+}
+
+fn same(dir: &Path, had: &str, identity: &str) -> Result<()> {
+    if had.trim_end() != identity {
+        bail!(
+            "{} holds the data of the store {}, not of {identity}: give each store a directory of its own",
+            dir.display(),
+            had.trim_end()
+        );
+    }
+    Ok(())
 }
 
 /// What a purge deleted.
@@ -53,11 +69,28 @@ pub(crate) struct Purged {
     pub(crate) bytes: u64,
 }
 
-/// Deletes every object of `store`, whose prefix `remote` names: the refs first, so no host
-/// opens a branch of it from then on, then the rest. `confirm` must be the prefix again, and an
+/// The parts of a store a purge deletes in turn, each listed on its own so that no listing
+/// holds more than GC's listing of the segments does: the refs first, so no host opens a
+/// branch of the store from then on, and last whatever else is left.
+const PARTS: [&str; 6] = [
+    keys::REFS,
+    keys::CHECKPOINTS,
+    keys::LOG,
+    keys::CHANGES,
+    keys::SEGMENTS,
+    "",
+];
+
+/// Deletes every object of `store`, whose prefix `remote` names, part by part as [`PARTS`]
+/// lists them, telling `done` each part's name and the objects it deleted there. `confirm` must be the prefix again, and an
 /// empty prefix, a whole bucket, is refused. It fails if objects are still there after it
 /// deleted what it listed: a host still writes under the prefix.
-pub(crate) async fn purge(store: &dyn Store, remote: &str, confirm: &str) -> Result<Purged> {
+pub(crate) async fn purge(
+    store: &dyn Store,
+    remote: &str,
+    confirm: &str,
+    done: &(dyn Fn(&str, u64) + Sync),
+) -> Result<Purged> {
     let prefix = remote.strip_prefix("s3://").unwrap_or(remote).trim_matches('/');
     if prefix.is_empty() {
         bail!("purge needs a prefix, --remote s3://<prefix>; it never deletes a whole bucket");
@@ -66,9 +99,10 @@ pub(crate) async fn purge(store: &dyn Store, remote: &str, confirm: &str) -> Res
         bail!("--confirm {confirm:?} is not the prefix {prefix:?} of --remote");
     }
     let mut purged = Purged { objects: 0, bytes: 0 };
-    for dir in [keys::REFS, ""] {
+    for dir in PARTS {
         let found = store.list(dir).await.with_context(|| format!("list {remote}"))?;
-        purged.objects += u64::try_from(found.len())?;
+        let n = u64::try_from(found.len())?;
+        purged.objects += n;
         purged.bytes += found.iter().map(|o| o.size).sum::<u64>();
         futures::stream::iter(found)
             .map(|o| async move {
@@ -80,6 +114,7 @@ pub(crate) async fn purge(store: &dyn Store, remote: &str, confirm: &str) -> Res
             .buffer_unordered(PARALLEL_DELETES)
             .try_collect::<()>()
             .await?;
+        done(if dir.is_empty() { "the rest" } else { dir }, n);
     }
     let left = store.list("").await.with_context(|| format!("list {remote}"))?;
     if !left.is_empty() {
@@ -95,7 +130,10 @@ pub(crate) async fn purge(store: &dyn Store, remote: &str, confirm: &str) -> Res
 /// [`purge`], reported on `out`.
 pub(crate) async fn run_purge(store: &dyn Store, remote: &str, confirm: &str, out: &Out) -> Result<()> {
     let t0 = Instant::now();
-    let p = purge(store, remote, confirm).await?;
+    let p = purge(store, remote, confirm, &|part, n| {
+        out.line(format!("deleted {n} objects of {part}"));
+    })
+    .await?;
     out.line(format!(
         "purged {remote}: {} objects ({} MiB) in {:.1?}",
         p.objects,
@@ -136,7 +174,25 @@ mod tests {
         let a = filled(&inner, "org-a").await;
         let ab = filled(&inner, "org-ab").await;
         let b = filled(&inner, "org-b").await;
-        let p = purge(&a, "s3://org-a", "org-a").await.unwrap();
+        let parts = std::sync::Mutex::new(Vec::new());
+        let p = purge(&a, "s3://org-a", "org-a", &|part, n| {
+            parts.lock().unwrap().push((part.to_owned(), n));
+        })
+        .await
+        .unwrap();
+        let parts = parts.into_inner().unwrap();
+        let named = |p: &str, n| (p.to_owned(), n);
+        assert_eq!(
+            parts,
+            [
+                named("refs", 2),
+                named("checkpoints", 0),
+                named("log", 1),
+                named("changes", 0),
+                named("segments", 2),
+                named("the rest", 1)
+            ]
+        );
         assert_eq!(
             p,
             Purged {
@@ -148,7 +204,7 @@ mod tests {
         assert_eq!(ab.list("").await.unwrap().len(), 6);
         assert_eq!(b.list("").await.unwrap().len(), 6);
         assert_eq!(
-            purge(&a, "s3://org-a/", "org-a/").await.unwrap(),
+            purge(&a, "s3://org-a/", "org-a/", &|_, _| {}).await.unwrap(),
             Purged { objects: 0, bytes: 0 }
         );
     }
@@ -157,11 +213,11 @@ mod tests {
     async fn a_purge_needs_the_prefix_twice_and_never_takes_a_bucket() {
         let inner = Arc::new(InMemory::new());
         let a = filled(&inner, "org-a").await;
-        let e = purge(&a, "s3://org-a", "org-b").await.unwrap_err();
+        let e = purge(&a, "s3://org-a", "org-b", &|_, _| {}).await.unwrap_err();
         assert!(e.to_string().contains("is not the prefix"), "{e}");
         let root = S3Store::over(inner, "");
         for remote in ["s3://", "s3:///"] {
-            let e = purge(&root, remote, "").await.unwrap_err();
+            let e = purge(&root, remote, "", &|_, _| {}).await.unwrap_err();
             assert!(e.to_string().contains("never deletes a whole bucket"), "{e}");
         }
         assert_eq!(a.list("").await.unwrap().len(), 6);
@@ -180,5 +236,10 @@ mod tests {
             "{e}"
         );
         bind(&d.path().join("other"), "https://r2|bucket|s3://org-b").unwrap();
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["store"]);
     }
 }

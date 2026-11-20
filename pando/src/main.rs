@@ -781,6 +781,18 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_slash_names_the_same_store() {
+        let id = |remote: &str| {
+            Cli::try_parse_from(["pando", "--remote", remote, "refs"])
+                .unwrap()
+                .store
+                .identity()
+        };
+        assert_eq!(id("s3://org-a/"), id("s3://org-a"));
+        assert_ne!(id("s3://org-a"), id("s3://org-ab"));
+    }
+
+    #[test]
     fn durations_parse_with_their_units() {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
