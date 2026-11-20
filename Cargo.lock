@@ -1151,6 +1151,7 @@ dependencies = [
  "pando-host",
  "pando-linux",
  "pando-s3",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

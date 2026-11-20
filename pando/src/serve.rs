@@ -29,6 +29,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 
+use crate::exit::Failure;
 use crate::{Cli, Command, Drained, Host};
 
 /// How long a daemon told twice to stop still waits for its attaches to commit their writes.
@@ -44,23 +45,28 @@ enum Stream {
 }
 
 /// Where a command writes its output: this process's standard output and error, or the
-/// client of the daemon that runs it.
+/// client of the daemon that runs it. With `--json`, standard output carries only the JSON
+/// lines of [`Out::result`] and [`Out::event`], and every other line goes to standard error.
 #[derive(Clone, Debug)]
-pub(crate) struct Out(Option<mpsc::UnboundedSender<(Stream, String)>>);
+pub(crate) struct Out {
+    to: Option<mpsc::UnboundedSender<(Stream, String)>>,
+    json: bool,
+}
 
 impl Out {
-    pub(crate) fn stdio() -> Out {
-        Out(None)
+    pub(crate) fn stdio(json: bool) -> Out {
+        Out { to: None, json }
     }
 
     /// Whether the command runs as its own process, writing to its standard output and error.
     pub(crate) fn is_stdio(&self) -> bool {
-        self.0.is_none()
+        self.to.is_none()
     }
 
-    /// Writes one line to standard output.
+    /// Writes one line for a person: to standard output, or to standard error with `--json`.
     pub(crate) fn line(&self, s: impl Into<String>) {
-        self.send(Stream::Out, s.into());
+        let to = if self.json { Stream::Err } else { Stream::Out };
+        self.send(to, s.into());
     }
 
     /// Writes one line to standard error.
@@ -68,8 +74,24 @@ impl Out {
         self.send(Stream::Err, s.into());
     }
 
+    /// Writes a result: `human` to standard output, or with `--json` only `json`.
+    pub(crate) fn result(&self, human: impl Into<String>, json: impl Into<serde_json::Value>) {
+        if self.json {
+            self.send(Stream::Out, json.into().to_string());
+        } else {
+            self.send(Stream::Out, human.into());
+        }
+    }
+
+    /// Writes `json` to standard output with `--json`; a person gets nothing.
+    pub(crate) fn event(&self, json: impl Into<serde_json::Value>) {
+        if self.json {
+            self.send(Stream::Out, json.into().to_string());
+        }
+    }
+
     fn send(&self, to: Stream, s: String) {
-        match (&self.0, to) {
+        match (&self.to, to) {
             (None, Stream::Out) => println!("{s}"),
             (None, Stream::Err) => eprintln!("{s}"),
             (Some(tx), _) => {
@@ -160,21 +182,26 @@ async fn answer(host: Arc<Host>, c: UnixStream) -> Result<()> {
     let cwd = (!args.is_empty()).then(|| PathBuf::from(args.remove(0)));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (job, keep) = {
-        let out = Out(Some(tx));
+        let out = Out {
+            to: Some(tx),
+            json: false,
+        };
         match request(&host, cwd, args) {
             Ok(cli) => {
                 let keep = matches!(cli.command, Command::Attach(_));
+                let out = Out {
+                    json: cli.json,
+                    ..out
+                };
                 let job = tokio::spawn(async move {
                     match crate::run(&host, cli.command, &out).await {
                         Ok(()) => 0,
-                        Err(e) if e.is::<Drained>() => i32::from(crate::device::TRY_AGAIN),
                         Err(e) => {
-                            out.err(format!("Error: {e:?}"));
-                            if e.is::<crate::device::StillPublishing>() {
-                                i32::from(crate::device::TRY_AGAIN)
-                            } else {
-                                1
+                            if !e.is::<Drained>() {
+                                out.err(format!("Error: {e:?}"));
+                                out.event(Failure::event(&e));
                             }
+                            i32::from(Failure::of(&e).code())
                         }
                     }
                 });

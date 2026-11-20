@@ -21,7 +21,9 @@ mod users;
 
 pub use dm::DmSwitch;
 pub use fuse::{FILE_NAME as FUSE_FILE, FuseFrontend, FuseOptions};
-pub use ublk::{Daemon, Frontend, FrontendOptions, daemon, daemon_dead, delete, device_id, resize, stop};
+pub use ublk::{
+    Daemon, Frontend, FrontendOptions, daemon, daemon_dead, delete, device_id, resize, stop, user_recovery,
+};
 
 /// What a stop of block device `dev` would cut off: each mount of it, each device stacked on
 /// it other than the device-mapper device named `over`, and, when neither explains it, an

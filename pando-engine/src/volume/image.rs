@@ -19,7 +19,9 @@ use crate::tree::Tree;
 pub(crate) const ABSORB_PARALLEL: usize = 16;
 
 impl Volume {
-    pub(crate) fn generation(&self) -> u64 {
+    /// The writer generation this volume takes when it opens: one past the ref's. A later
+    /// writer of the branch takes a higher one and fences this one.
+    pub fn generation(&self) -> u64 {
         self.inner.generation
     }
 
