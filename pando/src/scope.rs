@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use futures::{StreamExt, TryStreamExt};
 use pando_engine::ports::Store;
 use pando_format::keys;
+use serde_json::json;
 
 use crate::serve::Out;
 
@@ -131,15 +132,27 @@ pub(crate) async fn purge(
 pub(crate) async fn run_purge(store: &dyn Store, remote: &str, confirm: &str, out: &Out) -> Result<()> {
     let t0 = Instant::now();
     let p = purge(store, remote, confirm, &|part, n| {
-        out.line(format!("deleted {n} objects of {part}"));
+        out.result(
+            format!("deleted {n} objects of {part}"),
+            json!({"event": "purged-part", "part": part, "objects": n}),
+        );
     })
     .await?;
-    out.line(format!(
-        "purged {remote}: {} objects ({} MiB) in {:.1?}",
-        p.objects,
-        p.bytes >> 20,
-        t0.elapsed()
-    ));
+    let took = t0.elapsed();
+    out.result(
+        format!(
+            "purged {remote}: {} objects ({} MiB) in {took:.1?}",
+            p.objects,
+            p.bytes >> 20
+        ),
+        json!({
+            "event": "purged",
+            "remote": remote,
+            "objects": p.objects,
+            "bytes": p.bytes,
+            "took_ms": crate::millis(took),
+        }),
+    );
     Ok(())
 }
 
