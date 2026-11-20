@@ -94,10 +94,13 @@ fetched, or lands in a region of the branch's index the host has not read. The f
 and a retry once the store answers finds it done. With `--log strict`, a flush the log does not
 take within the wait fails the same way. Uploads retry with a backoff that grows to 30 s between
 tries. Once they fall 60 s behind the flushes, the daemon logs it and sets its systemd status to
-`degraded`; it logs again when they catch up. Until then the writes are on this host only, as
+`degraded`; it logs again when they catch up. `pando status` reports the same for every branch
+attached on the host (or one, with `--device` or `--fuse`), one tab-separated line each: the
+device or mount, the branch, the upload lag, and `serving`, `lagging`, `disk-full` or
+`uploads-stopped`. Until then the writes are on this host only, as
 in [a host that never comes back](#a-host-that-never-comes-back). A `detach` during an outage
-fails after `--publish-wait`, with the device stopped and the daemon still publishing; run
-`detach` again to wait for it.
+exits with status 75 after `--publish-wait`, with the device stopped and the daemon still
+publishing; run `detach` again to wait for it.
 
 **Full disk.** The cache directory keeps a 128 MiB file, `reserve`, that holds room for
 commits. When a write finds the disk of the cache or the state full, the daemon removes the

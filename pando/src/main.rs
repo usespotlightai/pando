@@ -137,8 +137,12 @@ enum Command {
     /// Serves a branch as a block device until `detach`, then publishes it.
     Attach(device::AttachArgs),
     /// Stops the device of an attached branch; returns once the branch is published, or fails
-    /// with why the daemon could not publish it.
+    /// with why the daemon could not publish it. When `--publish-wait` runs out first, it
+    /// exits with 75: the daemon may still be publishing, and `detach` again waits for it.
     Detach(device::DetachArgs),
+    /// Reports how each branch attached on this host stands, one line each: the device or
+    /// mount, the branch, how far its uploads are behind its flushes, and its state.
+    Status(device::StatusArgs),
     /// Grows an attached branch and the devices over it while it serves. The file system on
     /// it keeps its size until it is grown too, with resize2fs for ext4.
     Resize(device::ResizeArgs),
@@ -149,7 +153,7 @@ impl Command {
     /// daemon, or runs other commands that each say for themselves.
     fn access(&self) -> Option<Access> {
         match self {
-            Command::Detach(_) | Command::Resize(_) | Command::Serve => None,
+            Command::Detach(_) | Command::Resize(_) | Command::Status(_) | Command::Serve => None,
             Command::Refs | Command::Stat | Command::Checkpoints | Command::Gc { delete: false, .. } => {
                 Some(Access::Read)
             }
@@ -210,6 +214,11 @@ impl Cli {
             }
             Command::Resize(r) => {
                 for p in [&mut r.device, &mut r.fuse].into_iter().flatten() {
+                    abs(p);
+                }
+            }
+            Command::Status(s) => {
+                for p in [&mut s.device, &mut s.fuse].into_iter().flatten() {
                     abs(p);
                 }
             }
@@ -342,7 +351,7 @@ impl Host {
         if self.drain_failed.load(Ordering::Relaxed) {
             1
         } else {
-            device::DRAINED
+            i32::from(device::TRY_AGAIN)
         }
     }
 
@@ -443,7 +452,11 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("Error: {e:?}");
-            ExitCode::FAILURE
+            if e.is::<device::StillPublishing>() {
+                ExitCode::from(device::TRY_AGAIN)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -581,18 +594,22 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
         }
         Command::Detach(d) => device::detach(d).await,
         Command::Resize(r) => device::resize(r, out).await,
-        Command::Stat => {
-            let u = gc::usage(&cache().await?).await?;
-            out.line(format!(
-                "{} branches, {} segments ({} MiB), {} change lists",
-                u.branches,
-                u.segments,
-                u.segment_bytes >> 20,
-                u.change_lists
-            ));
-            Ok(())
-        }
+        Command::Status(s) => device::status(s, out).await,
+        Command::Stat => stat(&cache().await?, out).await,
     }
+}
+
+/// Reports how much the store holds.
+async fn stat(cache: &Arc<Cache>, out: &Out) -> Result<()> {
+    let u = gc::usage(cache).await?;
+    out.line(format!(
+        "{} branches, {} segments ({} MiB), {} change lists",
+        u.branches,
+        u.segments,
+        u.segment_bytes >> 20,
+        u.change_lists
+    ));
+    Ok(())
 }
 
 /// Makes branch `dst` from branch `src`, or with `checkpoint` from checkpoint `src`.

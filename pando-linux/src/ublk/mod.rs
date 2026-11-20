@@ -273,9 +273,11 @@ pub async fn stop(id: u32) -> io::Result<()> {
 }
 
 /// Deletes stopped device `id`. It waits at most `publish_wait` for the daemon to let go of the
-/// device, which it does once its branch is published, and then at most 10 s for the kernel to
-/// free the device. A mount or an open file that still holds the stopped device fails the
-/// delete; the kernel frees the device once they let go of it.
+/// device, which it does once its branch is published, and fails with
+/// [`io::ErrorKind::TimedOut`] when the daemon still holds it. It then waits at most 10 s for
+/// the kernel to free the device: a mount or an open file that still holds the stopped device
+/// fails the delete with [`io::ErrorKind::ResourceBusy`], and the kernel frees the device once
+/// they let go of it.
 pub async fn delete(id: u32, publish_wait: Duration) -> io::Result<()> {
     blocking(move || {
         wait_released(&Path::new("/dev").join(format!("ublkc{id}")), publish_wait).map_err(|e| {
@@ -297,7 +299,7 @@ pub async fn delete(id: u32, publish_wait: Duration) -> io::Result<()> {
         .map_err(|e| {
             if e.kind() == io::ErrorKind::TimedOut {
                 io::Error::new(
-                    e.kind(),
+                    io::ErrorKind::ResourceBusy,
                     format!(
                         "the daemon of ublk device {id} let go of it, which a live daemon does after \
                          its publish, but the delete did not finish within {RELEASE_WAIT:?}: a mount or an open file \
