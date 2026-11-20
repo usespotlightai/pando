@@ -88,12 +88,21 @@ bytes as that sweep kept, if that is more. It keeps:
 - the objects not yet uploaded under the saved state of each branch closed on this host.
   `<cache>/states` lists those state files.
 
-It drops every other record. Over each run of dropped records it writes padding and syncs, then
-frees the pages with a hole punch: offsets stay and nothing is copied. An open finishes padding
-that a crash interrupted, and its scan skips padding. A sweep marks in an epoch of its own, older
+It drops every other record. Before it writes padding over each run of dropped records, it lists
+the run in `<log>.pads` and syncs that file; it then frees the pages with a hole punch, without
+a sync of the log: offsets stay and nothing is copied. An open writes the padding of every listed
+run again, and its scan skips padding. The next sync of the log unlists the runs it covered, and
+a sweep that finds more than 1 MiB listed syncs the log itself. A sweep marks in an epoch of its own, older
 than the one later puts use, so a commit that starts after a sweep keeps only what it puts again.
 Under constant random writes, the log stays near the live data plus the trees that uploads in
 flight still need.
+
+With `--cache-budget`, the chunks an open branch reaches that are already in the store stay only
+while they fit. A sweep keeps what it must, the chunks appended since the last sweep began, and
+every tree node, then the chunks read most recently, until the log is at seven eighths of the
+budget. The next sweep runs once the log nears the budget again, and at the latest after an
+eighth of it is appended. While the log is a quarter past the budget, a fetch waits for the sweep
+under way or due.
 
 ## Host daemon
 
