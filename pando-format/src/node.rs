@@ -7,6 +7,8 @@ pub const FANOUT: usize = 256;
 /// are named by the hash of their encoding, so a branch is one root entry.
 ///
 /// Encoding: child count (u16 LE), then `[slot u8][entry]` for each non-empty child in slot order.
+/// Each entry holds its child's location, so nodes with the same hash have the same children in
+/// the same places; GC's mark relies on this to walk a node's subtree once.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Node {
     children: Box<[Entry; FANOUT]>,
@@ -139,6 +141,25 @@ mod tests {
         assert_eq!(Node::decode(&b).unwrap(), n);
         assert!(Node::decode(&b[..b.len() - 1]).is_err());
         assert!(Node::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn the_location_of_a_child_is_part_of_the_encoding() {
+        let at = |frame| {
+            let mut n = Node::new();
+            n.set(
+                7,
+                Entry {
+                    hash: Hash::of(b"a"),
+                    loc: crate::Loc {
+                        frame,
+                        ..Entry::EMPTY.loc
+                    },
+                },
+            );
+            n.encode()
+        };
+        assert_ne!(at(1), at(2));
     }
 
     #[test]
