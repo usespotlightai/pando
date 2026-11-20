@@ -116,3 +116,4 @@ what to do.
 | `follow --once` | `followed` | `built` |
 | `gc` | `gc` | the counts of the report: `live`, `live_bytes`, `used_bytes`, `dead`, `dead_bytes`, `deleted`, `current_writer`, `young`, `needed_by_kept`, `revived`, `stale_change_lists`, `stale_log_records` |
 | `stat` | `stat` | `branches`, `segments`, `segment_bytes`, `change_lists` |
+| `purge` | `purged-part`, one per part as it finishes, then `purged` | `part`, `objects`; then `remote`, `objects`, `bytes`, `took_ms` |

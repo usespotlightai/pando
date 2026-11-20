@@ -10,14 +10,17 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+chrono = { workspace = true, features = ["std"] }
 futures.workspace = true
 object_store = { workspace = true, features = ["aws"] }
 pando-engine.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["fs", "sync"] }
 parking_lot.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 
 [lints]

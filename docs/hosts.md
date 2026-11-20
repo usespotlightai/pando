@@ -31,7 +31,7 @@ repository's release workflow from a commit on main.
 | `/usr/local/lib/pando/<version>/` | each installed release: the binary and the unit |
 | `/usr/local/bin/pando` | a link to the current release's binary |
 | `/etc/systemd/system/pando-attach@.service` | the unit |
-| `/etc/pando/pando.env` | the host's settings, mode 0600: `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_SESSION_TOKEN`, or `S3_CREDENTIALS=instance` for the instance role, and `PANDO_ARGS` for global flags such as `--cache` |
+| `/etc/pando/pando.env` | the host's settings, mode 0600: `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_SESSION_TOKEN`, or `S3_CREDENTIALS` set to `instance`, `aws` or `file` (see [tenancy.md](tenancy.md#credentials)), and `PANDO_ARGS` for global flags such as `--cache` |
 | `/etc/pando/attach/<name>.env` | one branch: `PANDO_BRANCH`, `PANDO_DEVICE` (`/dev/ublkbN`), and `PANDO_ATTACH_ARGS` for the other `attach` flags, such as `--remote`, `--dm`, `--images` and `--state` |
 
 Credentials go in the env file, never in `PANDO_ARGS` or `PANDO_ATTACH_ARGS`: those end up on
