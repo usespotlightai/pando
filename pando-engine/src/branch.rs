@@ -168,6 +168,11 @@ fn copy_of(c: &Checkpoint) -> Ref {
 /// `dst` held goes, flushes its writer had not published included: the writer's log is sealed,
 /// so a writer still running fails its next append, and `dst` moves to a new writer generation
 /// whose log is closed, so no open replays the old log or resumes the old writer's state.
+///
+/// The seal comes before the ref moves, so no strict flush the writer logs returns after the
+/// advance. When `dst` changed meanwhile, the advance fails with its writer fenced all the
+/// same, as when an open seals the log and loses the take: what the writer logged stays for the
+/// next open, and running the advance again is safe.
 pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
     let remote = Remote::new(Arc::clone(&ports.store));
     let (from, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
