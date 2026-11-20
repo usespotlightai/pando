@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
 pando-engine.workspace = true
 pando-host.workspace = true
 pando-format.workspace = true
@@ -20,6 +21,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 pando-linux.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+object_store.workspace = true
 tempfile.workspace = true
 
 [lints]

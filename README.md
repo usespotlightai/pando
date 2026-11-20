@@ -45,6 +45,11 @@ sharing one root system.
 - **Host daemon.** `pando serve --socket PATH` keeps the store's connections, the cache and the
   checkpoints it has read. `pando --socket PATH <command>` runs the command there, so a branch or
   attach skips process start-up, credential loading and cold connections.
+- **A store per org.** Each org's branches live under a prefix of their own, with credentials
+  that reach only that prefix: from the AWS chain, or from a file another process refreshes, such
+  as R2 temporary credentials. A host's cache never serves two stores, and `pando purge` deletes a
+  prefix. [docs/tenancy.md](docs/tenancy.md) has the policies and the steps for an org that
+  leaves.
 
 ## Crates
 

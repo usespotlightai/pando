@@ -7,21 +7,22 @@
 
 use parking_lot::Mutex;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut};
 use object_store::client::{
     HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpResponseBody,
     HttpService, ReqwestConnector,
 };
 use object_store::path::Path;
 use object_store::{
-    ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
-    UpdateVersion,
+    ClientOptions, CredentialProvider, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode,
+    PutOptions, PutPayload, UpdateVersion,
 };
 use pando_engine::ports::{Object, ObjectInfo, Store, StoreError, Version};
 use tokio::sync::{OnceCell, oneshot};
@@ -33,8 +34,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// fails each try quickly and the engine's retries and waits apply.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where the store is and how to sign in. Credentials come from the caller or the instance
-/// metadata service, never from a file this crate reads.
+/// Where the store is and how to sign in.
 #[derive(Clone, Default)]
 pub struct S3Config {
     /// The bucket the store lives in.
@@ -82,6 +82,51 @@ pub enum Credentials {
         /// The metadata service, `http://169.254.169.254` when `None`.
         endpoint: Option<String>,
     },
+    /// The AWS credential chain after static keys, as `vars` configure it: web identity
+    /// (`AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN`, as EKS sets them), else the container
+    /// credentials of ECS (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`) or of EKS Pod Identity
+    /// (`AWS_CONTAINER_CREDENTIALS_FULL_URI` with `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`), else
+    /// the instance's role. Each is fetched again before it expires.
+    Aws {
+        /// Values of the variables [`AWS_CHAIN_VARS`] names, by name; any other is ignored.
+        vars: Vec<(String, String)>,
+    },
+    /// A key in a JSON file another process keeps current, in the form `credential_process`
+    /// prints: `AccessKeyId`, `SecretAccessKey`, and for a temporary key `SessionToken` and
+    /// `Expiration` (RFC 3339). Each request reads the file again if its size or modification
+    /// time changed, so a replacement written before the old key expires takes over without a
+    /// failed request. A key past its `Expiration` fails the request as transient, and the
+    /// engine's retries wait for the file to change.
+    File {
+        /// The file.
+        path: PathBuf,
+    },
+}
+
+/// The variables of the AWS credential chain [`Credentials::Aws`] reads.
+pub const AWS_CHAIN_VARS: &[&str] = &[
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_ENDPOINT_URL_STS",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+];
+
+fn chain_key(var: &str) -> Option<AmazonS3ConfigKey> {
+    Some(match var {
+        "AWS_WEB_IDENTITY_TOKEN_FILE" => AmazonS3ConfigKey::WebIdentityTokenFile,
+        "AWS_ROLE_ARN" => AmazonS3ConfigKey::RoleArn,
+        "AWS_ROLE_SESSION_NAME" => AmazonS3ConfigKey::RoleSessionName,
+        "AWS_ENDPOINT_URL_STS" => AmazonS3ConfigKey::StsEndpoint,
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" => AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI" => AmazonS3ConfigKey::ContainerCredentialsFullUri,
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" => AmazonS3ConfigKey::ContainerAuthorizationTokenFile,
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT" => AmazonS3ConfigKey::MetadataEndpoint,
+        _ => return None,
+    })
 }
 
 impl Default for Credentials {
@@ -105,6 +150,11 @@ impl std::fmt::Debug for Credentials {
             Credentials::Instance { endpoint } => {
                 f.debug_struct("Instance").field("endpoint", endpoint).finish()
             }
+            Credentials::Aws { vars } => f
+                .debug_struct("Aws")
+                .field("vars", &vars.iter().map(|(k, _)| k).collect::<Vec<_>>())
+                .finish(),
+            Credentials::File { path } => f.debug_struct("File").field("path", path).finish(),
         }
     }
 }
@@ -185,6 +235,19 @@ impl S3Store {
                     b = b.with_metadata_endpoint(e);
                 }
             }
+            Credentials::Aws { vars } => {
+                for (var, value) in vars {
+                    if let Some(k) = chain_key(var) {
+                        b = b.with_config(k, value);
+                    }
+                }
+            }
+            Credentials::File { path } => {
+                b = b.with_credentials(Arc::new(FileCredentials {
+                    path: path.clone(),
+                    last: Mutex::new(None),
+                }));
+            }
         }
         let (tx, rx) = oneshot::channel();
         let bucket = c.bucket.clone();
@@ -254,6 +317,108 @@ impl S3Store {
             .map_err(|e| map_err(key, e))?;
         Ok(Version(r.e_tag.unwrap_or_default()))
     }
+}
+
+/// The key of [`Credentials::File`], read again when the file changes.
+struct FileCredentials {
+    path: PathBuf,
+    last: Mutex<Option<FromFile>>,
+}
+
+struct FromFile {
+    stamp: (Option<SystemTime>, u64),
+    credential: Arc<AwsCredential>,
+    expires: Option<SystemTime>,
+}
+
+impl std::fmt::Debug for FileCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileCredentials")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileCredentials {
+    fn error(&self, what: &str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "S3",
+            source: format!("the credentials in {}: {what}", self.path.display()).into(),
+        }
+    }
+
+    fn current(&self, f: &FromFile) -> object_store::Result<Arc<AwsCredential>> {
+        match f.expires {
+            Some(t) if t <= SystemTime::now() => Err(self.error(&format!(
+                "expired at {}, and the file has not changed since",
+                chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+            ))),
+            _ => Ok(Arc::clone(&f.credential)),
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for FileCredentials {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        let meta = tokio::fs::metadata(&self.path)
+            .await
+            .map_err(|e| self.error(&e.to_string()))?;
+        let stamp = (meta.modified().ok(), meta.len());
+        if let Some(f) = self.last.lock().as_ref().filter(|f| f.stamp == stamp) {
+            return self.current(f);
+        }
+        let text = tokio::fs::read(&self.path)
+            .await
+            .map_err(|e| self.error(&e.to_string()))?;
+        let (credential, expires) = parse_credentials(&text).map_err(|e| self.error(&e))?;
+        let f = FromFile {
+            stamp,
+            credential: Arc::new(credential),
+            expires,
+        };
+        let c = self.current(&f);
+        *self.last.lock() = Some(f);
+        c
+    }
+}
+
+/// The key in a `credential_process` document, and when it expires. An error names what is
+/// wrong without any of the file's text.
+fn parse_credentials(text: &[u8]) -> Result<(AwsCredential, Option<SystemTime>), String> {
+    let doc: serde_json::Value = serde_json::from_slice(text)
+        .map_err(|e| format!("not JSON at line {} column {}", e.line(), e.column()))?;
+    let field = |name: &str| -> Result<Option<String>, String> {
+        match doc.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+            Some(_) => Err(format!("{name} is not a string")),
+        }
+    };
+    let (Some(key_id), Some(secret_key)) = (field("AccessKeyId")?, field("SecretAccessKey")?) else {
+        return Err("it needs AccessKeyId and SecretAccessKey".into());
+    };
+    let token = match field("SessionToken")? {
+        Some(t) => Some(t),
+        None => field("Token")?,
+    };
+    let expires = field("Expiration")?
+        .map(|t| {
+            chrono::DateTime::parse_from_rfc3339(&t)
+                .map(SystemTime::from)
+                .map_err(|_| "Expiration is not an RFC 3339 time".to_string())
+        })
+        .transpose()?;
+    Ok((
+        AwsCredential {
+            key_id,
+            secret_key,
+            token,
+        },
+        expires,
+    ))
 }
 
 /// A client error the store answered that the same request gets again.
@@ -689,6 +854,227 @@ mod tests {
         }
     }
 
+    type Heads = Arc<std::sync::Mutex<Vec<String>>>;
+    type Reply = Box<dyn Fn(&str) -> (&'static str, String) + Send + Sync>;
+
+    async fn serving(reply: Reply) -> (std::net::SocketAddr, Heads) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let heads: Heads = Arc::default();
+        let h = Arc::clone(&heads);
+        let reply = Arc::new(reply);
+        tokio::spawn(async move {
+            loop {
+                let (mut c, _) = l.accept().await.unwrap();
+                let h = Arc::clone(&h);
+                let reply = Arc::clone(&reply);
+                tokio::spawn(async move {
+                    let head = read_head(&mut c).await;
+                    h.lock().unwrap().push(head.clone());
+                    let (status, body) = reply(&head);
+                    let r = format!(
+                        "HTTP/1.1 {status}\r\netag: \"e\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if c.write_all(r.as_bytes()).await.is_ok() {
+                        let _ = c.shutdown().await;
+                    }
+                });
+            }
+        });
+        (addr, heads)
+    }
+
+    fn signed_by(heads: &Heads, path: &str) -> Vec<String> {
+        heads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.split_whitespace().nth(1) == Some(path))
+            .filter_map(|h| {
+                h.split_once("credential=")
+                    .map(|(_, r)| r.split('/').next().unwrap_or("").to_string())
+            })
+            .collect()
+    }
+
+    fn store_at(addr: std::net::SocketAddr, credentials: Credentials) -> S3Store {
+        S3Store::new(&S3Config {
+            bucket: "b".into(),
+            endpoint: Some(format!("http://{addr}")),
+            region: "us-east-1".into(),
+            credentials,
+            allow_http: true,
+            ..S3Config::default()
+        })
+        .unwrap()
+    }
+
+    fn rfc3339(t: SystemTime) -> String {
+        chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+    }
+
+    fn write(path: &std::path::Path, text: &str) {
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, text).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_credentials_file_replaced_before_it_expires_signs_the_next_request() {
+        let (addr, heads) = serving(Box::new(|_| ("200 OK", "v".into()))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let soon = rfc3339(SystemTime::now() + Duration::from_secs(600));
+        write(
+            &path,
+            &format!(
+                r#"{{"Version":1,"AccessKeyId":"ASIAONE","SecretAccessKey":"s3cr3t1","SessionToken":"t1","Expiration":"{soon}"}}"#
+            ),
+        );
+        let s = store_at(addr, Credentials::File { path: path.clone() });
+        s.get("k").await.unwrap();
+        s.put("k", Bytes::from_static(b"v")).await.unwrap();
+        write(
+            &path,
+            &format!(
+                r#"{{"Version":1,"AccessKeyId":"ASIATWOTWO","SecretAccessKey":"s3cr3t2","SessionToken":"t2","Expiration":"{soon}"}}"#
+            ),
+        );
+        s.put("k", Bytes::from_static(b"v")).await.unwrap();
+        assert_eq!(signed_by(&heads, "/b/k"), ["asiaone", "asiaone", "asiatwotwo"]);
+        let last = heads.lock().unwrap().last().unwrap().clone();
+        assert!(last.contains("x-amz-security-token: t2\r\n"), "{last}");
+    }
+
+    #[tokio::test]
+    async fn an_expired_credentials_file_fails_as_transient_without_its_secret() {
+        let (addr, heads) = serving(Box::new(|_| ("200 OK", "v".into()))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let past = rfc3339(SystemTime::now() - Duration::from_secs(1));
+        write(
+            &path,
+            &format!(
+                r#"{{"AccessKeyId":"ASIAOLD","SecretAccessKey":"s3cr3t","SessionToken":"tok","Expiration":"{past}"}}"#
+            ),
+        );
+        let s = store_at(addr, Credentials::File { path: path.clone() });
+        let e = s.get("k").await.unwrap_err();
+        assert!(matches!(e, StoreError::Transient { .. }), "{e}");
+        let text = format!("{e} {e:?}");
+        assert!(text.contains("expired"), "{text}");
+        for secret in ["ASIAOLD", "s3cr3t", "tok\""] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(heads.lock().unwrap().is_empty());
+        write(&path, r#"{"AccessKeyId":"ASIANEW","SecretAccessKey":"s3cr3t"}"#);
+        s.get("k").await.unwrap();
+        assert_eq!(signed_by(&heads, "/b/k"), ["asianew"]);
+    }
+
+    #[test]
+    fn a_malformed_credentials_file_names_the_fault_and_no_value() {
+        for (text, fault) in [
+            (
+                r#"{"AccessKeyId":5,"SecretAccessKey":"s3cr3t"}"#,
+                "AccessKeyId is not a string",
+            ),
+            (
+                r#"{"AccessKeyId":"AKID"}"#,
+                "needs AccessKeyId and SecretAccessKey",
+            ),
+            (
+                r#"{"AccessKeyId":"AKID","SecretAccessKey":"s3cr3t","Expiration":"s3cr3t"}"#,
+                "not an RFC 3339",
+            ),
+            (r#"{"AccessKeyId":"AKID","SecretAccessKey":"s3cr3t""#, "not JSON"),
+        ] {
+            let e = parse_credentials(text.as_bytes()).err().unwrap();
+            assert!(e.contains(fault), "{e}");
+            assert!(!e.contains("s3cr3t") && !e.contains("AKID\""), "{e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn short_instance_sessions_are_fetched_again_and_uploads_go_on() {
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let n = Arc::clone(&fetched);
+        let (addr, heads) = serving(Box::new(move |head| {
+            let token = head.contains("x-aws-ec2-metadata-token: tok\r\n");
+            match head.split_whitespace().take(2).collect::<Vec<_>>()[..] {
+                ["put", "/latest/api/token"] => ("200 OK", "tok".into()),
+                ["get", "/latest/meta-data/iam/security-credentials/"] if token => ("200 OK", "role".into()),
+                ["get", "/latest/meta-data/iam/security-credentials/role"] if token => {
+                    let i = n.fetch_add(1, Ordering::SeqCst);
+                    let expires = rfc3339(SystemTime::now() + Duration::from_secs(120));
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"Code":"Success","AccessKeyId":"ASIA{i}","SecretAccessKey":"s{i}","Token":"t{i}","Expiration":"{expires}"}}"#
+                        ),
+                    )
+                }
+                [_, "/b/k"] => ("200 OK", "v".into()),
+                _ => ("401 Unauthorized", String::new()),
+            }
+        }))
+        .await;
+        let s = store_at(
+            addr,
+            Credentials::Instance {
+                endpoint: Some(format!("http://{addr}")),
+            },
+        );
+        s.put("k", Bytes::from_static(b"v")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.put("k", Bytes::from_static(b"v")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.get("k").await.unwrap();
+        assert_eq!(signed_by(&heads, "/b/k"), ["asia0", "asia1", "asia2"]);
+    }
+
+    #[tokio::test]
+    async fn the_aws_chain_takes_eks_pod_identity_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "pod-token").unwrap();
+        let (addr, heads) = serving(Box::new(|head| {
+            match head.split_whitespace().take(2).collect::<Vec<_>>()[..] {
+                ["get", "/v1/credentials"] if head.contains("authorization: pod-token\r\n") => (
+                    "200 OK",
+                    r#"{"AccessKeyId":"ASIAPOD","SecretAccessKey":"s3cr3t","Token":"session","Expiration":"2099-01-01T00:00:00Z"}"#.into(),
+                ),
+                ["get", "/b/k"] => ("200 OK", "v".into()),
+                _ => ("401 Unauthorized", String::new()),
+            }
+        }))
+        .await;
+        let vars = vec![
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI".to_string(),
+                format!("http://{addr}/v1/credentials"),
+            ),
+            (
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE".to_string(),
+                token.display().to_string(),
+            ),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "ignored".to_string()),
+        ];
+        let c = Credentials::Aws { vars };
+        assert!(!format!("{c:?}").contains("pod-token"));
+        let s = store_at(addr, c);
+        s.get("k").await.unwrap();
+        assert_eq!(signed_by(&heads, "/b/k"), ["asiapod"]);
+    }
+
+    #[test]
+    fn every_chain_variable_configures_the_client() {
+        for v in AWS_CHAIN_VARS {
+            assert!(chain_key(v).is_some(), "{v}");
+        }
+    }
+
     #[test]
     fn debug_shows_no_credential() {
         let c = S3Config {
@@ -704,6 +1090,23 @@ mod tests {
             assert!(!d.contains(secret), "{d}");
         }
         assert!(d.contains("temporary: true"), "{d}");
+        let f = FileCredentials {
+            path: "/run/pando/credentials.json".into(),
+            last: Mutex::new(Some(FromFile {
+                stamp: (None, 0),
+                credential: Arc::new(AwsCredential {
+                    key_id: "AKIDEXAMPLE".into(),
+                    secret_key: "s3cr3t".into(),
+                    token: Some("session".into()),
+                }),
+                expires: None,
+            })),
+        };
+        let d = format!("{f:?}");
+        assert!(d.contains("credentials.json"), "{d}");
+        for secret in ["AKIDEXAMPLE", "s3cr3t", "session"] {
+            assert!(!d.contains(secret), "{d}");
+        }
     }
 
     #[test]
