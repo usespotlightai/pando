@@ -273,6 +273,7 @@ impl Cache {
         d: &Decode<'_>,
         sources: &mut Vec<Entry>,
     ) -> Result<()> {
+        self.room_for_fetch().await;
         let decoded = on_cpu(self.cpu.as_ref(), class(d.background), move || {
             let keep = keep.as_ref().map(|k| -> &dyn Fn(&Hash) -> bool { k.as_ref() });
             decode_frame(&z, keep)

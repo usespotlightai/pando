@@ -63,9 +63,23 @@ struct State {
     next_lock: u64,
     next_place: u64,
     capacity: Option<u64>,
+    /// How many more changes to the files succeed before every change fails.
+    stop_after: Option<u64>,
 }
 
 impl State {
+    /// Counts a change to the files; it fails once [`SimFs::stop_after`] ran out.
+    fn change(&mut self) -> io::Result<()> {
+        match &mut self.stop_after {
+            Some(0) => Err(io::Error::other("the simulated host stopped")),
+            Some(n) => {
+                *n -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
     /// The bytes still free for files to grow into.
     fn free(&self) -> u64 {
         let Some(cap) = self.capacity else {
@@ -110,9 +124,21 @@ impl SimFs {
         self.lock_state().capacity = bytes;
     }
 
+    /// Lets `n` more changes to the files succeed and fails every change after them, as a
+    /// host that stopped part way would leave them; `None` lifts it, as [`Self::crash`] does.
+    pub fn stop_after(&self, n: Option<u64>) {
+        self.lock_state().stop_after = n;
+    }
+
+    /// Whether the changes [`Self::stop_after`] let through ran out.
+    pub fn stopped(&self) -> bool {
+        self.lock_state().stop_after == Some(0)
+    }
+
     /// Loses everything not yet durable, as a power cut would, and drops every lock.
     pub fn crash(&self) {
         let mut s = self.lock_state();
+        s.stop_after = None;
         for d in s.data.values_mut() {
             d.current = d.durable.clone();
             d.blocks = d.durable_blocks.clone();
@@ -177,6 +203,7 @@ impl LocalFs for SimFs {
             }
             (Open::Create | Open::CreateNew, Err(e)) if e.kind() == io::ErrorKind::NotFound => {
                 Self::parent_exists(&s, path)?;
+                s.change()?;
                 Self::new_file(&mut s, path, Vec::new(), BTreeMap::new())
             }
             (_, found) => found?,
@@ -187,17 +214,16 @@ impl LocalFs for SimFs {
 
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut s = self.lock_state();
+        s.change()?;
         let node = s.names.remove(from).ok_or_else(|| not_found(from))?;
         s.names.insert(to.to_path_buf(), node);
         Ok(())
     }
 
     async fn remove(&self, path: &Path) -> io::Result<()> {
-        self.lock_state()
-            .names
-            .remove(path)
-            .map(|_| ())
-            .ok_or_else(|| not_found(path))
+        let mut s = self.lock_state();
+        s.change()?;
+        s.names.remove(path).map(|_| ()).ok_or_else(|| not_found(path))
     }
 
     async fn list(&self, dir: &Path) -> io::Result<Vec<DirEntry>> {
@@ -244,6 +270,7 @@ impl LocalFs for SimFs {
 
     async fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         let mut s = self.lock_state();
+        s.change()?;
         s.durable_names
             .retain(|p, n| *n == Node::Dir || p.parent() != Some(dir));
         let now: Vec<(PathBuf, Node)> = s
@@ -376,6 +403,7 @@ impl LocalImage for SimFs {
 
     async fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
         let mut s = self.lock_state();
+        s.change()?;
         let i = Self::inode(&s, path)?;
         let d = s.data.entry(i).or_default();
         let end = usize_from(offset + len).min(d.current.len());
@@ -420,9 +448,18 @@ impl SimFile {
         f(s.data.entry(self.inode).or_default(), &mut s.next_place, free)
     }
 
+    /// [`Self::with_free`] for a change to the file, which [`SimFs::stop_after`] may fail.
+    fn change<T>(&self, f: impl FnOnce(&mut Data, &mut u64, u64) -> io::Result<T>) -> io::Result<T> {
+        let mut s = self.fs.lock_state();
+        s.change()?;
+        let free = s.free();
+        let s = &mut *s;
+        f(s.data.entry(self.inode).or_default(), &mut s.next_place, free)
+    }
+
     /// Writes `bufs` from `offset` as far as the free space lets the file grow.
     fn write_bufs(&self, bufs: &[Bytes], offset: u64) -> io::Result<()> {
-        self.with_free(|d, next, free| {
+        self.change(|d, next, free| {
             let limit = usize_from(d.len().saturating_add(free).min(u64_from(usize::MAX)));
             let mut at = usize_from(offset);
             for b in bufs {
@@ -470,15 +507,15 @@ impl LocalFile for SimFile {
     }
 
     async fn sync_data(&self) -> io::Result<()> {
-        self.with(|d| {
+        self.change(|d, _, _| {
             d.durable = d.current.clone();
             d.durable_blocks = d.blocks.clone();
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn set_len(&self, len: u64) -> io::Result<()> {
-        self.with_free(|d, _, free| {
+        self.change(|d, _, free| {
             if len > d.len() && len - d.len() > free {
                 return Err(full());
             }
@@ -490,7 +527,7 @@ impl LocalFile for SimFile {
     }
 
     async fn allocate(&self, len: u64) -> io::Result<()> {
-        self.with_free(|d, _, free| {
+        self.change(|d, _, free| {
             if len > d.len() {
                 if len - d.len() > free {
                     return Err(full());
@@ -502,14 +539,14 @@ impl LocalFile for SimFile {
     }
 
     async fn punch(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.with(|d| {
+        self.change(|d, _, _| {
             let end = usize_from(offset + len).min(d.current.len());
             let start = usize_from(offset).min(end);
             d.current[start..end].fill(0);
             let (first, last) = (u64_from(start).div_ceil(BLOCK), u64_from(end) / BLOCK);
             d.blocks.retain(|b, _| *b < first || *b >= last);
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn size(&self) -> io::Result<u64> {
