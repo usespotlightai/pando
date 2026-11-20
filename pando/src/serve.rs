@@ -167,11 +167,11 @@ async fn answer(host: Arc<Host>, c: UnixStream) -> Result<()> {
                 let job = tokio::spawn(async move {
                     match crate::run(&host, cli.command, &out).await {
                         Ok(()) => 0,
-                        Err(e) if e.is::<Drained>() => crate::device::DRAINED,
+                        Err(e) if e.is::<Drained>() => i32::from(crate::device::TRY_AGAIN),
                         Err(e) => {
                             out.err(format!("Error: {e:?}"));
                             if e.is::<crate::device::StillPublishing>() {
-                                crate::device::STILL_PUBLISHING
+                                i32::from(crate::device::TRY_AGAIN)
                             } else {
                                 1
                             }

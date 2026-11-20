@@ -351,7 +351,7 @@ impl Host {
         if self.drain_failed.load(Ordering::Relaxed) {
             1
         } else {
-            device::DRAINED
+            i32::from(device::TRY_AGAIN)
         }
     }
 
@@ -453,16 +453,12 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("Error: {e:?}");
             if e.is::<device::StillPublishing>() {
-                ExitCode::from(exit_status(device::STILL_PUBLISHING))
+                ExitCode::from(device::TRY_AGAIN)
             } else {
                 ExitCode::FAILURE
             }
         }
     }
-}
-
-fn exit_status(code: i32) -> u8 {
-    u8::try_from(code).unwrap_or(1)
 }
 
 async fn start(cli: Cli) -> Result<Exit> {

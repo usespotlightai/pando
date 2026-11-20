@@ -7,7 +7,7 @@
 //! takes `detach` and `detach force`, and answers `ok` once the branch is published.
 //!
 //! On SIGTERM or SIGINT an attach drains: it publishes what the branch holds, for at most
-//! `--drain-wait`, and exits with [`DRAINED`] without stopping the device. The kernel holds a
+//! `--drain-wait`, and exits with [`TRY_AGAIN`] without stopping the device. The kernel holds a
 //! ublk device's I/O until `attach --recover` takes it over; a FUSE mount ends with its daemon,
 //! and the next `attach` of the branch on this host publishes the writes it left.
 
@@ -16,14 +16,12 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, ValueEnum};
 
-/// The exit status of an attach that drained and left its device to the next daemon.
-pub(crate) const DRAINED: i32 = 75;
+/// The exit status of a command that left its work to finish later: an attach that drained
+/// and left its device to the next daemon, or a `detach` whose `--publish-wait` ran out while
+/// the daemon still held the device, which a later `detach` waits for again.
+pub(crate) const TRY_AGAIN: u8 = 75;
 
-/// The exit status of a `detach` whose `--publish-wait` ran out while the daemon still held
-/// the device: it may still be publishing, and a later `detach` waits for it again.
-pub(crate) const STILL_PUBLISHING: i32 = 75;
-
-/// The error of a `detach` whose `--publish-wait` ran out; it exits with [`STILL_PUBLISHING`].
+/// The error of a `detach` whose `--publish-wait` ran out; it exits with [`TRY_AGAIN`].
 #[derive(Debug)]
 pub(crate) struct StillPublishing(pub(crate) String);
 
@@ -1255,39 +1253,35 @@ mod linux {
     }
 
     /// Reports how the branches attached on this host stand: `s.device` or `s.fuse`, or every
-    /// daemon with a control socket. Each line is the device or mount, the branch, how far its
-    /// uploads are behind its flushes, and its state: `serving`, `lagging` once uploads are
-    /// a minute behind, `disk-full`, or `uploads-stopped`. Fails when a daemon does not answer.
+    /// daemon with a control socket, asked all at once. Each line is the device or mount, the
+    /// branch, how far its uploads are behind its flushes, and its state: `serving`, `lagging`
+    /// once uploads are a minute behind, `disk-full`, or `uploads-stopped`. A socket found in
+    /// the scan with no daemon behind it, which a killed daemon leaves, is skipped; a daemon
+    /// that is there but does not answer fails the command, as does one named that is not there.
     pub(crate) async fn status(s: StatusArgs, out: &Out) -> Result<()> {
-        let sockets = match (s.device.as_deref(), s.fuse.as_deref()) {
-            (None, None) => {
-                let mut v = Vec::new();
-                match std::fs::read_dir(CONTROL_DIR) {
-                    Ok(dir) => {
-                        for e in dir {
-                            let p = e?.path();
-                            if p.extension().is_some_and(|x| x == "sock") {
-                                let served = p
-                                    .file_stem()
-                                    .and_then(|n| n.to_str())
-                                    .filter(|n| n.starts_with("ublkb"))
-                                    .map_or_else(|| p.clone(), |n| Path::new("/dev").join(n));
-                                v.push((p, served));
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).with_context(|| format!("read {CONTROL_DIR}")),
-                }
-                v.sort();
-                v
-            }
-            (device, fuse) => vec![socket_of(device, fuse)?],
+        let scanned = s.device.is_none() && s.fuse.is_none();
+        let sockets = if scanned {
+            control_sockets()?
+        } else {
+            vec![socket_of(s.device.as_deref(), s.fuse.as_deref())?]
         };
+        let mut asks = tokio::task::JoinSet::new();
+        for (i, (p, served)) in sockets.into_iter().enumerate() {
+            asks.spawn(async move {
+                let r = tokio::time::timeout(2 * REQUEST_WAIT, ask_status(&p)).await;
+                (i, served, r)
+            });
+        }
+        let mut answers = Vec::new();
+        while let Some(a) = asks.join_next().await {
+            answers.push(a?);
+        }
+        answers.sort_by_key(|(i, ..)| *i);
         let mut silent = 0;
-        for (p, served) in sockets {
-            match tokio::time::timeout(2 * REQUEST_WAIT, ask_status(&p)).await {
+        for (_, served, r) in answers {
+            match r {
                 Ok(Ok(line)) => out.line(line),
+                Ok(Err(e)) if scanned && no_daemon(&e) => {}
                 Ok(Err(e)) => {
                     silent += 1;
                     out.err(format!("{}: {e:#}", served.display()));
@@ -1306,6 +1300,36 @@ mod linux {
             bail!("{silent} attached daemons did not report how they stand");
         }
         Ok(())
+    }
+
+    /// The control sockets in [`CONTROL_DIR`], with what each serves as far as its name tells:
+    /// the ublk device, or the socket itself for a FUSE mount.
+    fn control_sockets() -> Result<Vec<(PathBuf, PathBuf)>> {
+        let mut v = Vec::new();
+        let dir = match std::fs::read_dir(CONTROL_DIR) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(v),
+            Err(e) => return Err(e).with_context(|| format!("read {CONTROL_DIR}")),
+        };
+        for e in dir {
+            let p = e?.path();
+            if p.extension().is_some_and(|x| x == "sock") {
+                let served = p
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| n.starts_with("ublkb"))
+                    .map_or_else(|| p.clone(), |n| Path::new("/dev").join(n));
+                v.push((p, served));
+            }
+        }
+        v.sort();
+        Ok(v)
+    }
+
+    /// Whether `e` says no daemon listens on the socket: it was refused, or the socket is gone.
+    fn no_daemon(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound))
     }
 
     /// Asks the daemon on control socket `p` how its branch stands, as a line of `status`.
@@ -1359,6 +1383,32 @@ mod linux {
             assert_eq!(fuse_control_path(Path::new("/mnt/x/")), want);
             assert_eq!(fuse_control_path(Path::new("/mnt/./x")), want);
             assert_ne!(fuse_control_path(Path::new("/mnt/y")), want);
+        }
+
+        #[tokio::test]
+        async fn a_socket_a_killed_daemon_left_reads_as_no_daemon() {
+            let dir = std::env::temp_dir().join(format!("pando-status-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("ublkb9.sock");
+            let _ = std::fs::remove_file(&p);
+            drop(UnixListener::bind(&p).unwrap());
+            assert!(no_daemon(&ask_status(&p).await.unwrap_err()), "refused");
+            std::fs::remove_file(&p).unwrap();
+            assert!(no_daemon(&ask_status(&p).await.unwrap_err()), "gone");
+            let l = UnixListener::bind(&p).unwrap();
+            let daemon = tokio::spawn(async move {
+                let (c, _) = l.accept().await.unwrap();
+                let (r, mut w) = c.into_split();
+                let mut line = String::new();
+                BufReader::new(r).read_line(&mut line).await.unwrap();
+                assert_eq!(line, "status\n");
+                w.write_all(b"ok /dev/ublkb9\tmain\t1500\tserving\n")
+                    .await
+                    .unwrap();
+            });
+            assert_eq!(ask_status(&p).await.unwrap(), "/dev/ublkb9\tmain\t1.5s\tserving");
+            daemon.await.unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
         }
 
         #[test]
