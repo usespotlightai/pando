@@ -170,7 +170,11 @@ async fn answer(host: Arc<Host>, c: UnixStream) -> Result<()> {
                         Err(e) if e.is::<Drained>() => crate::device::DRAINED,
                         Err(e) => {
                             out.err(format!("Error: {e:?}"));
-                            1
+                            if e.is::<crate::device::StillPublishing>() {
+                                crate::device::STILL_PUBLISHING
+                            } else {
+                                1
+                            }
                         }
                     }
                 });

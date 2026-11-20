@@ -1,9 +1,10 @@
 //! The `attach`, `resize` and `detach` commands: a branch served as a block device, either a
 //! ublk device or, with `--fuse`, a loop device over a file in a FUSE mount. An attach listens
 //! on a control socket, `/run/pando/ublkbN.sock` or `/run/pando/fuse-<hash of the mount>.sock`,
-//! that `resize` asks to grow it. A request is one line, `grow <bytes>`; the answer is
-//! `ok <bytes>` or `error <why>`. The daemon of a FUSE mount also takes `detach` and
-//! `detach force`, and answers `ok` once the branch is published.
+//! that `resize` asks to grow it and `status` asks how it stands. A request is one line:
+//! `grow <bytes>`, answered with `ok <bytes>` or `error <why>`, or `status`, answered with
+//! `ok <device>\t<branch>\t<upload lag in ms>\t<state>`. The daemon of a FUSE mount also
+//! takes `detach` and `detach force`, and answers `ok` once the branch is published.
 //!
 //! On SIGTERM or SIGINT an attach drains: it publishes what the branch holds, for at most
 //! `--drain-wait`, and exits with [`DRAINED`] without stopping the device. The kernel holds a
@@ -17,6 +18,22 @@ use clap::{ArgAction, Args, ValueEnum};
 
 /// The exit status of an attach that drained and left its device to the next daemon.
 pub(crate) const DRAINED: i32 = 75;
+
+/// The exit status of a `detach` whose `--publish-wait` ran out while the daemon still held
+/// the device: it may still be publishing, and a later `detach` waits for it again.
+pub(crate) const STILL_PUBLISHING: i32 = 75;
+
+/// The error of a `detach` whose `--publish-wait` ran out; it exits with [`STILL_PUBLISHING`].
+#[derive(Debug)]
+pub(crate) struct StillPublishing(pub(crate) String);
+
+impl std::fmt::Display for StillPublishing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StillPublishing {}
 
 /// How an attach ended.
 #[derive(Debug)]
@@ -196,6 +213,17 @@ pub(crate) struct DetachArgs {
     pub(crate) publish_wait: Duration,
 }
 
+/// Which attached branches `status` reports on: one, or every one on this host.
+#[derive(Args, Debug)]
+pub(crate) struct StatusArgs {
+    /// The ublk device the branch is served as, /dev/ublkbN.
+    #[arg(long, conflicts_with = "fuse")]
+    pub(crate) device: Option<PathBuf>,
+    /// The FUSE mount directory the branch is served in (`attach --fuse`).
+    #[arg(long)]
+    pub(crate) fuse: Option<PathBuf>,
+}
+
 /// Which attached branch `resize` grows, and to what size.
 #[derive(Args, Debug)]
 pub(crate) struct ResizeArgs {
@@ -211,7 +239,7 @@ pub(crate) struct ResizeArgs {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{attach, detach, notify, resize};
+pub(crate) use linux::{attach, detach, notify, resize, status};
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) async fn attach(
@@ -232,6 +260,11 @@ pub(crate) async fn detach(_: DetachArgs) -> anyhow::Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) async fn resize(_: ResizeArgs, _: &crate::Out) -> anyhow::Result<()> {
     anyhow::bail!("resize needs Linux")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn status(_: StatusArgs, _: &crate::Out) -> anyhow::Result<()> {
+    anyhow::bail!("status needs Linux")
 }
 
 /// Tells a service manager how the daemon stands; systemd's notify protocol exists only on
@@ -261,7 +294,7 @@ mod linux {
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
-    use super::{AttachArgs, DetachArgs, Ended, Recover, ResizeArgs, Served};
+    use super::{AttachArgs, DetachArgs, Ended, Recover, ResizeArgs, Served, StatusArgs, StillPublishing};
     use crate::Out;
 
     const CONTROL_DIR: &str = "/run/pando";
@@ -619,6 +652,14 @@ mod linux {
     }
 
     impl Front {
+        /// What the daemon serves: its ublk device, or its FUSE mount directory.
+        fn served(&self) -> PathBuf {
+            match self {
+                Front::Ublk(id) => PathBuf::from(format!("/dev/ublkb{id}")),
+                Front::Fuse(dir, _) => dir.clone(),
+            }
+        }
+
         /// The control socket of the daemon.
         fn control_path(&self) -> PathBuf {
             match self {
@@ -935,10 +976,32 @@ mod linux {
             (Ok(Request::Detach { .. }), ..) => {
                 "error detach a ublk device with `detach --device`\n".to_owned()
             }
+            (Ok(Request::Status), ..) => status_reply(att, front, name).await,
             (Err(e), ..) => format!("error {}\n", one_line(&format!("{e:#}"))),
         };
         w.write_all(reply.as_bytes()).await?;
         Ok(false)
+    }
+
+    /// The answer to a `status` request: what `front` serves, branch `name`, its upload lag in
+    /// milliseconds and its state.
+    async fn status_reply(att: &Attachment, front: &Front, name: &str) -> String {
+        let v = att.volume();
+        let lag = v.upload_lag();
+        let state = if v.upload_error().is_some() {
+            "uploads-stopped"
+        } else if v.disk_full().await {
+            "disk-full"
+        } else if lag >= LAGGING {
+            "lagging"
+        } else {
+            "serving"
+        };
+        format!(
+            "ok {}\t{name}\t{}\t{state}\n",
+            front.served().display(),
+            lag.as_millis()
+        )
     }
 
     /// A request on the control socket.
@@ -946,6 +1009,7 @@ mod linux {
     enum Request {
         Grow(u64),
         Detach { force: bool },
+        Status,
     }
 
     fn parse_request(line: &str) -> Result<Request> {
@@ -953,6 +1017,7 @@ mod linux {
             Some(("grow", n)) => Ok(Request::Grow(n.parse().with_context(|| format!("size {n:?}"))?)),
             Some(("detach", "force")) => Ok(Request::Detach { force: true }),
             None if line.trim_end() == "detach" => Ok(Request::Detach { force: false }),
+            None if line.trim_end() == "status" => Ok(Request::Status),
             _ => bail!("unknown request {:?}", line.trim_end()),
         }
     }
@@ -1107,12 +1172,12 @@ mod linux {
         let mut line = String::new();
         let n = tokio::time::timeout(wait, BufReader::new(rd).read_line(&mut line))
             .await
-            .with_context(|| {
-                format!(
+            .map_err(|_| {
+                StillPublishing(format!(
                     "the daemon of {} did not answer within {wait:?}; it may still be publishing \
                      its branch, or something still holds its loop device",
                     dir.display()
-                )
+                ))
             })??;
         match line.trim_end().split_once(' ') {
             _ if n == 0 => bail!(
@@ -1134,7 +1199,7 @@ mod linux {
     async fn detach_ublk(d: &DetachArgs, device: &Path) -> Result<()> {
         let id = pando_linux::device_id(device)?;
         if !device.exists() && Path::new(&format!("/dev/ublkc{id}")).exists() {
-            pando_linux::delete(id, d.publish_wait).await?;
+            delete(id, d.publish_wait).await?;
             return published(Path::new(CONTROL_DIR), id, device);
         }
         let switch = DmSwitch::new();
@@ -1159,7 +1224,7 @@ mod linux {
                     switch.resume(dm).await?;
                 }
                 switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
-                pando_linux::delete(id, d.publish_wait).await?;
+                delete(id, d.publish_wait).await?;
                 return published(Path::new(CONTROL_DIR), id, device);
             }
             switch.remove(dm).await.with_context(|| format!("remove {dm}"))?;
@@ -1173,8 +1238,103 @@ mod linux {
         };
         pando_linux::stop(id).await?;
         drop(lock);
-        pando_linux::delete(id, d.publish_wait).await?;
+        delete(id, d.publish_wait).await?;
         published(Path::new(CONTROL_DIR), id, device)
+    }
+
+    /// Deletes stopped ublk device `id` as [`pando_linux::delete`] does; [`StillPublishing`]
+    /// when its daemon still holds it after `publish_wait`.
+    async fn delete(id: u32, publish_wait: Duration) -> Result<()> {
+        pando_linux::delete(id, publish_wait).await.map_err(|e| {
+            if e.kind() == ErrorKind::TimedOut {
+                StillPublishing(e.to_string()).into()
+            } else {
+                anyhow::Error::new(e)
+            }
+        })
+    }
+
+    /// Reports how the branches attached on this host stand: `s.device` or `s.fuse`, or every
+    /// daemon with a control socket. Each line is the device or mount, the branch, how far its
+    /// uploads are behind its flushes, and its state: `serving`, `lagging` once uploads are
+    /// a minute behind, `disk-full`, or `uploads-stopped`. Fails when a daemon does not answer.
+    pub(crate) async fn status(s: StatusArgs, out: &Out) -> Result<()> {
+        let sockets = match (s.device.as_deref(), s.fuse.as_deref()) {
+            (None, None) => {
+                let mut v = Vec::new();
+                match std::fs::read_dir(CONTROL_DIR) {
+                    Ok(dir) => {
+                        for e in dir {
+                            let p = e?.path();
+                            if p.extension().is_some_and(|x| x == "sock") {
+                                let served = p
+                                    .file_stem()
+                                    .and_then(|n| n.to_str())
+                                    .filter(|n| n.starts_with("ublkb"))
+                                    .map_or_else(|| p.clone(), |n| Path::new("/dev").join(n));
+                                v.push((p, served));
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("read {CONTROL_DIR}")),
+                }
+                v.sort();
+                v
+            }
+            (device, fuse) => vec![socket_of(device, fuse)?],
+        };
+        let mut silent = 0;
+        for (p, served) in sockets {
+            match tokio::time::timeout(2 * REQUEST_WAIT, ask_status(&p)).await {
+                Ok(Ok(line)) => out.line(line),
+                Ok(Err(e)) => {
+                    silent += 1;
+                    out.err(format!("{}: {e:#}", served.display()));
+                }
+                Err(_) => {
+                    silent += 1;
+                    out.err(format!(
+                        "{}: the daemon did not answer within {:?}",
+                        served.display(),
+                        2 * REQUEST_WAIT
+                    ));
+                }
+            }
+        }
+        if silent > 0 {
+            bail!("{silent} attached daemons did not report how they stand");
+        }
+        Ok(())
+    }
+
+    /// Asks the daemon on control socket `p` how its branch stands, as a line of `status`.
+    async fn ask_status(p: &Path) -> Result<String> {
+        let conn = UnixStream::connect(p)
+            .await
+            .with_context(|| format!("connect to {}; is the daemon running?", p.display()))?;
+        let (rd, mut w) = conn.into_split();
+        w.write_all(b"status\n").await?;
+        w.shutdown().await?;
+        let mut line = String::new();
+        BufReader::new(rd).read_line(&mut line).await?;
+        let reply = line.trim_end();
+        let fields = reply
+            .strip_prefix("ok ")
+            .map(|r| r.split('\t').collect::<Vec<_>>());
+        match fields.as_deref() {
+            Some([served, branch, lag, state]) => {
+                let ms: u64 = lag.parse().with_context(|| format!("upload lag {lag:?}"))?;
+                Ok(format!(
+                    "{served}\t{branch}\t{:.1}s\t{state}",
+                    Duration::from_millis(ms).as_secs_f64()
+                ))
+            }
+            _ => match reply.split_once(' ') {
+                Some(("error", why)) => bail!("{why}"),
+                _ => bail!("the daemon answered {reply:?}"),
+            },
+        }
     }
 
     /// Fails while `users` hold device `dev`, so a stop cannot cut a mounted file system off.
@@ -1215,6 +1375,8 @@ mod linux {
                 parse_request("detach force\n").unwrap(),
                 Request::Detach { force: true }
             );
+            assert_eq!(parse_request("status\n").unwrap(), Request::Status);
+            assert!(parse_request("status all\n").is_err());
             assert!(parse_request("detach now\n").is_err());
             assert!(parse_request("grow\n").is_err());
             assert!(parse_request("shrink 4096\n").is_err());
