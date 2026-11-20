@@ -90,4 +90,7 @@ pub trait Store: Send + Sync + fmt::Debug {
     async fn list(&self, dir: &str) -> Result<Vec<ObjectInfo>, StoreError>;
     /// Deleting a missing object is not an error.
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
+    /// Whether the store keeps an object's earlier versions when it is replaced or deleted, so
+    /// a delete can be undone. Finding out may put an empty object at [`pando_format::keys::VERSIONS`].
+    async fn keeps_versions(&self) -> Result<bool, StoreError>;
 }

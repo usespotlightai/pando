@@ -1,0 +1,16 @@
+[Unit]
+Description=Pando GC of the store: reports what it finds dead, and deletes it with --delete
+Documentation=https://github.com/usespotlightai/pando/blob/main/docs/hosts.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/pando/pando.env
+EnvironmentFile=-/etc/pando/gc.env
+UnsetEnvironment=PANDO_SOCKET
+CacheDirectory=pando-gc
+CacheDirectoryMode=0700
+ExecStart=/usr/local/bin/pando --cache /var/cache/pando-gc gc $PANDO_GC_ARGS
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Pando GC of the store
+Documentation=https://github.com/usespotlightai/pando/blob/main/docs/hosts.md
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

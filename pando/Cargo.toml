@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 pando-linux.workspace = true
 
 [dev-dependencies]
+pando-engine = { workspace = true, features = ["sim"] }
 tempfile.workspace = true
 
 [lints]

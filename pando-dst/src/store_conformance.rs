@@ -12,6 +12,7 @@ pub async fn check(store: &dyn Store) {
     ranges_and_tails(store).await;
     list_returns_one_folder_in_key_order(store).await;
     delete_is_idempotent(store).await;
+    versions_answer_the_same_twice(store).await;
 }
 
 /// Deletes what [`check`] left under `test/`.
@@ -22,6 +23,12 @@ pub async fn clean_up(store: &dyn Store) {
     for o in store.list("test").await.unwrap() {
         store.delete(&o.key).await.unwrap();
     }
+    store.delete(pando_format::keys::VERSIONS).await.unwrap();
+}
+
+async fn versions_answer_the_same_twice(store: &dyn Store) {
+    let first = store.keeps_versions().await.unwrap();
+    assert_eq!(store.keeps_versions().await.unwrap(), first);
 }
 
 fn b(s: &'static str) -> Bytes {

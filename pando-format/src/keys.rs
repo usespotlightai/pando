@@ -17,6 +17,8 @@ const HINTS: &str = "hints";
 pub const WARM: &str = "warm";
 /// The marker that holds the store's [`crate::StoreFormat`].
 pub const FORMAT: &str = "format";
+/// An empty object a put tells from whether the store keeps earlier versions of objects.
+pub const VERSIONS: &str = "versions";
 
 /// The key of segment `id`'s data.
 pub fn segment(id: SegId) -> String {

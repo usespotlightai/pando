@@ -7,8 +7,9 @@
 # takes them from DIR, and checks the archive against SHA256SUMS before unpacking it.
 # Each version lives in /usr/local/lib/pando/VERSION. /usr/local/bin/pando is a link to the
 # current one, replaced in one rename: a running daemon keeps the binary it started with, and
-# every process started after the rename runs the new one. Installs the systemd unit
-# pando-attach@.service and creates /etc/pando/attach, mode 0700.
+# every process started after the rename runs the new one. Installs the release's systemd
+# units, pando-attach@.service and pando-gc.service with pando-gc.timer, which stays off until
+# enabled, and creates /etc/pando/attach, mode 0700.
 # --restart then restarts each running pando-attach@ unit, one at a time: its daemon drains and
 # the new binary takes its device over. It stops at the first unit that fails to come back, and
 # fails when systemd is not running.
@@ -60,7 +61,6 @@ name=pando-${version}-${arch}-linux
 lib=/usr/local/lib/pando
 dir=${lib}/${version}
 bin=/usr/local/bin/pando
-unit=/etc/systemd/system/pando-attach@.service
 
 if [[ ! -x ${dir}/pando ]]; then
 	work=$(mktemp -d)
@@ -88,8 +88,12 @@ fi
 
 running=$("${dir}/pando" --version)
 install -d -m 0700 /etc/pando /etc/pando/attach
-install -m 0644 "${dir}/pando-attach@.service" "${unit}.new"
-mv -f "${unit}.new" "${unit}"
+for f in "${dir}"/*.service "${dir}"/*.timer; do
+	[[ -e ${f} ]] || continue
+	unit=/etc/systemd/system/${f##*/}
+	install -m 0644 "${f}" "${unit}.new"
+	mv -f "${unit}.new" "${unit}"
+done
 ln -sfn "${dir}/pando" "${bin}.new"
 mv -Tf "${bin}.new" "${bin}"
 echo "${bin} is ${running}"

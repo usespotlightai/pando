@@ -56,6 +56,7 @@ struct State {
     refused: Vec<StoreOp>,
     latency: Duration,
     slow: Vec<(String, Duration)>,
+    versioned: bool,
 }
 
 /// An object store in memory, with S3's conditional write rules.
@@ -96,6 +97,11 @@ impl SimStore {
     /// Ends every refusal of [`SimStore::refuse`].
     pub fn accept(&self) {
         self.state.lock().refused.clear();
+    }
+
+    /// Makes [`Store::keeps_versions`] answer `on`; a new store keeps no versions.
+    pub fn set_versioned(&self, on: bool) {
+        self.state.lock().versioned = on;
     }
 
     /// Drops every injected fault no call has returned yet.
@@ -301,6 +307,10 @@ impl Store for SimStore {
                 modified: o.modified,
             })
             .collect())
+    }
+
+    async fn keeps_versions(&self) -> Result<bool, StoreError> {
+        Ok(self.state.lock().versioned)
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {

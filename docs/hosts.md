@@ -30,9 +30,12 @@ repository's release workflow from a commit on main.
 |---|---|
 | `/usr/local/lib/pando/<version>/` | each installed release: the binary and the unit |
 | `/usr/local/bin/pando` | a link to the current release's binary |
-| `/etc/systemd/system/pando-attach@.service` | the unit |
+| `/etc/systemd/system/pando-attach@.service` | the unit that serves a branch |
+| `/etc/systemd/system/pando-gc.service`, `pando-gc.timer` | the daily GC of the store, off until enabled (see [GC](#gc)) |
 | `/etc/pando/pando.env` | the host's settings, mode 0600: `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_SESSION_TOKEN`, or `S3_CREDENTIALS=instance` for the instance role, and `PANDO_ARGS` for global flags such as `--cache` |
 | `/etc/pando/attach/<name>.env` | one branch: `PANDO_BRANCH`, `PANDO_DEVICE` (`/dev/ublkbN`), and `PANDO_ATTACH_ARGS` for the other `attach` flags, such as `--remote`, `--dm`, `--images` and `--state` |
+| `/etc/pando/gc.env` | optional: `PANDO_GC_ARGS` for the `gc` flags of `pando-gc.service`, such as `--remote` and `--delete` |
+| `/var/cache/pando-gc/` | the cache of `pando-gc.service` |
 
 Credentials go in the env file, never in `PANDO_ARGS` or `PANDO_ATTACH_ARGS`: those end up on
 the command line. Quote a value that holds spaces: `PANDO_ATTACH_ARGS="--state /data/state --dm b1"`.
@@ -144,3 +147,58 @@ the branch.
 
 Nothing reports how many writes were lost yet. The ref records only what was published, and the
 upload lag of each branch is not exported. Until it is, the bound above is the only figure.
+
+## GC
+
+`pando gc` marks every segment a branch or a checkpoint reaches and reports the rest: what it
+would delete (`dead`), what it keeps because a current writer may still publish it or because
+it is younger than `--keep-young`, and what a branch reached again between its two marks
+(`revived`). `--delete` deletes what it reports dead, with the change lists no branch reads and
+the write logs of deleted branches. Run it from one host per store.
+
+**Versioning.** `gc --delete` refuses a store whose bucket keeps no earlier versions of what is
+replaced or deleted, so that a wrong delete can be undone. It finds out by putting an empty
+object, `versions`, at the store's root. `--unversioned` deletes anyway, for a store such as R2
+that has no versioning. Turn versioning on, and let earlier versions expire after 14 days:
+
+```bash
+aws s3api put-bucket-versioning --bucket BUCKET --versioning-configuration Status=Enabled
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket BUCKET --lifecycle-configuration '{"Rules": [{"ID": "pando-earlier-versions", "Status": "Enabled", "Filter": {"Prefix": ""}, "NoncurrentVersionExpiration": {"NoncurrentDays": 14}, "Expiration": {"ExpiredObjectDeleteMarker": true}, "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}]}'
+```
+
+With MinIO, `mc version enable ALIAS/BUCKET`. A deleted segment stays in the bucket, and is
+billed, for those 14 days; each publish of a branch keeps the ref it replaced for as long.
+
+**Schedule.** `pando-gc.service` runs `pando gc` with a cache of its own, and `pando-gc.timer`
+runs it once a day. Enable the timer on one host: `systemctl enable --now pando-gc.timer`. The
+report is one line in the journal: `journalctl -u pando-gc`. Put the flags in
+`/etc/pando/gc.env`, such as `PANDO_GC_ARGS="--remote s3://org"` for a store under a prefix.
+The unit only reports until `--delete` is added there. Add it once the reports have matched
+what you expect for two weeks: `dead` grows with the branches and checkpoints deleted and the
+writes replaced, and `revived` stays near zero. A `revived` that grows means branch copies
+come close to the `--validate` delay.
+
+**Restoring from a version.** A delete on a versioned bucket only puts a delete marker in front
+of the object; deleting the marker brings the object back. To bring back everything deleted
+under a store's prefix since a time, such as a segment a branch fails to read
+(`segments/<id>.idx: not found`), or a branch `pando delete` removed with its write log:
+
+```bash
+aws s3api list-object-versions --bucket BUCKET --prefix PREFIX/ --output text \
+  --query "DeleteMarkers[?IsLatest && LastModified>='2026-11-20T09:00:00Z'].[Key,VersionId]" |
+  while read -r key version; do aws s3api delete-object --bucket BUCKET --key "$key" --version-id "$version"; done
+```
+
+A ref a wrong write replaced comes back by copying its earlier version over it, with the branch
+detached everywhere: list the versions of `PREFIX/refs/<name>`, then
+
+```bash
+aws s3api copy-object --bucket BUCKET --key PREFIX/refs/NAME --copy-source "BUCKET/PREFIX/refs/NAME?versionId=VERSION"
+```
+
+If GC ran since the ref was replaced, also bring back the segments it deleted since then, as
+above. `tests/kernel/gc.sh` deletes a branch, lets GC delete its segments, deletes the delete
+markers and reads the branch back whole.

@@ -24,6 +24,7 @@ use object_store::{
     UpdateVersion,
 };
 use pando_engine::ports::{Object, ObjectInfo, Store, StoreError, Version};
+use pando_format::keys;
 use tokio::sync::{OnceCell, oneshot};
 
 /// The longest one request may take. A segment PUT shares the uplink with the other PUTs in
@@ -475,6 +476,18 @@ impl Store for S3Store {
             Err(e) => Err(map_err(key, e)),
         }
     }
+
+    async fn keeps_versions(&self) -> Result<bool, StoreError> {
+        let key = keys::VERSIONS;
+        let r = self
+            .inner
+            .get(key)
+            .await?
+            .put(&self.path(key), PutPayload::new())
+            .await
+            .map_err(|e| map_err(key, e))?;
+        Ok(r.version.is_some_and(|v| !v.is_empty() && v != "null"))
+    }
 }
 
 #[cfg(test)]
@@ -486,7 +499,7 @@ mod tests {
 
     use super::*;
 
-    async fn answer(mut c: TcpStream, status: &str, body: &str) {
+    async fn answer(mut c: TcpStream, status: &str, headers: &str, body: &str) {
         let mut req = Vec::new();
         let mut buf = [0; 4096];
         let head_end = loop {
@@ -508,7 +521,7 @@ mod tests {
             req.extend_from_slice(&buf[..n]);
         }
         let reply = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
         if c.write_all(reply.as_bytes()).await.is_ok() {
@@ -517,6 +530,14 @@ mod tests {
     }
 
     async fn answering(status: &'static str, body: &'static str) -> (S3Store, Arc<AtomicUsize>) {
+        answering_with(status, "", body).await
+    }
+
+    async fn answering_with(
+        status: &'static str,
+        headers: &'static str,
+        body: &'static str,
+    ) -> (S3Store, Arc<AtomicUsize>) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let seen = Arc::new(AtomicUsize::new(0));
@@ -525,7 +546,7 @@ mod tests {
             loop {
                 let (c, _) = l.accept().await.unwrap();
                 n.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(answer(c, status, body));
+                tokio::spawn(answer(c, status, headers, body));
             }
         });
         let s = S3Store::new(&S3Config {
@@ -574,6 +595,16 @@ mod tests {
             "{} bytes",
             e.to_string().len()
         );
+    }
+
+    #[tokio::test]
+    async fn a_put_answered_with_a_version_id_means_the_store_keeps_versions() {
+        let (s, _) = answering_with("200 OK", "etag: \"e\"\r\nx-amz-version-id: 3HL4kqtJ\r\n", "").await;
+        assert!(s.keeps_versions().await.unwrap());
+        let (s, _) = answering_with("200 OK", "etag: \"e\"\r\nx-amz-version-id: null\r\n", "").await;
+        assert!(!s.keeps_versions().await.unwrap());
+        let (s, _) = answering_with("200 OK", "etag: \"e\"\r\n", "").await;
+        assert!(!s.keeps_versions().await.unwrap());
     }
 
     #[tokio::test]
