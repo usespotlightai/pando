@@ -8,8 +8,10 @@
 # SOAK_SECONDS: a checked read of the read region, random reads, and a checked rewrite of the
 # write region, while it samples the log's disk every 10 s. It ends with a drain (SIGTERM) and
 # `gc --delete`, so the store stays bounded. With SOAK_LAST, the segment detaches instead, a
-# fresh host reads the branch whole, and the log's disk over the whole run is checked: never
-# far past the budget, and no higher in the last segment than in the first.
+# fresh host reads the branch whole, and the log's disk over the whole run is checked: from 30 s
+# after each attach, within twice the budget and the write region (the log passes the budget by
+# what one sweep's reads fetch, and by writes not uploaded yet), and no higher in the last
+# segment than in the first.
 #   SOAK_PHASE=start|resume  SOAK_SECONDS=17400  SOAK_SEGMENT=1  SOAK_LAST=1
 # ublk ids 77-78.
 TEST=soak
@@ -26,7 +28,7 @@ SIZE=$((4 << 30))
 PHASE=${SOAK_PHASE:?start or resume}
 SECONDS_LEFT=${SOAK_SECONDS:?seconds to run}
 SEG=${SOAK_SEGMENT:-1}
-LIMIT=$((BUDGET + BUDGET / 2))
+LIMIT=$((2 * BUDGET + WRITE))
 pid=
 spid=
 trap '[[ -n $spid ]] && kill "$spid" 2>/dev/null' EXIT
@@ -37,6 +39,7 @@ start)
 	echo "$RUN" >"$W/run"
 	echo "seg,t,log_bytes,log_apparent,pads_bytes,rss_kib" >"$W/samples.csv"
 	echo "seg,store_bytes" >"$W/store.csv"
+	: >"$W/settled.csv"
 	echo 0 >"$W/seed"
 	;;
 resume) RUN=$(cat "$W/run") ;;
@@ -110,6 +113,7 @@ fi
 
 log=$W/seg$SEG.log
 if attach_budget "$log"; then
+	echo "$SEG,$(($(date +%s || true) + 30))" >>"$W/settled.csv"
 	check "attach with the budget ($PHASE)" ok
 else
 	check "attach with the budget ($PHASE)" "$(tail -1 "$log" || true)"
@@ -152,7 +156,7 @@ done
 kill "$spid" 2>/dev/null
 wait "$spid" 2>/dev/null
 spid=
-top=$(awk -F, -v s="$SEG" '$1 == s && $3 > m { m = $3 } END { print m + 0 }' "$W/samples.csv")
+top=$(awk -F, -v s="$SEG" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] && $3 > m { m = $3 } END { print m + 0 }' "$W/settled.csv" "$W/samples.csv")
 if ((top <= LIMIT)); then
 	check "the log stays near the budget over $cycles cycles" "ok, at most $((top / MiB)) MiB of $((BUDGET / MiB))"
 else
@@ -190,7 +194,7 @@ else
 		check "fresh host" "attach: $(tail -1 "$W/fresh.log" || true)"
 	fi
 	pid=
-	mean() { awk -F, -v s="$1" 'NR > 1 && $1 == s { n++; t += $3 } END { if (n) printf "%d", t / n; else print 0 }' "$W/samples.csv"; }
+	mean() { awk -F, -v s="$1" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] { n++; t += $3 } END { if (n) printf "%d", t / n; else print 0 }' "$W/settled.csv" "$W/samples.csv"; }
 	first=$(mean 1)
 	last=$(mean "$SEG")
 	if ((last <= first + first / 4 + 32 * MiB)); then
