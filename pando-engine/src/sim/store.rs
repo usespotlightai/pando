@@ -120,7 +120,8 @@ impl SimStore {
     }
 
     /// Makes every call on a key that starts with `prefix` take `latency` instead, as calls on
-    /// large objects over a slow link do.
+    /// large objects over a slow link do. A key under several such prefixes takes the latency of
+    /// the longest.
     pub fn set_latency_under(&self, prefix: &str, latency: Duration) {
         let mut s = self.state.lock();
         s.slow.retain(|(p, _)| p != prefix);
@@ -157,7 +158,8 @@ impl SimStore {
             let s = self.state.lock();
             s.slow
                 .iter()
-                .find(|(p, _)| key.starts_with(p.as_str()))
+                .filter(|(p, _)| key.starts_with(p.as_str()))
+                .max_by_key(|(p, _)| p.len())
                 .map_or(s.latency, |(_, l)| *l)
         };
         if !latency.is_zero() {
@@ -337,5 +339,24 @@ mod tests {
             s.create("k", Bytes::new()).await,
             Err(StoreError::AlreadyExists { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_under_two_slow_prefixes_takes_the_longer_ones_latency() {
+        let s = SimStore::new(Arc::new(SimClock::new()));
+        s.set_latency(Duration::from_millis(1));
+        s.set_latency_under("segments/", Duration::from_millis(500));
+        s.set_latency_under("segments/b", Duration::from_millis(30));
+        let took = |key: &'static str| {
+            let s = &s;
+            async move {
+                let t0 = tokio::time::Instant::now();
+                s.create(key, Bytes::new()).await.unwrap();
+                t0.elapsed()
+            }
+        };
+        assert_eq!(took("segments/b/1").await, Duration::from_millis(30));
+        assert_eq!(took("segments/a/1").await, Duration::from_millis(500));
+        assert_eq!(took("refs/main").await, Duration::from_millis(1));
     }
 }
