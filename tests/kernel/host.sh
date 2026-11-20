@@ -14,4 +14,5 @@ data=()
 [[ -n ${DATA:-} ]] && data=(-v "$DATA":/data)
 pando=$(readlink -f "$PANDO")
 docker run --rm --privileged -v /dev:/dev "${data[@]}" -v "$pando":/pando:ro -v "$RESULTS":/results \
-	-e MODES -e TESTS -e DEVS -e PERF -e ASAN_OPTIONS pando-kernel-tests "$@"
+	-e MODES -e TESTS -e DEVS -e PERF -e ASAN_OPTIONS -e KEEP_STORE -e SOAK_PHASE -e SOAK_SECONDS \
+	-e SOAK_SEGMENT -e SOAK_LAST -e SOAK_BUDGET_MIB -e SOAK_READ_MIB -e SOAK_WRITE_MIB pando-kernel-tests "$@"

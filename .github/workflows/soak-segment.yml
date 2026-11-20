@@ -1,0 +1,116 @@
+name: soak-segment
+
+# One segment of the cache-budget soak (tests/kernel/soak.sh), called by soak.yml. It takes the
+# pando binary the soak built, restores /data from the segment before, runs this segment, and
+# keeps /data for the next one, with the object log's holes kept as holes.
+
+on:
+  workflow_call:
+    inputs:
+      segment:
+        type: number
+        required: true
+      last:
+        type: boolean
+        required: true
+      minutes:
+        type: number
+        required: true
+      budget_mib:
+        type: number
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  segment:
+    name: Segment ${{ inputs.segment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DATA: /mnt/pando-tests
+      RESULTS: /mnt/soak-results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Numbers
+        id: n
+        env:
+          SEGMENT: ${{ inputs.segment }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          echo "previous=$((SEGMENT - 1))" >> "$GITHUB_OUTPUT"
+          echo "seconds=$((MINUTES * 60))" >> "$GITHUB_OUTPUT"
+
+      - name: Kernel modules
+        run: |
+          modules=(ublk_drv dm_mod loop)
+          if ! sudo modprobe -a "${modules[@]}"; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a "${modules[@]}"
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: soak-pando-${{ github.run_id }}
+          path: ${{ runner.temp }}/bin
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: inputs.segment > 1
+        with:
+          name: soak-data-${{ github.run_id }}-${{ steps.n.outputs.previous }}
+          path: ${{ runner.temp }}/carried
+
+      - name: Restore the store, the cache and the state
+        if: inputs.segment > 1
+        env:
+          CARRIED: ${{ runner.temp }}/carried
+        run: |
+          sudo mkdir -p "$DATA"
+          sudo tar -C "$DATA" --sparse -xf "$CARRIED/data.tar"
+          rm -rf "$CARRIED"
+          sudo du -sh "$DATA"/*
+
+      - name: Run the segment
+        env:
+          PANDO: ${{ runner.temp }}/bin/pando
+          KEEP_STORE: "1"
+          SOAK_PHASE: ${{ inputs.segment == 1 && 'start' || 'resume' }}
+          SOAK_SEGMENT: ${{ inputs.segment }}
+          SOAK_SECONDS: ${{ steps.n.outputs.seconds }}
+          SOAK_LAST: ${{ inputs.last && '1' || '' }}
+          SOAK_BUDGET_MIB: ${{ inputs.budget_mib }}
+        run: |
+          chmod +x "$PANDO"
+          sudo mkdir -p "$DATA" "$RESULTS"
+          tests/kernel/host.sh soak
+
+      - name: Keep the store, the cache and the state
+        if: ${{ !inputs.last }}
+        env:
+          CARRIED: ${{ runner.temp }}/carried
+        run: |
+          mkdir -p "$CARRIED"
+          sudo tar -C "$DATA" --sparse -cf "$CARRIED/data.tar" minio minio-secret soak
+          sudo chown "$(id -u)" "$CARRIED/data.tar"
+          ls -l "$CARRIED/data.tar"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !inputs.last }}
+        with:
+          name: soak-data-${{ github.run_id }}-${{ inputs.segment }}
+          path: ${{ runner.temp }}/carried/data.tar
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: soak-results-${{ github.run_id }}-${{ inputs.segment }}
+          path: /mnt/soak-results
+          if-no-files-found: warn

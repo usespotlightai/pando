@@ -4,10 +4,10 @@ name: ci
 # chain, tests on x86_64 and on aarch64, the unsafe code under AddressSanitizer and a short run
 # of every fuzz target.
 # Then the store conformance tests against the AWS emulator, and the TLA+ model of the write log
-# with traces of the engine checked against it (specs/README.md). On main only: the crash and restart
-# scenarios over more seeds, line coverage, and an auditable release build. Longer fuzzing and
-# mutation testing are in deep.yml; the tests that need a Linux kernel are in kernel.yml
-# and xfstests.yml.
+# with traces of the engine checked against it (specs/README.md). On main only: the crash, restart
+# and GC scenarios over more seeds, line coverage, and an auditable release build. Longer fuzzing
+# and mutation testing are in deep.yml; the tests that need a Linux kernel are in kernel.yml and
+# xfstests.yml.
 # The ruleset on main requires the checks named check, deny and store; check passes only when
 # every pull request job before it passed.
 
@@ -268,7 +268,7 @@ jobs:
           if-no-files-found: error
 
   scenarios:
-    name: Crash and restart scenarios
+    name: Crash, restart and GC scenarios
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -282,11 +282,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: Crash and restart over 400 seeds, from a seed that changes with each run
+      - name: Crash and restart, and GC races, over 400 seeds, from a seed that changes with each run
         env:
           PANDO_DST_SEEDS: "400"
           RUN_NUMBER: ${{ github.run_number }}
-        run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios
+        run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios --test gc
 
   tla:
     name: TLA+ model and traces

@@ -1,0 +1,81 @@
+name: soak
+
+# The cache-budget soak: a branch four times the budget served for about a day, as five
+# segments of `minutes` each on fresh runners (tests/kernel/soak.sh), since a job may run at
+# most six hours. Each segment hands the store, the cache and the state to the next, so the
+# object log is one file over the whole run, and each restart takes the path of a reboot.
+# Started by hand; `segments` and `minutes` make a short run to try a change. A pull request
+# that changes the soak runs two segments of 20 minutes.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/soak.yml
+      - .github/workflows/soak-segment.yml
+      - tests/kernel/soak.sh
+      - tests/kernel/run.sh
+  workflow_dispatch:
+    inputs:
+      segments:
+        description: "Segments to run, 1 to 5"
+        type: number
+        default: 5
+      minutes:
+        description: "Minutes each segment cycles before it hands off"
+        type: number
+        default: 290
+      budget_mib:
+        description: "The cache budget in MiB"
+        type: number
+        default: 256
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build pando
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: tools/check.sh release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-pando-${{ github.run_id }}
+          path: target/release/pando
+          retention-days: 3
+          if-no-files-found: error
+
+  s1:
+    needs: build
+    uses: ./.github/workflows/soak-segment.yml
+    with: { segment: 1, last: "${{ (inputs.segments || 2) == 1 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+  s2:
+    needs: s1
+    if: (inputs.segments || 2) >= 2
+    uses: ./.github/workflows/soak-segment.yml
+    with: { segment: 2, last: "${{ (inputs.segments || 2) == 2 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+  s3:
+    needs: s2
+    if: (inputs.segments || 2) >= 3
+    uses: ./.github/workflows/soak-segment.yml
+    with: { segment: 3, last: "${{ (inputs.segments || 2) == 3 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+  s4:
+    needs: s3
+    if: (inputs.segments || 2) >= 4
+    uses: ./.github/workflows/soak-segment.yml
+    with: { segment: 4, last: "${{ (inputs.segments || 2) == 4 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+  s5:
+    needs: s4
+    if: (inputs.segments || 2) >= 5
+    uses: ./.github/workflows/soak-segment.yml
+    with: { segment: 5, last: "${{ (inputs.segments || 2) == 5 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }

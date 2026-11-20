@@ -770,6 +770,11 @@ impl Volume {
         }
     }
 
+    /// Why the uploader stopped for good, once it has: no later upload can publish the branch.
+    pub fn upload_error(&self) -> Option<Arc<Error>> {
+        self.inner.up.lock().error.clone()
+    }
+
     /// What the last upload packed.
     pub fn last_upload(&self) -> Option<PackStats> {
         self.inner.up.lock().last

@@ -79,18 +79,16 @@ pub struct GcReport {
 /// on use none.
 async fn mark(remote: &Remote, cache: &Arc<Cache>) -> Result<BTreeMap<SegId, u64>> {
     let mut live: BTreeMap<SegId, u64> = BTreeMap::new();
-    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut nodes: HashSet<Hash> = HashSet::new();
+    let mut stored: HashSet<Entry> = HashSet::new();
     for (size, root) in roots(remote).await? {
         let tree = Tree::new(Arc::clone(cache), size.div_ceil(CHUNK_SIZE as u64));
         tree.prefetch_nodes(&root, MARK_PARALLEL).await?;
-        tree.walk(&root, true, |e, _| {
-            if !seen.insert(e.hash) {
-                return false;
-            }
-            if !e.loc.is_pending() {
+        tree.walk(&root, true, |e, node| {
+            if !e.loc.is_pending() && stored.insert(*e) {
                 *live.entry(e.loc.seg).or_default() += u64::from(e.loc.len);
             }
-            true
+            !node || nodes.insert(e.hash)
         })
         .await?;
     }
@@ -321,6 +319,56 @@ mod tests {
         let mut b = vec![0; 4 * CHUNK_SIZE];
         v.read_at(&mut b, 0).await.unwrap();
         assert_eq!(b[CHUNK_SIZE + 1], 1u8.wrapping_mul(31).wrapping_add(2));
+        v.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chunk_stored_in_two_segments_keeps_both() {
+        let (ports, _, _) = sim::ports(5);
+        Volume::create(&ports, "main", 1 << 20).await.unwrap();
+        let c = host(&ports, "/c").await;
+        let chunk = |seed: u8| -> Vec<u8> {
+            (0..CHUNK_SIZE)
+                .map(|i| i.to_le_bytes()[0].wrapping_mul(seed) ^ seed)
+                .collect()
+        };
+        let at = |i: u64| i * CHUNK_SIZE as u64;
+        let v = Volume::open(&ports, Arc::clone(&c), Path::new("/v"), "main")
+            .await
+            .unwrap();
+        v.write_at(&chunk(3), 0).await.unwrap();
+        v.checkpoint().await.unwrap();
+        v.write_at(&chunk(5), at(1)).await.unwrap();
+        v.checkpoint().await.unwrap();
+        v.close().await;
+        let kept = branch::Checkpoints::default();
+        branch::checkpoint(&ports, &kept, "main", "v1", None)
+            .await
+            .unwrap();
+        let v = Volume::open(&ports, host(&ports, "/e").await, Path::new("/e"), "main")
+            .await
+            .unwrap();
+        v.write_at(&chunk(3), at(2)).await.unwrap();
+        v.write_at(&chunk(7), 0).await.unwrap();
+        v.write_at(&chunk(9), at(1)).await.unwrap();
+        v.checkpoint().await.unwrap();
+        v.close().await;
+        tokio::time::sleep(Duration::from_hours(25)).await;
+        let opts = GcOptions {
+            delete: true,
+            ..GcOptions::default()
+        };
+        collect(&c, ports.clock.as_ref(), &opts).await.unwrap();
+
+        branch::from_checkpoint(&ports, &kept, "v1", "back", None)
+            .await
+            .unwrap();
+        let v = Volume::open(&ports, host(&ports, "/d").await, Path::new("/w"), "back")
+            .await
+            .unwrap();
+        let mut b = vec![0; CHUNK_SIZE];
+        v.read_at(&mut b, 0).await.unwrap();
+        assert_eq!(b, chunk(3));
         v.close().await;
     }
 

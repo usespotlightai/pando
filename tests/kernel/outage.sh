@@ -2,10 +2,10 @@
 # The store stops answering while a branch serves: MinIO gets SIGSTOP, so connections open and
 # requests wait, as with a store that is blackholed. A read of a chunk this host does not hold
 # must fail with EIO within --store-wait and leave no process in D state; reads of what the host
-# holds, writes and fsync go on, and the daemon reports the uploads behind. After SIGCONT the
-# read works and the daemon reports the uploads caught up. A detach while the store is stopped
-# again fails at --publish-wait; once it answers, a second detach publishes, and a fresh host
-# reads every write from the store. ublk ids 71-72.
+# holds, writes and fsync go on, and the daemon and `pando status` report the uploads behind.
+# After SIGCONT the read works and the daemon reports the uploads caught up. A detach while the
+# store is stopped again exits 75 at --publish-wait; once it answers, a second detach publishes,
+# and a fresh host reads every write from the store. ublk ids 71-72.
 TEST=outage
 # shellcheck source=SCRIPTDIR/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -115,6 +115,8 @@ if ! serve "$W/cache-o" "$log" "$A"; then
 	exit 1
 fi
 if readback "$A" 0 1 "$W/data" 0; then check "read before the outage" ok; else check "read before the outage" "differs"; fi
+st=$("$PANDO" status --device "$A" 2>&1 || true)
+if [[ $st == "$A"$'\t'o$'\t'*$'\t'serving ]]; then check "status before the outage" ok; else check "status before the outage" "$st"; fi
 
 mark "pando outage: SIGSTOP"
 sleep 1
@@ -156,6 +158,8 @@ stuck=$(ps -eo stat=,pid=,comm= | awk '$1 ~ /^D/ && $3 == "dd"')
 if [[ -z $stuck ]]; then check "no dd in D state" ok; else check "no dd in D state" "$stuck"; fi
 
 if waitline "$log" "uploads of o are .* behind" 90; then check "degraded reported" ok; else check "degraded reported" "no line"; fi
+st=$("$PANDO" status 2>&1 || true)
+if [[ $st == *"$A"$'\t'o$'\t'*$'\t'lagging* ]]; then check "status during the outage" ok; else check "status during the outage" "$st"; fi
 
 mark "pando outage: SIGCONT"
 resume
@@ -167,12 +171,14 @@ mark "pando outage: SIGSTOP before detach"
 pkill -STOP -x minio || check "stop the store again" "no minio"
 timeout 5 dd if="$W/new" of="$A" bs=1M seek=160 count=1 oflag=direct conv=fsync status=none 2>>"$W/dd.log" ||
 	check "write before the detach" "failed or slow"
-if timeout 60 "$PANDO" detach --device "$A" --publish-wait 5s >>"$W/detach.log" 2>&1; then
+rc=0
+timeout 60 "$PANDO" detach --device "$A" --publish-wait 5s >>"$W/detach.log" 2>&1 || rc=$?
+if [[ $rc == 0 ]]; then
 	check "detach during the outage" "it returned before the store answered"
-elif grep -q "may still be publishing" "$W/detach.log"; then
-	check "detach during the outage" "ok, fails at --publish-wait"
+elif [[ $rc == 75 ]] && grep -q "may still be publishing" "$W/detach.log"; then
+	check "detach during the outage" "ok, exits 75 at --publish-wait"
 else
-	check "detach during the outage" "$(tail -1 "$W/detach.log" || true)"
+	check "detach during the outage" "exit $rc: $(tail -1 "$W/detach.log" || true)"
 fi
 mark "pando outage: SIGCONT before detach"
 resume
