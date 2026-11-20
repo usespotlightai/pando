@@ -55,6 +55,7 @@ struct State {
     faults: VecDeque<Fault>,
     refused: Vec<StoreOp>,
     latency: Duration,
+    slow: Vec<(String, Duration)>,
 }
 
 /// An object store in memory, with S3's conditional write rules.
@@ -118,6 +119,15 @@ impl SimStore {
         self.state.lock().latency = latency;
     }
 
+    /// Makes every call on a key that starts with `prefix` take `latency` instead, as calls on
+    /// large objects over a slow link do. A key under several such prefixes takes the latency of
+    /// the longest.
+    pub fn set_latency_under(&self, prefix: &str, latency: Duration) {
+        let mut s = self.state.lock();
+        s.slow.retain(|(p, _)| p != prefix);
+        s.slow.push((prefix.to_string(), latency));
+    }
+
     /// Stops or resumes answering. While stopped, every call waits without failing, as a store
     /// that is down or cut off does; calls in flight finish once it answers again.
     pub fn set_answering(&self, on: bool) {
@@ -144,7 +154,14 @@ impl SimStore {
         let _ = held
             .wait_for(|h| !h.iter().any(|(o, p)| *o == op && key.starts_with(p.as_str())))
             .await;
-        let latency = self.state.lock().latency;
+        let latency = {
+            let s = self.state.lock();
+            s.slow
+                .iter()
+                .filter(|(p, _)| key.starts_with(p.as_str()))
+                .max_by_key(|(p, _)| p.len())
+                .map_or(s.latency, |(_, l)| *l)
+        };
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
         }
@@ -322,5 +339,24 @@ mod tests {
             s.create("k", Bytes::new()).await,
             Err(StoreError::AlreadyExists { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_under_two_slow_prefixes_takes_the_longer_ones_latency() {
+        let s = SimStore::new(Arc::new(SimClock::new()));
+        s.set_latency(Duration::from_millis(1));
+        s.set_latency_under("segments/", Duration::from_millis(500));
+        s.set_latency_under("segments/b", Duration::from_millis(30));
+        let took = |key: &'static str| {
+            let s = &s;
+            async move {
+                let t0 = tokio::time::Instant::now();
+                s.create(key, Bytes::new()).await.unwrap();
+                t0.elapsed()
+            }
+        };
+        assert_eq!(took("segments/b/1").await, Duration::from_millis(30));
+        assert_eq!(took("segments/a/1").await, Duration::from_millis(500));
+        assert_eq!(took("refs/main").await, Duration::from_millis(1));
     }
 }

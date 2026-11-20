@@ -1,0 +1,463 @@
+------------------------------ MODULE WriteLog ------------------------------
+(***************************************************************************)
+(* The write log of one branch, as pando-engine/src/volume/log.rs and the  *)
+(* open, generation take, upload and close in volume/mod.rs run it, with   *)
+(* hosts that crash, lose their disk, and race each other on the store.    *)
+(*                                                                         *)
+(* A branch's contents are modelled by their history: the sequence of the  *)
+(* flushes that made them. A writes record holds the history of its        *)
+(* writer at flush `from` and at flush `to`; applying it to a state between *)
+(* the two gives the state at `to`, and applying it to any other state     *)
+(* mixes two histories, which on a real disk is a file system no flush ever *)
+(* produced.                                                               *)
+(***************************************************************************)
+EXTENDS Naturals, Sequences, FiniteSets, TLC
+
+CONSTANTS
+    Hosts,          \* hosts that open the branch, one process each at a time
+    Modes,          \* the log modes an open may take: "behind", "strict"
+    MaxFlushes,     \* flushes the writers commit in all
+    MaxOpens,       \* opens in all
+    MaxAdvances,    \* `pando advance` runs onto the branch
+    Depth           \* the longest behaviour checked, in steps; 0 for every behaviour
+
+VARIABLES
+    ref,        \* the branch's ref: root, writer generation, log position, version
+    store,      \* the log records in the store
+    disk,       \* each host's local state, which a later open on that host may resume
+    proc,       \* each host's process
+    nextId,     \* the next flush id
+    opens,      \* opens so far
+    advances,   \* advances so far
+    acked,      \* strict flushes some writer returned from
+    histories   \* every history a writer committed or a ref held
+
+vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories>>
+
+Max(a, b) == IF a >= b THEN a ELSE b
+Range(s) == {s[i] : i \in DOMAIN s}
+IsPrefix(a, b) == Len(a) <= Len(b) /\ SubSeq(b, 1, Len(a)) = a
+
+Pos(g, f, n, c) == [gen |-> g, flush |-> f, next |-> n, closed |-> c]
+
+Seal(g, n) ==
+    [g |-> g, n |-> n, kind |-> "seal", from |-> 0, to |-> 0, base |-> <<>>, hist |-> <<>>]
+Writes(g, n, from, to, base, hist) ==
+    [g |-> g, n |-> n, kind |-> "writes", from |-> from, to |-> to, base |-> base, hist |-> hist]
+
+At(g, n) == {r \in store : r.g = g /\ r.n = n}
+
+NoDisk == [present |-> FALSE, root |-> <<>>, published |-> <<>>, publishing |-> <<>>, gen |-> 0]
+
+Idle ==
+    [pc |-> "idle",
+     \* the ref the open read
+     rroot |-> <<>>, rgen |-> 0, rver |-> 0, start |-> Pos(0, 0, 0, FALSE),
+     \* the scan: generation, record number, last flush applied, gap, state
+     g |-> 0, n |-> 0, have |-> 0, gap |-> FALSE, st |-> <<>>, mixed |-> FALSE,
+     replayed |-> FALSE,
+     \* the writer
+     gen |-> 0, mode |-> "behind", hists |-> <<<<>>>>, seq |-> 0, opened |-> <<>>,
+     logged |-> 0, uploaded |-> 0, upRoot |-> <<>>, dropped |-> 0, records |-> <<>>,
+     batching |-> FALSE, shipping |-> FALSE, shipN |-> 0, shipFrom |-> 0, shipTo |-> 0,
+     refused |-> FALSE, shipperDone |-> FALSE,
+     upping |-> FALSE, upSeq |-> 0, ver |-> 0,
+     covered |-> 0, published |-> FALSE, olderTrimmed |-> FALSE,
+     toDelete |-> {}, stopped |-> FALSE, closing |-> FALSE, closeSeq |-> 0,
+     fenced |-> FALSE, waiting |-> {}, ackedAtTake |-> {}]
+
+\* The state after flush i of writer p.
+H(p, i) == p.hists[i + 1]
+
+\* Log.records.partition_point: the records whose last flush is at or below s.
+Covering(p, s) == Len(SelectSeq(p.records, LAMBDA t : t <= s))
+
+Init ==
+    /\ ref = [root |-> <<>>, gen |-> 0, log |-> Pos(0, 0, 0, FALSE), ver |-> 0]
+    /\ store = {}
+    /\ disk = [h \in Hosts |-> NoDisk]
+    /\ proc = [h \in Hosts |-> Idle]
+    /\ nextId = 1
+    /\ opens = 0
+    /\ advances = 0
+    /\ acked = {}
+    /\ histories = {<<>>}
+
+-----------------------------------------------------------------------------
+(* Opening: Volume::open_logged, log::scan, Inner::take_generation.        *)
+
+\* VolState::resumes: the ref holds the root this host published or was
+\* publishing, and names the generation this host's state names.
+Resumes(d, r) ==
+    /\ d.present
+    /\ d.published = r.root \/ d.publishing = r.root
+    /\ d.gen = r.gen
+
+\* Where the scan goes after generation g-1: a generation past the ref's ends it.
+EnterGen(p, g) ==
+    IF g > p.rgen
+    THEN [p EXCEPT !.pc = "replay"]
+    ELSE [p EXCEPT !.pc = "scan", !.g = g,
+                   !.n = IF g = p.start.gen THEN p.start.next ELSE 0,
+                   !.have = IF g = p.start.gen THEN p.start.flush ELSE 0]
+
+FirstGen(start) ==
+    LET g0 == Max(start.gen, 1)
+    IN IF g0 = start.gen /\ start.closed THEN g0 + 1 ELSE g0
+
+\* A resumed state the ref does not hold is the writer's flush 1, left to the
+\* uploader (Inner::resumed_ahead).
+Resumed(p, d) ==
+    IF d.root = p.rroot
+    THEN [p EXCEPT !.pc = "take", !.hists = <<d.root>>, !.opened = d.root, !.st = d.root]
+    ELSE [p EXCEPT !.pc = "take", !.hists = <<p.rroot, d.root>>, !.seq = 1, !.dropped = 1,
+                   !.opened = d.root, !.st = d.root]
+
+\* An open reads the ref, and either resumes this host's state or scans the log.
+Open(h, m) ==
+    /\ proc[h].pc = "idle"
+    /\ opens < MaxOpens
+    /\ opens' = opens + 1
+    /\ LET r == ref
+           base == [Idle EXCEPT !.rroot = r.root, !.rgen = r.gen, !.rver = r.ver,
+                                !.start = r.log, !.gen = r.gen + 1, !.mode = m,
+                                !.st = r.root, !.upRoot = r.root]
+       IN IF Resumes(disk[h], r)
+          THEN proc' = [proc EXCEPT ![h] = Resumed(base, disk[h])]
+          ELSE IF r.gen = 0 \/ (r.log.closed /\ r.log.gen = r.gen)
+          THEN proc' = [proc EXCEPT ![h] = [base EXCEPT !.pc = "replay"]]
+          ELSE proc' = [proc EXCEPT ![h] = EnterGen(base, FirstGen(r.log))]
+    /\ UNCHANGED <<ref, store, disk, nextId, advances, acked, histories>>
+
+\* One GET of record (g, n): a writes record is applied, skipped, or past a gap;
+\* a seal ends the generation; a missing record is sealed next.
+ScanRead(h) ==
+    LET p == proc[h]
+        found == At(p.g, p.n)
+    IN /\ p.pc = "scan"
+       /\ IF found = {}
+          THEN proc' = [proc EXCEPT ![h].pc = "seal"]
+          ELSE LET rec == CHOOSE x \in found : TRUE
+                   p1 == [p EXCEPT !.n = p.n + 1]
+                   gap == p.gap \/ rec.from > p.have
+                   fits == IsPrefix(rec.base, p.st) /\ IsPrefix(p.st, rec.hist)
+               IN proc' = [proc EXCEPT ![h] =
+                    IF rec.kind = "seal" THEN EnterGen(p, p.g + 1)
+                    ELSE IF rec.to <= p.have THEN p1
+                    ELSE IF gap THEN [p1 EXCEPT !.gap = TRUE]
+                    ELSE [p1 EXCEPT !.have = rec.to, !.replayed = TRUE,
+                                    !.st = IF fits THEN rec.hist ELSE p.st,
+                                    !.mixed = p.mixed \/ ~fits]]
+       /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+\* The conditional create of a seal at the first free number; when another
+\* record took the number first, the scan reads it.
+ScanSeal(h) ==
+    LET p == proc[h]
+    IN /\ p.pc = "seal"
+       /\ IF At(p.g, p.n) = {}
+          THEN /\ store' = store \cup {Seal(p.g, p.n)}
+               /\ proc' = [proc EXCEPT ![h] = EnterGen(p, p.g + 1)]
+          ELSE /\ proc' = [proc EXCEPT ![h].pc = "scan"]
+               /\ UNCHANGED store
+       /\ UNCHANGED <<ref, disk, nextId, opens, advances, acked, histories>>
+
+\* Inner::start_journal starts afresh, and Inner::replay_log commits what the
+\* scan applied as the writer's flush 1.
+Replay(h) ==
+    LET p == proc[h]
+        hists == IF p.replayed THEN <<p.rroot, p.st>> ELSE <<p.rroot>>
+    IN /\ p.pc = "replay"
+       /\ proc' = [proc EXCEPT ![h] =
+                    [p EXCEPT !.pc = "take", !.hists = hists, !.seq = Len(hists) - 1,
+                              !.opened = p.st]]
+       /\ disk' = [disk EXCEPT ![h] =
+                    [present |-> TRUE, root |-> p.st, published |-> p.rroot,
+                     publishing |-> <<>>, gen |-> p.rgen]]
+       /\ UNCHANGED <<ref, store, nextId, opens, advances, acked, histories>>
+
+\* The conditional PUT of the ref that takes the next writer generation.
+Take(h) ==
+    LET p == proc[h]
+    IN /\ p.pc = "take"
+       /\ IF ref.ver = p.rver
+          THEN /\ ref' = [ref EXCEPT !.gen = p.gen, !.log = p.start, !.ver = @ + 1]
+               /\ proc' = [proc EXCEPT ![h] =
+                            [p EXCEPT !.pc = "run", !.ver = ref.ver + 1, !.ackedAtTake = acked,
+                                      !.rroot = <<>>, !.rgen = 0, !.rver = 0,
+                                      !.start = Pos(0, 0, 0, FALSE), !.g = 0, !.n = 0,
+                                      !.have = 0, !.gap = FALSE, !.st = <<>>,
+                                      !.replayed = FALSE]]
+               /\ disk' = [disk EXCEPT ![h].gen = p.gen]
+          ELSE /\ proc' = [proc EXCEPT ![h] = Idle]
+               /\ UNCHANGED <<ref, disk>>
+       /\ UNCHANGED <<store, nextId, opens, advances, acked, histories>>
+
+-----------------------------------------------------------------------------
+(* A running writer: Inner::commit_once, the shipper, the uploader,        *)
+(* trim_log, close_log and wait_logged.                                    *)
+
+Running(h) == proc[h].pc = "run"
+Live(h) == Running(h) /\ ~proc[h].fenced
+
+\* A flush commits locally and durably. A flush that bounds memory, or is too
+\* large for a record, is left to the uploader: the queue drops it and what
+\* waits before it.
+Flush(h, logged) ==
+    LET p == proc[h]
+        now == Append(H(p, p.seq), nextId)
+    IN /\ Live(h)
+       /\ nextId <= MaxFlushes
+       /\ proc' = [proc EXCEPT ![h] =
+                    [p EXCEPT !.hists = Append(p.hists, now), !.seq = p.seq + 1,
+                              !.dropped = IF logged THEN p.dropped ELSE p.seq + 1,
+                              !.waiting = IF p.mode = "strict"
+                                          THEN p.waiting \cup {<<p.seq + 1, nextId>>}
+                                          ELSE p.waiting]]
+       /\ disk' = [disk EXCEPT ![h].root = now]
+       /\ nextId' = nextId + 1
+       /\ histories' = histories \cup {now}
+       /\ UNCHANGED <<ref, store, opens, advances, acked>>
+
+ShipBase(p) == Max(p.logged, p.uploaded)
+
+\* The shipper runs until a create of its own fails or the log stops; it does not
+\* look for a fence the uploader found.
+Shipper(h) == Running(h) /\ ~proc[h].shipperDone
+
+ShipIdle(p) == ~p.batching /\ ~p.shipping /\ ~p.stopped
+
+\* The shipper takes the flushes after its base into one batch.
+ShipBatch(h, to) ==
+    LET p == proc[h]
+        base == ShipBase(p)
+    IN /\ Shipper(h)
+       /\ ShipIdle(p)
+       /\ p.dropped <= base
+       /\ base < to /\ to <= p.seq
+       /\ proc' = [proc EXCEPT ![h] =
+                    [p EXCEPT !.batching = TRUE, !.shipFrom = base, !.shipTo = to]]
+       /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+\* Once the batch is encoded, the shipper takes the record's number before the
+\* create starts, unless the log stopped meanwhile.
+ShipNumber(h) ==
+    LET p == proc[h]
+    IN /\ Running(h)
+       /\ p.batching
+       /\ proc' = [proc EXCEPT ![h] =
+                    IF p.stopped
+                    THEN [p EXCEPT !.batching = FALSE, !.shipFrom = 0, !.shipTo = 0]
+                    ELSE [p EXCEPT !.batching = FALSE, !.shipping = TRUE,
+                                   !.shipN = Len(p.records), !.records = Append(p.records, p.shipTo)]]
+       /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+\* Flushes the queue dropped are covered once an upload published them.
+ShipCovered(h) ==
+    LET p == proc[h]
+        base == ShipBase(p)
+    IN /\ Shipper(h)
+       /\ ShipIdle(p)
+       /\ p.dropped > p.logged /\ p.dropped <= base /\ p.seq <= base
+       /\ proc' = [proc EXCEPT ![h].logged = base]
+       /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+\* The conditional create of the record. When another record took the number,
+\* the shipper reads that record back before it fences the writer.
+ShipCreate(h) ==
+    LET p == proc[h]
+    IN /\ Running(h)
+       /\ p.shipping /\ ~p.refused
+       /\ IF At(p.gen, p.shipN) = {}
+          THEN /\ store' = store \cup
+                    {Writes(p.gen, p.shipN, p.shipFrom, p.shipTo, H(p, p.shipFrom), H(p, p.shipTo))}
+               /\ proc' = [proc EXCEPT ![h] =
+                            [p EXCEPT !.shipping = FALSE, !.logged = Max(p.logged, p.shipTo),
+                                      !.shipN = 0, !.shipFrom = 0, !.shipTo = 0]]
+          ELSE /\ proc' = [proc EXCEPT ![h].refused = TRUE]
+               /\ UNCHANGED store
+       /\ UNCHANGED <<ref, disk, nextId, opens, advances, acked, histories>>
+
+\* The read-back finds another record: the writer is fenced and the shipper ends.
+ShipFence(h) ==
+    /\ Running(h)
+    /\ proc[h].shipping /\ proc[h].refused
+    /\ proc' = [proc EXCEPT ![h] =
+                 [@ EXCEPT !.shipping = FALSE, !.refused = FALSE, !.fenced = TRUE,
+                           !.shipperDone = TRUE, !.shipN = 0, !.shipFrom = 0, !.shipTo = 0]]
+    /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+\* A create that failed transiently gives up once the log stopped, and the
+\* shipper ends.
+ShipAbandon(h) ==
+    /\ Running(h)
+    /\ proc[h].shipping /\ proc[h].stopped /\ ~proc[h].refused
+    /\ proc' = [proc EXCEPT ![h] =
+                 [@ EXCEPT !.shipping = FALSE, !.shipperDone = TRUE,
+                           !.shipN = 0, !.shipFrom = 0, !.shipTo = 0]]
+    /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+\* The uploader packs the current root and records it as publishing.
+UploadStart(h) ==
+    LET p == proc[h]
+    IN /\ Live(h)
+       /\ ~p.upping
+       /\ H(p, p.seq) /= p.upRoot
+       /\ proc' = [proc EXCEPT ![h] = [p EXCEPT !.upping = TRUE, !.upSeq = p.seq]]
+       /\ disk' = [disk EXCEPT ![h].publishing = H(p, p.seq)]
+       /\ UNCHANGED <<ref, store, nextId, opens, advances, acked, histories>>
+
+\* The conditional PUT of the ref with the packed root and the log position.
+UploadPut(h) ==
+    LET p == proc[h]
+        root == H(p, p.upSeq)
+        pos == Pos(p.gen, p.upSeq, Covering(p, p.upSeq), p.stopped)
+    IN /\ Running(h)
+       /\ p.upping
+       /\ IF ref.ver = p.ver
+          THEN /\ ref' = [root |-> root, gen |-> p.gen, log |-> pos, ver |-> ref.ver + 1]
+               /\ proc' = [proc EXCEPT ![h] =
+                            [p EXCEPT !.upping = FALSE, !.upSeq = 0, !.ver = ref.ver + 1,
+                                      !.uploaded = Max(p.uploaded, p.upSeq), !.upRoot = root,
+                                      !.covered = Max(p.covered, pos.next), !.published = TRUE]]
+               /\ disk' = [disk EXCEPT ![h].published = root, ![h].publishing = <<>>]
+               /\ histories' = histories \cup {root}
+          ELSE /\ proc' = [proc EXCEPT ![h] =
+                            [p EXCEPT !.upping = FALSE, !.upSeq = 0, !.fenced = TRUE]]
+               /\ UNCHANGED <<ref, disk, histories>>
+       /\ UNCHANGED <<store, nextId, opens, advances, acked>>
+
+\* The writer deletes a record the published ref covers. Trims run from the
+\* shipper and from close_log at once, so a record may be deleted again, and a
+\* shipper fenced by the uploader still trims.
+TrimOwn(h, n) ==
+    /\ Running(h)
+    /\ n < proc[h].covered
+    /\ store' = store \ At(proc[h].gen, n)
+    /\ UNCHANGED <<proc, ref, disk, nextId, opens, advances, acked, histories>>
+
+\* Once it published, the writer lists the log and picks what earlier writers
+\* left, except the seal that ends each earlier writer's log.
+TrimListOlder(h) ==
+    LET p == proc[h]
+        older == {r \in store : r.g < p.gen}
+        last(g) == CHOOSE n \in {r.n : r \in {x \in older : x.g = g}} :
+                     \A x \in older : x.g = g => x.n <= n
+        kept == {r \in older : r.kind = "seal" /\ r.n = last(r.g)}
+    IN /\ Running(h)
+       /\ p.published /\ ~p.olderTrimmed
+       /\ proc' = [proc EXCEPT ![h] =
+                    [p EXCEPT !.olderTrimmed = TRUE,
+                              !.toDelete = {<<r.g, r.n>> : r \in older \ kept}]]
+       /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+TrimDeleteOlder(h, k) ==
+    /\ Running(h)
+    /\ k \in proc[h].toDelete
+    /\ store' = store \ At(k[1], k[2])
+    /\ proc' = [proc EXCEPT ![h].toDelete = @ \ {k}]
+    /\ UNCHANGED <<ref, disk, nextId, opens, advances, acked, histories>>
+
+\* close_log, once every flush is published: the log stops, and once no record
+\* is in flight the ref records that this writer appends no more.
+CloseStop(h) ==
+    LET p == proc[h]
+    IN /\ Running(h)
+       /\ ~p.stopped
+       /\ p.uploaded >= p.seq
+       /\ proc' = [proc EXCEPT ![h] =
+                    [p EXCEPT !.stopped = TRUE, !.closing = TRUE, !.closeSeq = p.seq]]
+       /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+ClosePut(h) ==
+    LET p == proc[h]
+        pos == Pos(p.gen, p.closeSeq, Covering(p, p.closeSeq), TRUE)
+    IN /\ Running(h)
+       /\ p.closing /\ ~p.shipping
+       /\ IF ref.ver = p.ver
+          THEN /\ ref' = [root |-> p.upRoot, gen |-> p.gen, log |-> pos, ver |-> ref.ver + 1]
+               /\ proc' = [proc EXCEPT ![h] =
+                            [p EXCEPT !.closing = FALSE, !.closeSeq = 0, !.ver = ref.ver + 1,
+                                      !.covered = Max(p.covered, pos.next), !.published = TRUE]]
+          ELSE /\ proc' = [proc EXCEPT ![h] = [p EXCEPT !.closing = FALSE, !.closeSeq = 0]]
+               /\ UNCHANGED ref
+       /\ UNCHANGED <<store, disk, nextId, opens, advances, acked, histories>>
+
+\* wait_logged: a strict flush returns once the log or an upload has it, even
+\* if the writer was fenced since.
+Ack(h, w) ==
+    /\ Running(h)
+    /\ w \in proc[h].waiting
+    /\ proc[h].logged >= w[1] \/ proc[h].uploaded >= w[1]
+    /\ acked' = acked \cup {w[2]}
+    /\ proc' = [proc EXCEPT ![h].waiting = @ \ {w}]
+    /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, histories>>
+
+-----------------------------------------------------------------------------
+(* Failures and other commands.                                            *)
+
+\* The process stops: a daemon crash, a kill, or a detach. The host's state stays.
+Stop(h) ==
+    /\ proc[h].pc /= "idle"
+    /\ proc' = [proc EXCEPT ![h] = Idle]
+    /\ UNCHANGED <<ref, store, disk, nextId, opens, advances, acked, histories>>
+
+\* The host is lost with its disk.
+Lose(h) ==
+    /\ proc[h].pc /= "idle" \/ disk[h].present
+    /\ proc' = [proc EXCEPT ![h] = Idle]
+    /\ disk' = [disk EXCEPT ![h] = NoDisk]
+    /\ UNCHANGED <<ref, store, nextId, opens, advances, acked, histories>>
+
+\* branch::advance moves the ref to another branch's root and keeps the rest;
+\* what the branch held is meant to go, strict flushes included.
+Advance ==
+    LET root == <<MaxFlushes + 1 + advances>>
+    IN /\ advances < MaxAdvances
+       /\ ref' = [ref EXCEPT !.root = root, !.ver = @ + 1]
+       /\ advances' = advances + 1
+       /\ histories' = histories \cup {root}
+       /\ acked' = {}
+       /\ UNCHANGED <<store, disk, proc, nextId, opens>>
+
+Next ==
+    \/ \E h \in Hosts :
+        \/ \E m \in Modes : Open(h, m)
+        \/ ScanRead(h) \/ ScanSeal(h) \/ Replay(h) \/ Take(h)
+        \/ \E logged \in BOOLEAN : Flush(h, logged)
+        \/ \E to \in 1..MaxFlushes + 1 : ShipBatch(h, to)
+        \/ ShipNumber(h) \/ ShipCovered(h) \/ ShipCreate(h) \/ ShipFence(h)
+        \/ ShipAbandon(h)
+        \/ UploadStart(h) \/ UploadPut(h)
+        \/ \E n \in 0..MaxFlushes + 1 : TrimOwn(h, n)
+        \/ TrimListOlder(h)
+        \/ \E k \in proc[h].toDelete : TrimDeleteOlder(h, k)
+        \/ CloseStop(h) \/ ClosePut(h)
+        \/ \E w \in proc[h].waiting : Ack(h, w)
+        \/ Stop(h) \/ Lose(h)
+    \/ Advance
+
+Spec == Init /\ [][Next]_vars
+
+-----------------------------------------------------------------------------
+(* Properties.                                                             *)
+
+\* An open never mixes two histories: what it replays is a state some writer
+\* committed. This is the docs' "an open always sees a prefix of the flushes".
+OpenSeesAPrefix ==
+    \A h \in Hosts :
+        /\ ~proc[h].mixed
+        /\ proc[h].pc \in {"replay", "take", "run"} => proc[h].st \in histories
+
+\* A writer that takes the branch holds every strict flush any writer returned
+\* from before.
+StrictFlushesSurvive ==
+    \A h \in Hosts : Running(h) => proc[h].ackedAtTake \subseteq Range(proc[h].opened)
+
+\* The ref only ever holds a state some writer committed.
+RefHoldsAWriterState == ref.root \in histories
+
+Symmetry == Permutations(Hosts)
+
+WithinDepth == Depth = 0 \/ TLCGet("level") <= Depth
+=============================================================================

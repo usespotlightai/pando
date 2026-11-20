@@ -8,9 +8,11 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 pando-engine = { workspace = true, features = ["sim"] }
 pando-format.workspace = true
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]

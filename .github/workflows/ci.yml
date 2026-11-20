@@ -3,10 +3,11 @@ name: ci
 # The checks from tools/check.sh on every pull request and every push to main: lints, supply
 # chain, tests on x86_64 and on aarch64, the unsafe code under AddressSanitizer and a short run
 # of every fuzz target.
-# Then the store conformance tests against the AWS emulator. On main only: the crash, restart and GC
-# scenarios over more seeds, line coverage, and an auditable release build. Longer fuzzing and
-# mutation testing are in deep.yml; the tests that need a Linux kernel are in kernel.yml
-# and xfstests.yml.
+# Then the store conformance tests against the AWS emulator, and the TLA+ model of the write log
+# with traces of the engine checked against it (specs/README.md). On main only: the crash, restart
+# and GC scenarios over more seeds, line coverage, and an auditable release build. Longer fuzzing
+# and mutation testing are in deep.yml; the tests that need a Linux kernel are in kernel.yml and
+# xfstests.yml.
 # The ruleset on main requires the checks named check, deny and store; check passes only when
 # every pull request job before it passed.
 
@@ -286,6 +287,41 @@ jobs:
           PANDO_DST_SEEDS: "400"
           RUN_NUMBER: ${{ github.run_number }}
         run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios --test gc
+
+  tla:
+    name: TLA+ model and traces
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: tla
+
+      - name: The write log model
+        run: PATH=$JAVA_HOME_21_X64/bin:$PATH tools/tlc.sh
+
+      - name: Traces of 40 races, from a seed that changes with each run, against the spec
+        env:
+          PANDO_DST_SEEDS: "40"
+          PANDO_TLA_TRACES: ${{ runner.temp }}/tla-traces
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          PANDO_DST_FIRST=$((RUN_NUMBER * 40)) cargo test -p pando-dst --test scenarios racing
+          PATH=$JAVA_HOME_21_X64/bin:$PATH tools/tlc.sh traces "$PANDO_TLA_TRACES"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: tla-traces-${{ github.run_id }}
+          path: ${{ runner.temp }}/tla-traces
+          if-no-files-found: ignore
 
   store:
     name: store

@@ -9,5 +9,7 @@
 )]
 
 pub mod gc_race;
+pub mod race;
 pub mod scenario;
 pub mod store_conformance;
+pub mod trace;
