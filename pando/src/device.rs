@@ -3,7 +3,9 @@
 //! on a control socket, `/run/pando/ublkbN.sock` or `/run/pando/fuse-<hash of the mount>.sock`,
 //! that `resize` asks to grow it and `status` asks how it stands. A request is one line:
 //! `grow <bytes>`, answered with `ok <bytes>` or `error <why>`, or `status`, answered with
-//! `ok <device>\t<branch>\t<upload lag in ms>\t<state>`. The daemon of a FUSE mount also
+//! `ok <device>\t<branch>\t<upload lag in ms>\t<state>\t<generation>\t<bytes not uploaded>\t<cache
+//! bytes>\t<why uploads stopped>`; a daemon of an earlier release answers with the first four
+//! fields only. The daemon of a FUSE mount also
 //! takes `detach` and `detach force`, and answers `ok` once the branch is published.
 //!
 //! On SIGTERM or SIGINT an attach drains: it publishes what the branch holds, for at most
@@ -237,7 +239,7 @@ pub(crate) struct ResizeArgs {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{attach, detach, notify, resize, status};
+pub(crate) use linux::{attach, check_host, detach, notify, resize, status, supported};
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) async fn attach(
@@ -251,8 +253,22 @@ pub(crate) async fn attach(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) async fn detach(_: DetachArgs) -> anyhow::Result<()> {
+pub(crate) async fn detach(_: DetachArgs, _: &crate::Out) -> anyhow::Result<()> {
     anyhow::bail!("detach needs Linux")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn supported(_: &AttachArgs) -> anyhow::Result<()> {
+    Err(crate::exit::Unsupported("attach needs Linux".into()).into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn check_host(out: &crate::Out) -> anyhow::Result<()> {
+    out.result(
+        "attach needs Linux",
+        serde_json::json!({"event": "check", "check": "linux", "ok": false, "fix": "run pando on Linux"}),
+    );
+    Err(crate::exit::Unsupported("attach needs Linux".into()).into())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -292,8 +308,11 @@ mod linux {
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
+    use serde_json::json;
+
     use super::{AttachArgs, DetachArgs, Ended, Recover, ResizeArgs, Served, StatusArgs, StillPublishing};
-    use crate::Out;
+    use crate::exit::{InUse, Unsupported};
+    use crate::{Out, millis};
 
     const CONTROL_DIR: &str = "/run/pando";
     /// How long a daemon waits for the request of a client that connected.
@@ -360,17 +379,7 @@ mod linux {
             a.dm.as_deref()
                 .map_or_else(|| device.clone(), pando_linux::mapper_path);
         limit_dirty(&mounted, a.dirty_limit, out).await;
-        out.line(format!(
-            "attached {} as {} in {:.1?}{}",
-            a.name,
-            device.display(),
-            t0.elapsed(),
-            if att.rejoined() {
-                ", rejoined its image"
-            } else {
-                ""
-            }
-        ));
+        attached(out, &a, &att, &device, &mounted, recover, t0.elapsed());
         let mut signals = Signals::new()?;
         if out.is_stdio() {
             notify("READY=1");
@@ -414,6 +423,70 @@ mod linux {
         Ok(Ended::Detached)
     }
 
+    /// Reports that ublk device `device` serves branch `a.name`, mounted through `mounted`.
+    fn attached(
+        out: &Out,
+        a: &AttachArgs,
+        att: &Attachment,
+        device: &Path,
+        mounted: &Path,
+        recovered: bool,
+        took: Duration,
+    ) {
+        out.result(
+            format!(
+                "attached {} as {} in {took:.1?}{}",
+                a.name,
+                device.display(),
+                if att.rejoined() {
+                    ", rejoined its image"
+                } else {
+                    ""
+                }
+            ),
+            json!({
+                "event": "attached",
+                "branch": a.name,
+                "device": device,
+                "dm": a.dm.as_ref().map(|_| mounted),
+                "block_device": mounted,
+                "generation": att.volume().generation(),
+                "rejoined": att.rejoined(),
+                "recovered": recovered,
+                "took_ms": millis(took),
+            }),
+        );
+    }
+
+    /// Reports that the loop device of the FUSE mount at `dir` serves branch `name`.
+    fn attached_fuse(out: &Out, name: &str, att: &Attachment, dir: &Path, fe: &FuseFrontend, took: Duration) {
+        out.result(
+            format!(
+                "attached {name} as {} in {took:.1?}: {}, {}",
+                fe.device().display(),
+                fe.file().display(),
+                if fe.direct_io() {
+                    "direct I/O"
+                } else {
+                    "buffered: the loop device refused direct I/O"
+                }
+            ),
+            json!({
+                "event": "attached",
+                "branch": name,
+                "device": fe.device(),
+                "fuse": dir,
+                "file": fe.file(),
+                "block_device": fe.device(),
+                "direct_io": fe.direct_io(),
+                "generation": att.volume().generation(),
+                "rejoined": att.rejoined(),
+                "recovered": false,
+                "took_ms": millis(took),
+            }),
+        );
+    }
+
     /// Serves branch `a.name` as a file in the FUSE mount at `dir`, bound to a loop device,
     /// until `detach --fuse` or an unmount ends the mount, then publishes it; or until a signal
     /// drains it.
@@ -449,18 +522,7 @@ mod linux {
             }
         };
         limit_dirty(fe.device(), a.dirty_limit, out).await;
-        out.line(format!(
-            "attached {} as {} in {:.1?}: {}, {}",
-            a.name,
-            fe.device().display(),
-            t0.elapsed(),
-            fe.file().display(),
-            if fe.direct_io() {
-                "direct I/O"
-            } else {
-                "buffered: the loop device refused direct I/O"
-            }
-        ));
+        attached_fuse(out, &a.name, &att, &dir, &fe, t0.elapsed());
         let mut signals = Signals::new()?;
         if out.is_stdio() {
             notify("READY=1");
@@ -554,6 +616,13 @@ mod linux {
             tokio::select! {
                 e = v.upload_stopped() => {
                     out.err(format!("uploads of {name} stopped: {e}"));
+                    out.event(json!({
+                        "event": "state",
+                        "branch": name,
+                        "state": "uploads-stopped",
+                        "upload_lag_ms": millis(v.upload_lag()),
+                        "error": e.to_string(),
+                    }));
                     return;
                 }
                 () = tokio::time::sleep(LAG_CHECK) => {}
@@ -578,6 +647,19 @@ mod linux {
                 } else {
                     out.line(format!("the cache's disk has room again: writes to {name} go on"));
                 }
+            }
+            if was != (lagging, full) {
+                let state = match (lagging, full) {
+                    (_, true) => "disk-full",
+                    (true, false) => "lagging",
+                    (false, false) => "serving",
+                };
+                out.event(json!({
+                    "event": "state",
+                    "branch": name,
+                    "state": state,
+                    "upload_lag_ms": millis(lag),
+                }));
             }
             if out.is_stdio() && was != (lagging, full) {
                 notify(&match (lagging, full) {
@@ -807,6 +889,12 @@ mod linux {
             .flush()
             .await
             .with_context(|| format!("drain {name}: commit the writes locally"))?;
+        out.event(json!({
+            "event": "drained",
+            "branch": name,
+            "published": published,
+            "took_ms": millis(t0.elapsed()),
+        }));
         if published {
             out.line(format!(
                 "drained {name} in {:.1?}: the store holds every write acknowledged before the signal",
@@ -982,10 +1070,16 @@ mod linux {
     }
 
     /// The answer to a `status` request: what `front` serves, branch `name`, its upload lag in
-    /// milliseconds and its state.
+    /// milliseconds, its state, its writer generation, the bytes it has not uploaded, the bytes
+    /// of the cache's object log, and why its uploads stopped, if they did.
     async fn status_reply(att: &Attachment, front: &Front, name: &str) -> String {
         let v = att.volume();
         let lag = v.upload_lag();
+        let stopped = v.upload_error().map_or_default(|e| one_line(&e.to_string()));
+        let unuploaded = v
+            .unuploaded_bytes()
+            .await
+            .map_or_else(|_| "-".to_owned(), |n| n.to_string());
         let state = if v.upload_error().is_some() {
             "uploads-stopped"
         } else if v.disk_full().await {
@@ -996,10 +1090,92 @@ mod linux {
             "serving"
         };
         format!(
-            "ok {}\t{name}\t{}\t{state}\n",
+            "ok {}\t{name}\t{}\t{state}\t{}\t{unuploaded}\t{}\t{}\n",
             front.served().display(),
-            lag.as_millis()
+            lag.as_millis(),
+            v.generation(),
+            att.cache().log_bytes(),
+            stopped.replace('\t', " "),
         )
+    }
+
+    /// How an attached branch stands, as its daemon answered `status`. A daemon of an earlier
+    /// release leaves out what follows the state.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Standing {
+        served: String,
+        branch: String,
+        lag_ms: u64,
+        state: String,
+        generation: Option<u64>,
+        unuploaded: Option<u64>,
+        cache: Option<u64>,
+        stopped: Option<String>,
+    }
+
+    impl Standing {
+        fn parse(reply: &str) -> Result<Standing> {
+            let fields = reply
+                .strip_prefix("ok ")
+                .map(|r| r.split('\t').collect::<Vec<_>>());
+            let number =
+                |what: &str, f: &str| -> Result<u64> { f.parse().with_context(|| format!("{what} {f:?}")) };
+            match fields.as_deref() {
+                Some([served, branch, lag, state, rest @ ..]) if rest.is_empty() || rest.len() == 4 => {
+                    let mut st = Standing {
+                        served: (*served).to_owned(),
+                        branch: (*branch).to_owned(),
+                        lag_ms: number("upload lag", lag)?,
+                        state: (*state).to_owned(),
+                        generation: None,
+                        unuploaded: None,
+                        cache: None,
+                        stopped: None,
+                    };
+                    if let [generation, unuploaded, cache, stopped] = rest {
+                        st.generation = Some(number("generation", generation)?);
+                        st.unuploaded = match *unuploaded {
+                            "-" => None,
+                            n => Some(number("bytes not uploaded", n)?),
+                        };
+                        st.cache = Some(number("cache bytes", cache)?);
+                        st.stopped = (!stopped.is_empty()).then(|| (*stopped).to_owned());
+                    }
+                    Ok(st)
+                }
+                _ => match reply.split_once(' ') {
+                    Some(("error", why)) => bail!("{why}"),
+                    _ => bail!("the daemon answered {reply:?}"),
+                },
+            }
+        }
+
+        fn human(&self) -> String {
+            let lag = Duration::from_millis(self.lag_ms).as_secs_f64();
+            let unuploaded = self
+                .unuploaded
+                .map_or_default(|n| format!("\t{} MiB not uploaded", n >> 20));
+            let stopped = self.stopped.as_ref().map_or_default(|why| format!("\t{why}"));
+            format!(
+                "{}\t{}\t{lag:.1}s\t{}{unuploaded}{stopped}",
+                self.served, self.branch, self.state
+            )
+        }
+
+        fn json(&self) -> serde_json::Value {
+            json!({
+                "event": "status",
+                "device": self.served,
+                "branch": self.branch,
+                "state": self.state,
+                "degraded": self.state != "serving",
+                "upload_lag_ms": self.lag_ms,
+                "generation": self.generation,
+                "unuploaded_bytes": self.unuploaded,
+                "cache_bytes": self.cache,
+                "error": self.stopped,
+            })
+        }
     }
 
     /// A request on the control socket.
@@ -1065,11 +1241,14 @@ mod linux {
         BufReader::new(rd).read_line(&mut line).await?;
         match line.trim_end().split_once(' ') {
             Some(("ok", _)) => {
-                out.line(format!(
-                    "{} is {} bytes; grow the file system on it to use them (resize2fs for ext4)",
-                    served.display(),
-                    r.size
-                ));
+                out.result(
+                    format!(
+                        "{} is {} bytes; grow the file system on it to use them (resize2fs for ext4)",
+                        served.display(),
+                        r.size
+                    ),
+                    json!({"event": "resized", "device": served, "size": r.size}),
+                );
                 Ok(())
             }
             Some(("error", why)) => bail!("resize {}: {why}", served.display()),
@@ -1093,10 +1272,11 @@ mod linux {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        bail!(
+        Err(InUse(format!(
             "the daemon of {} is alive; recover only a device whose daemon died",
             device.display()
-        )
+        ))
+        .into())
     }
 
     /// Publishes the branch and frees it; the device no longer writes to its image.
@@ -1114,7 +1294,10 @@ mod linux {
             ));
         }
         let total = t0.elapsed();
-        out.line(format!("published {name} in {total:.1?}: {r:?}"));
+        out.result(
+            format!("published {name} in {total:.1?}: {r:?}"),
+            json!({"event": "published", "branch": name, "took_ms": millis(total)}),
+        );
         let c = &r.checkpoint;
         let last = c.last.unwrap_or_default();
         let s = cache.stats();
@@ -1144,12 +1327,17 @@ mod linux {
     /// Stops the device of `d`. A live daemon publishes the branch before the device is
     /// deleted, so this returns once the branch is in the store, or fails with why the daemon
     /// could not publish it. A device an earlier detach stopped is only waited for again.
-    pub(crate) async fn detach(d: DetachArgs) -> Result<()> {
+    pub(crate) async fn detach(d: DetachArgs, out: &Out) -> Result<()> {
+        let t0 = Instant::now();
         if let Some(dir) = &d.fuse {
-            return detach_fuse(dir, d.force, d.publish_wait).await;
+            detach_fuse(dir, d.force, d.publish_wait).await?;
+            out.event(json!({"event": "detached", "fuse": dir, "took_ms": millis(t0.elapsed())}));
+            return Ok(());
         }
         let device = d.device.clone().context("detach needs --device or --fuse")?;
-        detach_ublk(&d, &device).await
+        detach_ublk(&d, &device).await?;
+        out.event(json!({"event": "detached", "device": device, "took_ms": millis(t0.elapsed())}));
+        Ok(())
     }
 
     /// Asks the daemon of the FUSE mount at `dir` to let go of its loop device, unmount and
@@ -1280,7 +1468,7 @@ mod linux {
         let mut silent = 0;
         for (_, served, r) in answers {
             match r {
-                Ok(Ok(line)) => out.line(line),
+                Ok(Ok(st)) => out.result(st.human(), st.json()),
                 Ok(Err(e)) if scanned && no_daemon(&e) => {}
                 Ok(Err(e)) => {
                     silent += 1;
@@ -1332,8 +1520,8 @@ mod linux {
             .is_some_and(|e| matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound))
     }
 
-    /// Asks the daemon on control socket `p` how its branch stands, as a line of `status`.
-    async fn ask_status(p: &Path) -> Result<String> {
+    /// Asks the daemon on control socket `p` how its branch stands.
+    async fn ask_status(p: &Path) -> Result<Standing> {
         let conn = UnixStream::connect(p)
             .await
             .with_context(|| format!("connect to {}; is the daemon running?", p.display()))?;
@@ -1342,23 +1530,118 @@ mod linux {
         w.shutdown().await?;
         let mut line = String::new();
         BufReader::new(rd).read_line(&mut line).await?;
-        let reply = line.trim_end();
-        let fields = reply
-            .strip_prefix("ok ")
-            .map(|r| r.split('\t').collect::<Vec<_>>());
-        match fields.as_deref() {
-            Some([served, branch, lag, state]) => {
-                let ms: u64 = lag.parse().with_context(|| format!("upload lag {lag:?}"))?;
-                Ok(format!(
-                    "{served}\t{branch}\t{:.1}s\t{state}",
-                    Duration::from_millis(ms).as_secs_f64()
-                ))
+        Standing::parse(line.trim_end_matches('\n'))
+    }
+
+    /// Fails with [`Unsupported`] when this host lacks a device node `a` needs, or ublk lacks
+    /// user recovery, before the attach touches the store.
+    pub(crate) async fn supported(a: &AttachArgs) -> Result<()> {
+        let needs: &[&str] = if a.fuse.is_some() {
+            &["fuse", "loop"]
+        } else if a.dm.is_some() {
+            &["ublk", "device-mapper"]
+        } else {
+            &["ublk"]
+        };
+        for c in CHECKS.iter().filter(|c| needs.contains(&c.name)) {
+            if !Path::new(c.node).exists() {
+                return Err(Unsupported(format!("{} is missing: {}", c.node, c.fix)).into());
             }
-            _ => match reply.split_once(' ') {
-                Some(("error", why)) => bail!("{why}"),
-                _ => bail!("the daemon answered {reply:?}"),
-            },
         }
+        if a.fuse.is_none() && matches!(pando_linux::user_recovery().await, Ok(false)) {
+            return Err(Unsupported(format!("ublk lacks user recovery with reissue: {RECOVERY_FIX}")).into());
+        }
+        Ok(())
+    }
+
+    /// What to do when ublk lacks user recovery, which every `attach --device` asks for.
+    const RECOVERY_FIX: &str =
+        "use Linux 6.0 or later, so a crash or an upgrade takes the device over without failing its I/O";
+
+    /// A device node an attach needs, and what to do when it is missing.
+    struct Check {
+        name: &'static str,
+        node: &'static str,
+        fix: &'static str,
+    }
+
+    const CHECKS: [Check; 4] = [
+        Check {
+            name: "ublk",
+            node: "/dev/ublk-control",
+            fix: "load ublk_drv (modprobe ublk_drv; on Ubuntu it is in linux-modules-extra-$(uname -r)), \
+                  or attach with --fuse",
+        },
+        Check {
+            name: "device-mapper",
+            node: "/dev/mapper/control",
+            fix: "load dm_mod (modprobe dm_mod), or attach without --dm and --images",
+        },
+        Check {
+            name: "loop",
+            node: "/dev/loop-control",
+            fix: "load loop (modprobe loop); attach --fuse needs it",
+        },
+        Check {
+            name: "fuse",
+            node: "/dev/fuse",
+            fix: "load fuse (modprobe fuse); attach --fuse needs it",
+        },
+    ];
+
+    /// Reports whether this host can attach branches, one line per check; fails with
+    /// [`Unsupported`] when neither `attach --device` nor `attach --fuse` can work.
+    pub(crate) async fn check_host(out: &Out) -> Result<()> {
+        let mut ok = std::collections::HashMap::new();
+        for c in &CHECKS {
+            let here = Path::new(c.node).exists();
+            ok.insert(c.name, here);
+            report(out, c.name, here, &format!("{} is there", c.node), c.fix);
+        }
+        let recovery = if ok["ublk"] {
+            match pando_linux::user_recovery().await {
+                Ok(true) => (true, "ublk takes a device over from a dead daemon".to_owned()),
+                Ok(false) => (false, "ublk lacks user recovery with reissue".to_owned()),
+                Err(e) => (false, format!("ask ublk for its features: {e}")),
+            }
+        } else {
+            (false, "no ublk".to_owned())
+        };
+        report(out, "user-recovery", recovery.0, &recovery.1, RECOVERY_FIX);
+        let root = rustix::process::geteuid().is_root();
+        report(out, "root", root, "runs as root", "run attach and detach as root");
+        let ublk = ok["ublk"] && recovery.0 && root;
+        let fuse = ok["fuse"] && ok["loop"] && root;
+        out.result(
+            format!(
+                "attach --device: {}; attach --fuse: {}",
+                if ublk { "works" } else { "does not work" },
+                if fuse { "works" } else { "does not work" }
+            ),
+            json!({"event": "host", "ublk": ublk, "fuse": fuse}),
+        );
+        if ublk || fuse {
+            Ok(())
+        } else {
+            Err(Unsupported("this host can attach no branch: see the checks above".into()).into())
+        }
+    }
+
+    fn report(out: &Out, name: &str, ok: bool, detail: &str, fix: &str) {
+        out.result(
+            if ok {
+                format!("{name}: ok, {detail}")
+            } else {
+                format!("{name}: missing: {fix}")
+            },
+            json!({
+                "event": "check",
+                "check": name,
+                "ok": ok,
+                "detail": detail,
+                "fix": (!ok).then_some(fix),
+            }),
+        );
     }
 
     /// Fails while `users` hold device `dev`, so a stop cannot cut a mounted file system off.
@@ -1366,16 +1649,51 @@ mod linux {
         if users.is_empty() {
             return Ok(());
         }
-        bail!(
+        Err(InUse(format!(
             "{dev} is in use: {}. Unmount it and stop what holds it, then detach again; the \
              device still serves the branch (--force stops it anyway and loses unflushed writes)",
             users.join(", ")
-        )
+        ))
+        .into())
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn status_reads_the_reply_of_this_release_and_of_earlier_ones() {
+            let old = Standing::parse("ok /dev/ublkb1\tmain\t1500\tserving").unwrap();
+            assert_eq!(old.human(), "/dev/ublkb1\tmain\t1.5s\tserving");
+            assert_eq!(old.json()["generation"], serde_json::Value::Null);
+            assert_eq!(old.json()["degraded"], false);
+            let new = Standing::parse(
+                "ok /dev/ublkb1\tmain\t61000\tuploads-stopped\t7\t2097152\t4096\tref main changed by another writer",
+            )
+            .unwrap();
+            assert_eq!(
+                new.json(),
+                json!({
+                    "event": "status",
+                    "device": "/dev/ublkb1",
+                    "branch": "main",
+                    "state": "uploads-stopped",
+                    "degraded": true,
+                    "upload_lag_ms": 61000,
+                    "generation": 7,
+                    "unuploaded_bytes": 2_097_152,
+                    "cache_bytes": 4096,
+                    "error": "ref main changed by another writer",
+                })
+            );
+            let none = Standing::parse("ok /dev/ublkb1\tmain\t0\tserving\t2\t0\t0\t").unwrap();
+            assert_eq!(none.stopped, None);
+            assert!(Standing::parse("ok /dev/ublkb1\tmain\t0\tserving\t2").is_err());
+            assert_eq!(
+                Standing::parse("error no such branch").unwrap_err().to_string(),
+                "no such branch"
+            );
+        }
 
         #[test]
         fn every_spelling_of_a_fuse_directory_names_one_socket() {
@@ -1406,7 +1724,10 @@ mod linux {
                     .await
                     .unwrap();
             });
-            assert_eq!(ask_status(&p).await.unwrap(), "/dev/ublkb9\tmain\t1.5s\tserving");
+            assert_eq!(
+                ask_status(&p).await.unwrap().human(),
+                "/dev/ublkb9\tmain\t1.5s\tserving"
+            );
             daemon.await.unwrap();
             std::fs::remove_dir_all(&dir).unwrap();
         }

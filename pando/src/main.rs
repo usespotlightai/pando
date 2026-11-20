@@ -9,6 +9,7 @@
 
 mod config;
 mod device;
+mod exit;
 mod scope;
 mod serve;
 
@@ -20,10 +21,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use exit::Failure;
 use pando_engine::gc::{self, GcOptions};
 use pando_engine::store_format::{Access, check_format};
 use pando_engine::{Cache, Ports, Volume, base, branch};
 use pando_format::{Ref, StoreFormat, keys};
+use serde_json::json;
 use serve::Out;
 use tokio::sync::{OnceCell, watch};
 
@@ -48,6 +51,10 @@ struct Cli {
     /// Threads for CPU work (hashing, compression).
     #[arg(long, global = true, default_value_t = 8)]
     cpu_threads: usize,
+    /// Report on standard output in JSON lines, one object with an `event` field each, as
+    /// docs/cli.md lists them; every other line goes to standard error.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -148,6 +155,10 @@ enum Command {
     /// Grows an attached branch and the devices over it while it serves. The file system on
     /// it keeps its size until it is grown too, with resize2fs for ext4.
     Resize(device::ResizeArgs),
+    /// Reports whether this host can attach branches: ublk with user recovery, device-mapper,
+    /// and the loop devices and FUSE of `attach --fuse`, each with what to do about it. Exits
+    /// with 6 when neither `attach --device` nor `attach --fuse` can work here.
+    CheckHost,
     /// Deletes everything under the store's prefix (its branches, checkpoints, segments, logs
     /// and format marker), as when an org leaves. Detach the prefix's branches on every host
     /// first: it fails if objects appear while it runs. It never deletes a whole bucket. In a
@@ -169,6 +180,7 @@ impl Command {
             Command::Detach(_)
             | Command::Resize(_)
             | Command::Status(_)
+            | Command::CheckHost
             | Command::Serve
             | Command::Purge { .. } => None,
             Command::Refs | Command::Stat | Command::Checkpoints | Command::Gc { delete: false, .. } => {
@@ -251,6 +263,7 @@ impl Cli {
             | Command::Delete { .. }
             | Command::Gc { .. }
             | Command::Stat
+            | Command::CheckHost
             | Command::Purge { .. } => {}
         }
     }
@@ -438,6 +451,7 @@ enum Exit {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     let flushers = matches!(cli.command, Command::Attach(_) | Command::Serve);
     if flushers {
         pando_host::tune_malloc();
@@ -472,11 +486,10 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("Error: {e:?}");
-            if e.is::<device::StillPublishing>() {
-                ExitCode::from(device::TRY_AGAIN)
-            } else {
-                ExitCode::FAILURE
+            if json {
+                println!("{}", Failure::event(&e));
             }
+            ExitCode::from(Failure::of(&e).code())
         }
     }
 }
@@ -511,13 +524,16 @@ async fn start(cli: Cli) -> Result<Exit> {
         host.cache().await?;
         serve::serve(Arc::clone(&host), &socket).await
     } else {
-        run(&host, cli.command, &Out::stdio()).await
+        run(&host, cli.command, &Out::stdio(cli.json)).await
     };
     if host.holds() {
         if let Err(e) = &done
             && !e.is::<Drained>()
         {
             eprintln!("{e:#}");
+            if cli.json {
+                println!("{}", Failure::event(e));
+            }
         }
         let status = host.drained_status();
         return Ok(Exit::Held { status, host });
@@ -528,26 +544,20 @@ async fn start(cli: Cli) -> Result<Exit> {
 
 /// Runs one command on `host`, writing its output to `out`.
 pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> {
+    if let Command::Attach(a) = &command {
+        device::supported(a).await?;
+    }
     host.prepare(&command).await?;
     let ports = &host.ports;
     let cache = || host.cache();
     match command {
         Command::Refs => refs(ports, out).await,
-        Command::Init { name, size } => Ok(Volume::create(ports, &name, size).await?),
-        Command::Import { name, image } => {
-            let t0 = Instant::now();
-            let r = pando_engine::import(ports, &cache().await?, &name, &image).await?;
-            out.line(format!(
-                "imported {name}: {} MiB device, {} chunks with data ({} of ext4 metadata), {} segments ({} MiB) in {:.1?}",
-                r.size >> 20,
-                r.chunks,
-                r.metadata,
-                r.upload.segments,
-                r.upload.bytes >> 20,
-                t0.elapsed()
-            ));
+        Command::Init { name, size } => {
+            Volume::create(ports, &name, size).await?;
+            out.event(json!({"event": "created", "branch": name, "size": size}));
             Ok(())
         }
+        Command::Import { name, image } => import(ports, &cache().await?, &name, &image, out).await,
         Command::Branch {
             src,
             dst,
@@ -557,25 +567,23 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
         Command::Checkpoint { src, name, max_age } => checkpoint(host, &src, &name, max_age, out).await,
         Command::Checkpoints => checkpoints(ports, out).await,
         Command::DeleteCheckpoint { name } => {
-            Ok(branch::delete_checkpoint(ports, &host.checkpoints, &name).await?)
+            branch::delete_checkpoint(ports, &host.checkpoints, &name).await?;
+            out.event(json!({"event": "deleted-checkpoint", "checkpoint": name}));
+            Ok(())
         }
         Command::Serve => bail!("serve runs only as its own process"),
-        Command::Advance { dst, src } => Ok(branch::advance(ports, &dst, &src).await?),
-        Command::Delete { name } => Ok(branch::delete(ports, &name).await?),
-        Command::Base { name, dir, parallel } => {
-            let t0 = Instant::now();
-            let r = base::build_branch(ports, &cache().await?, &dir, &name, parallel).await?;
-            if r.built {
-                let seed = r.seed.map_or_default(|s| format!(", seeded from {}", s.short()));
-                out.line(format!(
-                    "base of {name} built in {:.1?}: {} chunks{seed}",
-                    t0.elapsed(),
-                    r.chunks
-                ));
-            } else {
-                out.line(format!("base of {name} is here already"));
-            }
+        Command::Advance { dst, src } => {
+            branch::advance(ports, &dst, &src).await?;
+            out.event(json!({"event": "advanced", "branch": dst, "to": src}));
             Ok(())
+        }
+        Command::Delete { name } => {
+            branch::delete(ports, &name).await?;
+            out.event(json!({"event": "deleted", "branch": name}));
+            Ok(())
+        }
+        Command::Base { name, dir, parallel } => {
+            build_base(ports, &cache().await?, &dir, &name, parallel, out).await
         }
         Command::Follow {
             dir,
@@ -589,7 +597,10 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
             loop {
                 let n = f.once().await?;
                 if once {
-                    out.line(format!("built {n} base images"));
+                    out.result(
+                        format!("built {n} base images"),
+                        json!({"event": "followed", "built": n}),
+                    );
                     return Ok(());
                 }
                 tokio::time::sleep(interval).await;
@@ -613,9 +624,10 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
             let ended = device::attach(ports, cache().await?, a, host.identity.clone(), out).await?;
             host.ended(ended)
         }
-        Command::Detach(d) => device::detach(d).await,
+        Command::Detach(d) => device::detach(d, out).await,
         Command::Resize(r) => device::resize(r, out).await,
         Command::Status(s) => device::status(s, out).await,
+        Command::CheckHost => device::check_host(out).await,
         Command::Stat => stat(&cache().await?, out).await,
         Command::Purge { confirm } => {
             scope::run_purge(ports.store.as_ref(), &host.remote, &confirm, out).await
@@ -623,16 +635,88 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
     }
 }
 
+/// Creates branch `name` with the bytes of disk image `image`.
+async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path, out: &Out) -> Result<()> {
+    let t0 = Instant::now();
+    let r = pando_engine::import(ports, cache, name, image).await?;
+    let took = t0.elapsed();
+    out.result(
+        format!(
+            "imported {name}: {} MiB device, {} chunks with data ({} of ext4 metadata), {} segments ({} MiB) in {took:.1?}",
+            r.size >> 20,
+            r.chunks,
+            r.metadata,
+            r.upload.segments,
+            r.upload.bytes >> 20,
+        ),
+        json!({
+            "event": "imported",
+            "branch": name,
+            "size": r.size,
+            "chunks": r.chunks,
+            "segments": r.upload.segments,
+            "segment_bytes": r.upload.bytes,
+            "took_ms": millis(took),
+        }),
+    );
+    Ok(())
+}
+
+/// Builds this host's base image of branch `name` in `dir`.
+async fn build_base(
+    ports: &Ports,
+    cache: &Arc<Cache>,
+    dir: &Path,
+    name: &str,
+    parallel: usize,
+    out: &Out,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let r = base::build_branch(ports, cache, dir, name, parallel).await?;
+    let took = t0.elapsed();
+    let human = if r.built {
+        let seed = r.seed.map_or_default(|s| format!(", seeded from {}", s.short()));
+        format!("base of {name} built in {took:.1?}: {} chunks{seed}", r.chunks)
+    } else {
+        format!("base of {name} is here already")
+    };
+    out.result(
+        human,
+        json!({
+            "event": "base",
+            "branch": name,
+            "built": r.built,
+            "chunks": r.chunks,
+            "took_ms": millis(took),
+        }),
+    );
+    Ok(())
+}
+
+/// `d` in whole milliseconds, for `--json`.
+pub(crate) fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Reports how much the store holds.
 async fn stat(cache: &Arc<Cache>, out: &Out) -> Result<()> {
     let u = gc::usage(cache).await?;
-    out.line(format!(
-        "{} branches, {} segments ({} MiB), {} change lists",
-        u.branches,
-        u.segments,
-        u.segment_bytes >> 20,
-        u.change_lists
-    ));
+    out.result(
+        format!(
+            "{} branches, {} segments ({} MiB), {} change lists",
+            u.branches,
+            u.segments,
+            u.segment_bytes >> 20,
+            u.change_lists
+        ),
+        json!({
+            "event": "stat",
+            "branches": u.branches,
+            "segments": u.segments,
+            "segment_bytes": u.segment_bytes,
+            "change_lists": u.change_lists,
+        }),
+    );
     Ok(())
 }
 
@@ -651,7 +735,17 @@ async fn fork(
     } else {
         branch::copy(&host.ports, src, dst, Some(max_age)).await?;
     }
-    out.line(format!("{src} -> {dst} in {:.1?}", t0.elapsed()));
+    let took = t0.elapsed();
+    out.result(
+        format!("{src} -> {dst} in {took:.1?}"),
+        json!({
+            "event": "branched",
+            "from": src,
+            "branch": dst,
+            "from_checkpoint": checkpoint,
+            "took_ms": millis(took),
+        }),
+    );
     Ok(())
 }
 
@@ -659,24 +753,42 @@ async fn fork(
 async fn checkpoint(host: &Host, src: &str, name: &str, max_age: Duration, out: &Out) -> Result<()> {
     let t0 = Instant::now();
     let c = branch::checkpoint(&host.ports, &host.checkpoints, src, name, Some(max_age)).await?;
-    let root = c.root.hash.short();
-    out.line(format!(
-        "checkpoint {name} of {src} at {root} in {:.1?}",
-        t0.elapsed()
-    ));
+    let took = t0.elapsed();
+    out.result(
+        format!(
+            "checkpoint {name} of {src} at {} in {took:.1?}",
+            c.root.hash.short()
+        ),
+        json!({
+            "event": "checkpointed",
+            "checkpoint": name,
+            "branch": src,
+            "root": c.root.hash.to_string(),
+            "took_ms": millis(took),
+        }),
+    );
     Ok(())
 }
 
 async fn checkpoints(ports: &Ports, out: &Out) -> Result<()> {
     for (name, c) in branch::list_checkpoints(ports).await? {
-        out.line(format!("{name} {} {} {}", c.size, c.branch, c.root.hash.short()));
+        out.result(
+            format!("{name} {} {} {}", c.size, c.branch, c.root.hash.short()),
+            json!({
+                "event": "checkpoint",
+                "checkpoint": name,
+                "size": c.size,
+                "branch": c.branch,
+                "root": c.root.hash.to_string(),
+            }),
+        );
     }
     Ok(())
 }
 
 async fn collect(ports: &Ports, cache: &Arc<Cache>, opts: &GcOptions, out: &Out) -> Result<()> {
     let r = gc::collect(cache, ports.clock.as_ref(), opts).await?;
-    out.line(format!(
+    let human = format!(
         "{} live segments ({} MiB, {} MiB used), {} dead ({} MiB){}; kept {} of current writers, {} young, {} needed by kept; {} revived; {} stale change lists, {} stale log records",
         r.live,
         r.live_bytes >> 20,
@@ -690,7 +802,25 @@ async fn collect(ports: &Ports, cache: &Arc<Cache>, opts: &GcOptions, out: &Out)
         r.revived,
         r.stale_change_lists,
         r.stale_log_records
-    ));
+    );
+    out.result(
+        human,
+        json!({
+            "event": "gc",
+            "live": r.live,
+            "live_bytes": r.live_bytes,
+            "used_bytes": r.used_bytes,
+            "dead": r.dead,
+            "dead_bytes": r.dead_bytes,
+            "deleted": r.deleted,
+            "current_writer": r.current_writer,
+            "young": r.young,
+            "needed_by_kept": r.needed_by_kept,
+            "revived": r.revived,
+            "stale_change_lists": r.stale_change_lists,
+            "stale_log_records": r.stale_log_records,
+        }),
+    );
     Ok(())
 }
 
@@ -698,13 +828,18 @@ async fn refs(ports: &Ports, out: &Out) -> Result<()> {
     for o in ports.store.list(keys::REFS).await? {
         let name = o.key.strip_prefix(&format!("{}/", keys::REFS)).unwrap_or(&o.key);
         let r = Ref::decode(&ports.store.get(&o.key).await?.body).with_context(|| format!("ref {name}"))?;
-        let from = r.from.map_or_default(|f| format!(" from {f}"));
-        out.line(format!(
-            "{name} {} {} {}{from}",
-            r.size,
-            r.generation,
-            r.root.hash.short()
-        ));
+        let from = r.from.as_ref().map_or_default(|f| format!(" from {f}"));
+        out.result(
+            format!("{name} {} {} {}{from}", r.size, r.generation, r.root.hash.short()),
+            json!({
+                "event": "ref",
+                "branch": name,
+                "size": r.size,
+                "generation": r.generation,
+                "root": r.root.hash.to_string(),
+                "from": r.from,
+            }),
+        );
     }
     Ok(())
 }

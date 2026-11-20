@@ -27,7 +27,8 @@ Each action names the code it models:
 | `Open`, `Resumed` | `Volume::open_logged`, `VolState::resumes`, `Inner::resumed_ahead` |
 | `ScanRead`, `ScanSeal`, `Replay` | `log::scan`, `Inner::replay_log` |
 | `Take` | `Inner::take_generation` |
-| `Flush` | a commit; `logged = FALSE` is one the queue drops and leaves to the uploader |
+| `Write` | a write to the volume, kept by the host's journal unless the host fails first; `Inner::start_journal` gives a resumed writer the journal's writes back |
+| `Commit` | `Inner::commit_once`: a flush, or a checkpoint's or a detach's commit; `logged = FALSE` is one the queue drops and leaves to the uploader |
 | `ShipBatch`, `ShipNumber`, `ShipCreate`, `ShipFence`, `ShipCovered`, `ShipAbandon` | `Log::take_batch`, `Inner::shipper`, `Inner::put_record` |
 | `UploadStart`, `UploadPut` | `Inner::uploader`, `Inner::upload`, `Inner::log_pos` |
 | `TrimOwn`, `TrimListOlder`, `TrimDeleteOlder` | `Inner::trim_log` |
@@ -50,9 +51,9 @@ tools/tlc.sh
 ```
 
 That checks every model in `specs/*.cfg`, the ones a pull request runs. `WriteLog.cfg` has two
-hosts, two flushes, three opens and strict mode, and checks every behaviour of up to 24 steps:
-about 2.3 million distinct states, a minute on a CI runner. `WriteLog-advance.cfg` adds one
-advance with two opens, to 16 steps: about 0.9 million states.
+hosts, two writes, three opens and strict mode, and checks every behaviour of up to 24 steps:
+about 3.8 million distinct states. `WriteLog-advance.cfg` adds one advance with two opens, to 16
+steps: about 1.1 million states.
 
 ```bash
 tools/tlc.sh nightly
@@ -76,7 +77,8 @@ The race scenario in `pando-dst/tests/scenarios.rs` runs two hosts that open, fl
 detach, crash and lose their disk on one branch, over a simulated store with latency. A third
 host advances the branch now and then, to a new empty branch or to a copy of what it published. With
 `PANDO_TLA_TRACES` set, each seed also writes every call on the branch's ref and log, in the
-order the store applied them, and every flush a writer committed, as `race-<seed>/TraceData.tla`.
+order the store applied them, and every write and flush of a writer, as
+`race-<seed>/TraceData.tla`.
 `trace/WriteLogTrace.tla` maps each event to one action of the spec with the same host, record,
 flushes, log position and outcome, and lets the actions no call shows run in between. TLC then
 searches for a behaviour of the spec that matches the whole trace.

@@ -56,6 +56,8 @@ pub enum Step {
     DeleteLog(u64, u64),
     /// A list of the branch's log.
     ListLog,
+    /// The host's writer wrote the data of a flush.
+    Write,
     /// The host's writer committed a flush.
     Flush,
     /// The host's process ended; its local state stays.
@@ -355,6 +357,7 @@ impl<'a> Row<'a> {
             },
             Step::ListLog => op("list_log"),
             Step::Flush => op("flush"),
+            Step::Write => op("write"),
             Step::Stop => op("stop"),
             Step::Lose => op("lose"),
         }
@@ -388,14 +391,14 @@ impl<'a> Row<'a> {
 }
 
 /// The trace as module `TraceData`: the hosts, the host that runs advances, bounds on opens,
-/// flushes and advances, and the events.
+/// writes and advances, and the events.
 pub fn module(hosts: &[&str], advancer: &str, bounds: (usize, usize, usize), events: &[Event]) -> String {
-    let (opens, flushes, advances) = bounds;
+    let (opens, writes, advances) = bounds;
     let names: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
     let mut out = String::from("---- MODULE TraceData ----\n");
     let _ = writeln!(out, "TraceHosts == {{{}}}", names.join(", "));
     let _ = writeln!(out, "TraceOpens == {opens}");
-    let _ = writeln!(out, "TraceFlushes == {flushes}");
+    let _ = writeln!(out, "TraceWrites == {writes}");
     let _ = writeln!(out, "TraceAdvancer == \"{advancer}\"");
     let _ = writeln!(out, "TraceAdvances == {advances}");
     out.push_str("Trace == <<\n");
