@@ -17,7 +17,7 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 CONSTANTS
     Hosts,          \* hosts that open the branch, one process each at a time
     Modes,          \* the log modes an open may take: "behind", "strict"
-    MaxFlushes,     \* flushes the writers commit in all
+    MaxFlushes,     \* writes the writers make in all, each a flush once committed
     MaxOpens,       \* opens in all
     MaxAdvances,    \* `pando advance` runs onto the branch
     Depth           \* the longest behaviour checked, in steps; 0 for every behaviour
@@ -37,6 +37,7 @@ VARIABLES
 vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories>>
 
 Max(a, b) == IF a >= b THEN a ELSE b
+Last(s) == s[Len(s)]
 Range(s) == {s[i] : i \in DOMAIN s}
 IsPrefix(a, b) == Len(a) <= Len(b) /\ SubSeq(b, 1, Len(a)) = a
 
@@ -49,7 +50,11 @@ Writes(g, n, from, to, base, hist) ==
 
 At(g, n) == {r \in store : r.g = g /\ r.n = n}
 
-NoDisk == [present |-> FALSE, root |-> <<>>, published |-> <<>>, publishing |-> <<>>, gen |-> 0]
+\* A host's local state: the root it committed last, the writes its journal
+\* holds since, and what it published.
+NoDisk ==
+    [present |-> FALSE, root |-> <<>>, pending |-> <<>>, published |-> <<>>,
+     publishing |-> <<>>, gen |-> 0]
 
 Idle ==
     [pc |-> "idle",
@@ -60,6 +65,8 @@ Idle ==
      replayed |-> FALSE,
      \* the writer
      gen |-> 0, mode |-> "behind", hists |-> <<<<>>>>, seq |-> 0, opened |-> <<>>,
+     \* the writes in memory no commit has taken yet
+     pending |-> <<>>,
      logged |-> 0, uploaded |-> 0, upRoot |-> <<>>, dropped |-> 0, records |-> <<>>,
      batching |-> FALSE, shipping |-> FALSE, shipN |-> 0, shipFrom |-> 0, shipTo |-> 0,
      refused |-> FALSE, shipperDone |-> FALSE,
@@ -116,9 +123,10 @@ FirstGen(start) ==
 \* uploader (Inner::resumed_ahead).
 Resumed(p, d) ==
     IF d.root = p.rroot
-    THEN [p EXCEPT !.pc = "take", !.hists = <<d.root>>, !.opened = d.root, !.st = d.root]
+    THEN [p EXCEPT !.pc = "take", !.hists = <<d.root>>, !.opened = d.root, !.st = d.root,
+                   !.pending = d.pending]
     ELSE [p EXCEPT !.pc = "take", !.hists = <<p.rroot, d.root>>, !.seq = 1, !.dropped = 1,
-                   !.opened = d.root, !.st = d.root]
+                   !.opened = d.root, !.st = d.root, !.pending = d.pending]
 
 \* An open reads the ref, and either resumes this host's state or scans the log.
 Open(h, m) ==
@@ -179,7 +187,7 @@ Replay(h) ==
                     [p EXCEPT !.pc = "take", !.hists = hists, !.seq = Len(hists) - 1,
                               !.opened = p.st]]
        /\ disk' = [disk EXCEPT ![h] =
-                    [present |-> TRUE, root |-> p.st, published |-> p.rroot,
+                    [present |-> TRUE, root |-> p.st, pending |-> <<>>, published |-> p.rroot,
                      publishing |-> <<>>, gen |-> p.rgen]]
        /\ UNCHANGED <<ref, store, nextId, opens, advances, acked, histories>>
 
@@ -208,24 +216,35 @@ Take(h) ==
 Running(h) == proc[h].pc = "run"
 Live(h) == Running(h) /\ ~proc[h].fenced
 
-\* A flush commits locally and durably. A flush that bounds memory, or is too
-\* large for a record, is left to the uploader: the queue drops it and what
-\* waits before it.
-Flush(h, logged) ==
+\* A write lands in the process's memory and, unless the host fails first, in
+\* its journal. It takes the next flush id.
+Write(h, kept) ==
+    /\ Running(h)
+    /\ nextId <= MaxFlushes
+    /\ proc' = [proc EXCEPT ![h].pending = Append(@, nextId)]
+    /\ disk' = IF kept THEN [disk EXCEPT ![h].pending = Append(@, nextId)] ELSE disk
+    /\ nextId' = nextId + 1
+    /\ UNCHANGED <<ref, store, opens, advances, acked, histories>>
+
+\* A commit takes every write in memory, locally and durably. A flush is a commit
+\* that returns to its caller, who waits for the log in strict mode; a commit
+\* with no caller is a checkpoint's or a detach's. A commit that bounds memory,
+\* or is too large for a record, is left to the uploader: the queue drops it and
+\* what waits before it.
+Commit(h, logged, flush) ==
     LET p == proc[h]
-        now == Append(H(p, p.seq), nextId)
+        now == H(p, p.seq) \o p.pending
     IN /\ Live(h)
-       /\ nextId <= MaxFlushes
+       /\ p.pending /= <<>>
        /\ proc' = [proc EXCEPT ![h] =
-                    [p EXCEPT !.hists = Append(p.hists, now), !.seq = p.seq + 1,
+                    [p EXCEPT !.hists = Append(p.hists, now), !.seq = p.seq + 1, !.pending = <<>>,
                               !.dropped = IF logged THEN p.dropped ELSE p.seq + 1,
-                              !.waiting = IF p.mode = "strict"
-                                          THEN p.waiting \cup {<<p.seq + 1, nextId>>}
+                              !.waiting = IF flush /\ p.mode = "strict"
+                                          THEN p.waiting \cup {<<p.seq + 1, Last(p.pending)>>}
                                           ELSE p.waiting]]
-       /\ disk' = [disk EXCEPT ![h].root = now]
-       /\ nextId' = nextId + 1
+       /\ disk' = [disk EXCEPT ![h].root = now, ![h].pending = <<>>]
        /\ histories' = histories \cup {now}
-       /\ UNCHANGED <<ref, store, opens, advances, acked>>
+       /\ UNCHANGED <<ref, store, nextId, opens, advances, acked>>
 
 ShipBase(p) == Max(p.logged, p.uploaded)
 
@@ -476,7 +495,8 @@ Next ==
     \/ \E h \in Hosts :
         \/ \E m \in Modes : Open(h, m)
         \/ ScanRead(h) \/ ScanSeal(h) \/ Replay(h) \/ Take(h)
-        \/ \E logged \in BOOLEAN : Flush(h, logged)
+        \/ \E kept \in BOOLEAN : Write(h, kept)
+        \/ \E logged, flush \in BOOLEAN : Commit(h, logged, flush)
         \/ \E to \in 1..MaxFlushes + 1 : ShipBatch(h, to)
         \/ ShipNumber(h) \/ ShipCovered(h) \/ ShipCreate(h) \/ ShipFence(h)
         \/ ShipAbandon(h)

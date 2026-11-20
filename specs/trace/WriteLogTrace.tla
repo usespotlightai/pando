@@ -88,7 +88,8 @@ Observe(e) ==
                 \/ p.gen = e.g /\ WL!TrimOwn(h, e.n)
                 \/ WL!TrimDeleteOlder(h, <<e.g, e.n>>)
          [] e.op = "list_log" -> WL!TrimListOlder(h)
-         [] e.op = "flush" -> WL!Flush(h, TRUE)
+         [] e.op = "write" -> \E kept \in BOOLEAN : WL!Write(h, kept)
+         [] e.op = "flush" -> WL!Commit(h, TRUE, TRUE)
          [] e.op = "stop" -> WL!Stop(h)
          [] e.op = "lose" -> WL!Lose(h)
 
@@ -96,6 +97,7 @@ Hidden ==
     /\ UNCHANGED i
     /\ \E h \in TraceHosts :
         \/ WL!Replay(h)
+        \/ WL!Commit(h, TRUE, FALSE)
         \/ \E to \in 1..TraceFlushes + 1 : WL!ShipBatch(h, to)
         \/ WL!ShipNumber(h)
         \/ WL!ShipCovered(h)

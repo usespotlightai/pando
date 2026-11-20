@@ -56,6 +56,8 @@ pub enum Step {
     DeleteLog(u64, u64),
     /// A list of the branch's log.
     ListLog,
+    /// The host's writer wrote the data of a flush.
+    Write,
     /// The host's writer committed a flush.
     Flush,
     /// The host's process ended; its local state stays.
@@ -355,6 +357,7 @@ impl<'a> Row<'a> {
             },
             Step::ListLog => op("list_log"),
             Step::Flush => op("flush"),
+            Step::Write => op("write"),
             Step::Stop => op("stop"),
             Step::Lose => op("lose"),
         }

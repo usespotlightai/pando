@@ -2,7 +2,9 @@
 //! at random while the others' background tasks run, and now and then the branch is advanced to
 //! an empty branch or to a copy of itself. Every open must hold a prefix of some writer's
 //! flushes, every strict flush that returned since the last advance, and no flush an advance
-//! dropped; the calls on the branch's ref and log are traced for `specs/WriteLogTrace.tla`.
+//! dropped. A fenced writer's last write, whose flush failed, may follow its flushes: its
+//! journal may keep it, and an open that resumes its state then holds it. The calls on the
+//! branch's ref and log, and each write and flush, are traced for `specs/WriteLogTrace.tla`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -86,6 +88,8 @@ struct World {
     traced: BTreeMap<u64, u64>,
     /// Each writer's flushes in order, from the open it took the branch with.
     histories: Vec<Vec<u64>>,
+    /// The write each history's writer could not flush, being fenced.
+    unflushed: BTreeMap<usize, u64>,
     acked: BTreeSet<u64>,
     next: u64,
     race: Race,
@@ -115,12 +119,15 @@ impl World {
         Ok(held)
     }
 
-    /// The writer history `held` is a prefix of, and the length of that prefix.
+    /// The prefix of a writer history that `held` is, in order: some of the writer's flushes,
+    /// or all of them and the write it could not flush.
     fn prefix_of(&self, held: &BTreeSet<u64>) -> Option<Vec<u64>> {
-        self.histories.iter().find_map(|h| {
-            let k = held.len();
-            (h.len() >= k && h[..k].iter().copied().collect::<BTreeSet<_>>() == *held)
-                .then(|| h[..k].to_vec())
+        let k = held.len();
+        self.histories.iter().enumerate().find_map(|(i, h)| {
+            let mut ids = h.clone();
+            ids.extend(self.unflushed.get(&i));
+            (ids.len() >= k && ids[..k].iter().copied().collect::<BTreeSet<_>>() == *held)
+                .then(|| ids[..k].to_vec())
         })
     }
 
@@ -180,19 +187,22 @@ impl World {
         }
         let id = self.next;
         self.next += 1;
+        let wrote = self.tracer.len();
         if w.v.write_at(&id.to_le_bytes(), id * CHUNK).await.is_err() {
             w.fenced = true;
             return;
         }
+        self.tracer.insert(wrote, w.host, Step::Write);
+        self.traced.insert(id, u64_from(self.traced.len()) + 1);
         let before = w.v.root();
         let at = self.tracer.len();
         let r = tokio::time::timeout(WAIT, w.v.flush()).await;
         if w.v.root() == before {
             w.fenced = true;
+            self.unflushed.insert(w.history, id);
             return;
         }
         self.tracer.insert(at, w.host, Step::Flush);
-        self.traced.insert(id, u64_from(self.traced.len()) + 1);
         self.histories[w.history].push(id);
         self.race.flushes += 1;
         if w.mode == LogMode::Strict && matches!(r, Ok(Ok(()))) {
@@ -347,6 +357,7 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
         dropped: BTreeSet::new(),
         traced: BTreeMap::new(),
         histories: vec![Vec::new()],
+        unflushed: BTreeMap::new(),
         acked: BTreeSet::new(),
         next: 1,
         race: Race::default(),
@@ -404,6 +415,7 @@ fn count(race: &mut Race, events: &[Event]) {
             Step::CreateLog(..)
             | Step::DeleteLog(..)
             | Step::ListLog
+            | Step::Write
             | Step::Flush
             | Step::Stop
             | Step::Lose => {}
