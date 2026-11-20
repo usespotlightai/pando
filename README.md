@@ -45,6 +45,10 @@ sharing one root system.
 - **Host daemon.** `pando serve --socket PATH` keeps the store's connections, the cache and the
   checkpoints it has read. `pando --socket PATH <command>` runs the command there, so a branch or
   attach skips process start-up, credential loading and cold connections.
+- **A contract for programs.** With `--json` every command reports in JSON lines, `status`
+  reports each attached branch's upload lag and unuploaded bytes, `check-host` says whether a
+  host can attach, and exit statuses tell in use, store unreachable, fenced and unsupported
+  apart. [docs/cli.md](docs/cli.md) lists them.
 
 ## Crates
 

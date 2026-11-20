@@ -234,6 +234,13 @@ fn join(queues: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
     }
 }
 
+/// Whether this kernel's ublk takes a device over from a dead daemon and reissues the requests
+/// it had in flight, which a crash or an upgrade needs; an error when ublk is not loaded.
+pub async fn user_recovery() -> io::Result<bool> {
+    let both = ctrl::F_USER_RECOVERY | ctrl::F_USER_RECOVERY_REISSUE;
+    blocking(move || Ok(Ctrl::open()?.features() & both == both)).await
+}
+
 /// Whether the daemon of device `id` died: ublk holds its I/O (quiesced) or fails it.
 pub async fn daemon_dead(id: u32) -> io::Result<bool> {
     Ok(daemon(id).await? == Daemon::Dead)

@@ -215,6 +215,15 @@ impl Tree {
         self.pack_at(*root, self.depth - 1, p).await
     }
 
+    /// How many distinct chunks under `root` no upload has put in the store yet.
+    pub(crate) async fn pending_count(&self, root: &Entry) -> Result<u64> {
+        let mut chunks = Vec::new();
+        self.pending_chunks(root, &mut chunks).await?;
+        chunks.sort_unstable();
+        chunks.dedup();
+        Ok(u64::try_from(chunks.len()).unwrap_or(u64::MAX))
+    }
+
     async fn pending_chunks(&self, root: &Entry, out: &mut Vec<Hash>) -> Result<()> {
         let mut stack = vec![(*root, self.depth - 1)];
         while let Some((e, level)) = stack.pop() {
