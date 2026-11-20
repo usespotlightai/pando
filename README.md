@@ -357,13 +357,15 @@ of the daemon, so those rows mostly measure memory. Its writes do not: sequentia
 NVMe, and 4 KiB random writes reach about 123k IOPS, near the NVMe's 134k. At `d57f1de` they reached
 only 14k: each dirty 4 KiB write held a whole 64 KiB chunk in memory, so the dirty-memory limit held
 random writes to the speed of full-chunk flushes. Dirty writes now stay in the journal. During these
-runs the daemon's memory grew with each run, to a peak of 1,060 MiB: the object log index and the
-uploader's map of uploaded objects keep every chunk version. This is a known issue, and a fix is in
-progress. The after-handoff rows are from `d57f1de`. After handoff, I/O goes through device-mapper
-and a loop device to the image on the NVMe and runs at the NVMe's speed. EBS gp3 runs at its
-baseline of 3,000 IOPS and 125 MiB/s. On ZeroFS every request goes over NBD to its server and on S3
-Files over NFS to the file system, so a single 4 KiB read waits on a round trip: about 240 IOPS on
-S3 Files.
+runs at `a871f16`, the daemon's memory grew with each run, to a peak of 1,060 MiB: the object log
+index and the uploader's map of uploaded objects kept every chunk version. Since then, sweeps drop
+old chunk versions from the object log, and the uploader's map is gone. In a local run of 10 rounds
+of 4 KiB random writes over a 1 GiB file, the object log stayed between 2.6 and 5.2 GB on disk over
+21.6 GB written; the bench rows have not been rerun since. The after-handoff rows are from
+`d57f1de`. After handoff, I/O goes through device-mapper and a loop device to the image on the NVMe
+and runs at the NVMe's speed. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On ZeroFS
+every request goes over NBD to its server and on S3 Files over NFS to the file system, so a single 4
+KiB read waits on a round trip: about 240 IOPS on S3 Files.
 
 <!-- bench:fio -->
 <picture>
