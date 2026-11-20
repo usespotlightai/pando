@@ -58,24 +58,24 @@ jobs:
   s1:
     needs: build
     uses: ./.github/workflows/soak-segment.yml
-    with: { segment: 1, last: "${{ (inputs.segments || 2) == 1 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+    with: { segment: 1, last: "${{ (inputs.segments || 2) == 1 }}", minutes: "${{ fromJSON(inputs.minutes || 20) }}", budget_mib: "${{ fromJSON(inputs.budget_mib || 256) }}" }
   s2:
     needs: s1
     if: (inputs.segments || 2) >= 2
     uses: ./.github/workflows/soak-segment.yml
-    with: { segment: 2, last: "${{ (inputs.segments || 2) == 2 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+    with: { segment: 2, last: "${{ (inputs.segments || 2) == 2 }}", minutes: "${{ fromJSON(inputs.minutes || 20) }}", budget_mib: "${{ fromJSON(inputs.budget_mib || 256) }}" }
   s3:
     needs: s2
     if: (inputs.segments || 2) >= 3
     uses: ./.github/workflows/soak-segment.yml
-    with: { segment: 3, last: "${{ (inputs.segments || 2) == 3 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+    with: { segment: 3, last: "${{ (inputs.segments || 2) == 3 }}", minutes: "${{ fromJSON(inputs.minutes || 20) }}", budget_mib: "${{ fromJSON(inputs.budget_mib || 256) }}" }
   s4:
     needs: s3
     if: (inputs.segments || 2) >= 4
     uses: ./.github/workflows/soak-segment.yml
-    with: { segment: 4, last: "${{ (inputs.segments || 2) == 4 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+    with: { segment: 4, last: "${{ (inputs.segments || 2) == 4 }}", minutes: "${{ fromJSON(inputs.minutes || 20) }}", budget_mib: "${{ fromJSON(inputs.budget_mib || 256) }}" }
   s5:
     needs: s4
     if: (inputs.segments || 2) >= 5
     uses: ./.github/workflows/soak-segment.yml
-    with: { segment: 5, last: "${{ (inputs.segments || 2) == 5 }}", minutes: "${{ inputs.minutes || 20 }}", budget_mib: "${{ inputs.budget_mib || 256 }}" }
+    with: { segment: 5, last: "${{ (inputs.segments || 2) == 5 }}", minutes: "${{ fromJSON(inputs.minutes || 20) }}", budget_mib: "${{ fromJSON(inputs.budget_mib || 256) }}" }

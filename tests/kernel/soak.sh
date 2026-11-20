@@ -11,8 +11,8 @@
 # fresh host reads the branch whole, and the log's disk over the whole run is checked: from 30 s
 # after each attach, within twice the budget and the write region (the log passes the budget by
 # what one sweep's reads fetch, and by writes not uploaded yet), and no higher in the last
-# segment than in the first; nor the daemon's memory. SOAK_SECONDS counts from after the attach
-# and the read-back.
+# segment than in the first, each over its second half, once the first has an hour of samples;
+# nor the daemon's memory. SOAK_SECONDS counts from after the attach and the read-back.
 #   SOAK_PHASE=start|resume  SOAK_SECONDS=17400  SOAK_SEGMENT=1  SOAK_LAST=1
 # ublk ids 77-78.
 TEST=soak
@@ -57,6 +57,7 @@ check() {
 	local what=$1 got=$2
 	case $got in
 	ok*) say "segment $SEG: $what: $got" ;;
+	skipped*) say "segment $SEG: $what: SKIPPED: ${got#skipped, }" ;;
 	*)
 		say "segment $SEG: $what: FAILED: $got"
 		fails=$((fails + 1))
@@ -199,11 +200,15 @@ else
 		check "fresh host" "attach: $(tail -1 "$W/fresh.log" || true)"
 	fi
 	pid=
-	# mean <segment> <column>: the mean of a sampled column in a segment, from 30 s after its attach.
-	mean() { awk -F, -v s="$1" -v c="$2" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] { n++; t += $c } END { if (n) printf "%d", t / n; else print 0 }' "$W/settled.csv" "$W/samples.csv"; }
+	# mean <segment> <column>: the mean of a sampled column over the second half of a segment's
+	# samples from 30 s after its attach.
+	mean() { awk -F, -v s="$1" -v c="$2" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] { v[n++] = $c } END { for (i = int(n / 2); i < n; i++) t += v[i]; if (n) printf "%d", t / (n - int(n / 2)); else print 0 }' "$W/settled.csv" "$W/samples.csv"; }
+	span=$(awk -F, 'FNR == NR { from[$1] = $2; next } $1 == 1 && $2 >= from[1] { if (!a) a = $2; b = $2 } END { print b - a }' "$W/settled.csv" "$W/samples.csv")
 	first=$(mean 1 3)
 	last=$(mean "$SEG" 3)
-	if ((first > 0 && last > 0 && last <= first + first / 4 + 32 * MiB)); then
+	if ((span < 3600)); then
+		check "the log does not grow across segments" "skipped, segment 1 has $((span / 60)) minutes of samples, under 60: mean $((first / MiB)) MiB in segment 1, $((last / MiB)) MiB in segment $SEG"
+	elif ((first > 0 && last > 0 && last <= first + first / 4 + 32 * MiB)); then
 		check "the log does not grow across segments" "ok, mean $((first / MiB)) MiB in segment 1, $((last / MiB)) MiB in segment $SEG"
 	else
 		check "the log does not grow across segments" "mean $((first / MiB)) MiB in segment 1, $((last / MiB)) MiB in segment $SEG"
