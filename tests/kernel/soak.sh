@@ -11,7 +11,8 @@
 # fresh host reads the branch whole, and the log's disk over the whole run is checked: from 30 s
 # after each attach, within twice the budget and the write region (the log passes the budget by
 # what one sweep's reads fetch, and by writes not uploaded yet), and no higher in the last
-# segment than in the first.
+# segment than in the first; nor the daemon's memory. SOAK_SECONDS counts from after the attach
+# and the read-back.
 #   SOAK_PHASE=start|resume  SOAK_SECONDS=17400  SOAK_SEGMENT=1  SOAK_LAST=1
 # ublk ids 77-78.
 TEST=soak
@@ -50,7 +51,6 @@ resume) RUN=$(cat "$W/run") ;;
 esac
 : >"$R/$TEST.log"
 fails=0
-t_end=$(($(date +%s) + SECONDS_LEFT))
 C=$W/cache
 
 check() {
@@ -121,6 +121,7 @@ else
 	exit 1
 fi
 [[ $PHASE = resume ]] && reads_back "$A" "every block reads back after the restart"
+t_end=$(($(date +%s) + SECONDS_LEFT))
 
 (
 	while :; do
@@ -143,8 +144,11 @@ while (($(now || true) + 900 < t_end)); do
 	region "$A" read "$W/cycle.out" --rw=read --do_verify=1 --verify_only=1 || check "cycle $cycles: read region" "$(grep -iE "verify|error|bad" "$W/cycle.out" | tail -2 | tr '\n' ' ' || true)"
 	left=$((t_end - $(now || true) - 600))
 	((left > 300)) && left=300
-	((left > 0)) && fio --name=soak-random --filename="$A" --ioengine=libaio --direct=1 --bs=64k --iodepth=16 \
-		--size="$READ" --rw=randread --time_based --runtime="$left" --randseed="$cycles$SEG" >>"$W/cycle.out" 2>&1
+	if ((left > 0)) && ! fio --name=soak-random --filename="$A" --ioengine=libaio --direct=1 --bs=64k \
+		--iodepth=16 --size="$READ" --rw=randread --time_based --runtime="$left" --randseed="$cycles$SEG" \
+		>>"$W/cycle.out" 2>&1; then
+		check "cycle $cycles: random reads" "$(grep -iE "error|bad" "$W/cycle.out" | tail -2 | tr '\n' ' ' || true)"
+	fi
 	seed=$((SEG * 100000 + cycles))
 	if region "$A" write "$W/cycle.out" --rw=write --randseed="$seed" --do_verify=1; then
 		echo "$seed" >"$W/seed"
@@ -156,6 +160,7 @@ done
 kill "$spid" 2>/dev/null
 wait "$spid" 2>/dev/null
 spid=
+((cycles > 0)) || check "cycles" "none ran in $SECONDS_LEFT s"
 top=$(awk -F, -v s="$SEG" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] && $3 > m { m = $3 } END { print m + 0 }' "$W/settled.csv" "$W/samples.csv")
 if ((top <= LIMIT)); then
 	check "the log stays near the budget over $cycles cycles" "ok, at most $((top / MiB)) MiB of $((BUDGET / MiB))"
@@ -194,13 +199,21 @@ else
 		check "fresh host" "attach: $(tail -1 "$W/fresh.log" || true)"
 	fi
 	pid=
-	mean() { awk -F, -v s="$1" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] { n++; t += $3 } END { if (n) printf "%d", t / n; else print 0 }' "$W/settled.csv" "$W/samples.csv"; }
-	first=$(mean 1)
-	last=$(mean "$SEG")
-	if ((last <= first + first / 4 + 32 * MiB)); then
+	# mean <segment> <column>: the mean of a sampled column in a segment, from 30 s after its attach.
+	mean() { awk -F, -v s="$1" -v c="$2" 'FNR == NR { from[$1] = $2; next } $1 == s && $2 >= from[s] { n++; t += $c } END { if (n) printf "%d", t / n; else print 0 }' "$W/settled.csv" "$W/samples.csv"; }
+	first=$(mean 1 3)
+	last=$(mean "$SEG" 3)
+	if ((first > 0 && last > 0 && last <= first + first / 4 + 32 * MiB)); then
 		check "the log does not grow across segments" "ok, mean $((first / MiB)) MiB in segment 1, $((last / MiB)) MiB in segment $SEG"
 	else
 		check "the log does not grow across segments" "mean $((first / MiB)) MiB in segment 1, $((last / MiB)) MiB in segment $SEG"
+	fi
+	first=$(mean 1 6)
+	last=$(mean "$SEG" 6)
+	if ((first > 0 && last > 0 && last <= first + first / 2 + 64 * 1024)); then
+		check "the daemon's memory does not grow across segments" "ok, mean RSS $((first / 1024)) MiB in segment 1, $((last / 1024)) MiB in segment $SEG"
+	else
+		check "the daemon's memory does not grow across segments" "mean RSS $((first / 1024)) MiB in segment 1, $((last / 1024)) MiB in segment $SEG"
 	fi
 fi
 store=$(du -sB1 /data/minio | cut -f1 || true)
