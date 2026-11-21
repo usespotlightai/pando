@@ -55,6 +55,168 @@ sharing one root system.
   prefix. [docs/tenancy.md](docs/tenancy.md) has the policies and the steps for an org that
   leaves.
 
+## Getting started
+
+This guide makes a workspace, saves it, gives a run its own branch of it, and opens that branch
+on a second host.
+
+### 1. What you need
+
+- A Linux host, x86_64 or aarch64, with glibc 2.39 or newer (Ubuntu 24.04, Debian 13), and root.
+- A kernel with ublk: `sudo modprobe ublk_drv`. On Ubuntu the module is in
+  `linux-modules-extra-$(uname -r)`.
+- A bucket in an S3-compatible store (AWS S3, Cloudflare R2 or MinIO), and a key that can read,
+  write, list and delete in it.
+
+### 2. Install Pando
+
+Install the latest release as [docs/hosts.md](docs/hosts.md#install) shows: four commands
+download `install.sh`, check it against the release's checksums and run it. Then check that the
+host can serve branches:
+
+```bash
+sudo pando check-host
+```
+
+It lists what the host has and says how to fix anything missing.
+
+### 3. Point Pando at your bucket
+
+Pando reads the store's settings from the environment, never from its arguments. Put them in
+`/etc/pando/pando.env`, readable only by root:
+
+```bash
+sudo install -m 0600 /dev/null /etc/pando/pando.env
+sudoedit /etc/pando/pando.env
+```
+
+```bash
+S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+S3_BUCKET=my-workspaces
+S3_REGION=auto
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+```
+
+For AWS S3, set `S3_ENDPOINT=https://s3.<region>.amazonaws.com` and `S3_REGION` to the bucket's
+region.
+
+Every command from here on runs in a root shell that has those settings loaded. Open one with
+`sudo -i`, then load them in it:
+
+```bash
+set -a; . /etc/pando/pando.env; set +a
+```
+
+### 4. Make a workspace
+
+Create an empty 20 GiB branch called `base`, and serve it as the block device `/dev/ublkb0`:
+
+```bash
+pando init base $((20 << 30))
+pando attach base --device /dev/ublkb0 >base.log 2>&1 &
+until grep -q '^attached' base.log; do sleep 0.2; done
+```
+
+`attach` keeps running in the background while it serves the device, and writes `attached base
+as /dev/ublkb0` once the device can be used; the `until` line waits for that. If it never comes,
+`cat base.log` says why. Put a file system on the device, mount it, and fill it with what every
+run needs:
+
+```bash
+mkfs.ext4 -q /dev/ublkb0
+mkdir -p /mnt/base
+mount /dev/ublkb0 /mnt/base
+git clone https://github.com/<you>/<repo> /mnt/base/repo
+(cd /mnt/base/repo && npm ci)
+```
+
+When it is ready, unmount it and detach. `detach` returns once the bucket holds every change:
+
+```bash
+umount /mnt/base
+pando detach --device /dev/ublkb0
+```
+
+Already have a disk image? `pando import base disk.img` makes the branch from it in one step.
+
+### 5. Save it as a checkpoint
+
+```bash
+pando checkpoint base base-v1
+```
+
+A checkpoint never changes. Every run starts from it, and `base` stays free to change for the
+next version.
+
+### 6. Give a run its own branch
+
+```bash
+pando branch --checkpoint base-v1 run-1
+pando attach run-1 --device /dev/ublkb1 >run-1.log 2>&1 &
+until grep -q '^attached' run-1.log; do sleep 0.2; done
+mkdir -p /mnt/run-1
+mount /dev/ublkb1 /mnt/run-1
+```
+
+Making the branch takes about 100 ms and copies nothing. The run sees the whole workspace at
+`/mnt/run-1`, and Pando fetches only what it reads. The run can change anything there; no
+other branch sees its changes.
+
+When the run ends, save its changes:
+
+```bash
+umount /mnt/run-1
+pando detach --device /dev/ublkb1
+```
+
+Only what the run changed is uploaded.
+
+A host runs one `attach` at a time on its cache, `/data/cache` unless `--cache` names another.
+To serve several branches at once, start the host daemon (`pando serve --socket
+/run/pando.sock`) and pass `--socket /run/pando.sock` to each command, or give each `attach` a
+`--cache` and `--state` of its own.
+
+### 7. Open the branch on another host
+
+On a second host, install Pando and load the same settings (steps 2 and 3), then:
+
+```bash
+pando attach run-1 --device /dev/ublkb0 >run-1.log 2>&1 &
+until grep -q '^attached' run-1.log; do sleep 0.2; done
+mkdir -p /mnt/run-1
+mount /dev/ublkb0 /mnt/run-1
+```
+
+The files are as the first run left them. Only one host at a time can have a branch attached.
+A host that attaches it takes it over, and the host that had it can no longer write to it.
+
+### 8. Look around and clean up
+
+```bash
+pando refs          # the branches in the bucket
+pando checkpoints   # the checkpoints
+pando status        # the branches attached on this host, and how far behind their uploads are
+pando delete run-1  # delete a branch you no longer need
+pando gc            # report what no branch or checkpoint needs any more
+```
+
+Detach a branch, and unmount it first, before you delete it. `pando gc` only reports.
+`pando gc --delete` frees the space; see the GC section of
+[docs/hosts.md](docs/hosts.md#gc) before you turn it on.
+
+### Next steps
+
+- **Run branches under systemd**, so they survive daemon crashes, reboots and upgrades:
+  [docs/hosts.md](docs/hosts.md).
+- **Drive Pando from a program** with `--json` and exit statuses: [docs/cli.md](docs/cli.md).
+- **Keep each customer's data apart**, with a store and credentials per org:
+  [docs/tenancy.md](docs/tenancy.md).
+- **Start faster** with the host daemon (`pando serve`, as in step 6), and with `attach --dm
+  NAME --images DIR`: you mount `/dev/mapper/NAME`, and once the branch is local Pando switches
+  it to a local image in `DIR`, off the I/O path. `pando attach --help` lists every flag.
+- **Cut a release:** [docs/releasing.md](docs/releasing.md).
+
 ## Crates
 
 | Crate | Contents |
@@ -66,12 +228,6 @@ sharing one root system.
 | `pando-linux` | the ublk block device frontend and the device-mapper switch |
 | `pando-dst` | deterministic simulation, crash and fault scenarios, and conformance suites for every port adapter |
 | `pando` | the command-line tool |
-
-## Installing
-
-Releases have binaries for x86_64 and aarch64 Linux, checksums and build provenance.
-[docs/hosts.md](docs/hosts.md) covers installing one and upgrading a host with attached
-branches; [docs/releasing.md](docs/releasing.md) covers cutting one.
 
 ## Building
 
