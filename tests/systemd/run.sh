@@ -8,8 +8,9 @@
 #   stop: systemctl stop drains and leaves the device; systemctl start takes it over.
 #   detach: umount and pando detach; the unit stops for good with status 0.
 #   store: the cache and state are deleted and the unit opens the branch from the store.
-#   gc: pando-gc@ reports once on each of two stores, the branch's and an empty prefix, with a
-#     cache of its own for each, deletes nothing, and its timer runs once enabled for one store.
+#   gc: pando-gc@ refuses a store with no env file, reports once on each of two stores, the
+#     branch's and an empty prefix, with a cache of its own for each, deletes nothing, and its
+#     timer runs once enabled for one store.
 # It changes this host's /usr/local and /etc, so it refuses a host where pando is installed.
 # Run as root with the ublk_drv module loaded. PANDO is the pando binary; RESULTS gets the log.
 # The store is MinIO from the kernel test image (tests/kernel), over TLS on 127.0.0.1:9100.
@@ -234,6 +235,8 @@ check store
 umount "${MNT}" || fail "store: umount failed"
 store pando detach --device "${DEV}" >>"${LOG}" 2>&1 || fail "store: detach failed"
 
+if systemctl start pando-gc@missing.service 2>>"${LOG}"; then fail "gc: a store with no env file ran"; fi
+say "gc: a store with no env file does not run"
 printf '' >/etc/pando/gc/root.env
 printf 'PANDO_GC_ARGS="--remote s3://other"\n' >/etc/pando/gc/other.env
 t0=$(date '+%Y-%m-%d %H:%M:%S')

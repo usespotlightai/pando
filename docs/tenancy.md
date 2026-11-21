@@ -105,8 +105,9 @@ each org:
 
 ## When an org leaves
 
-1. Detach every branch of the org on every host, stop the org's daemons, and stop its GC:
-   `systemctl disable --now pando-gc@ORG.timer`.
+1. Detach every branch of the org on every host, and stop the org's daemons. Stop its GC, both
+   the timer and a run that may be going: `systemctl disable --now pando-gc@ORG.timer`, then
+   `systemctl stop pando-gc@ORG.service`.
 2. Purge the prefix, naming it twice:
 
    ```

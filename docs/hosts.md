@@ -180,8 +180,8 @@ store per org, name each instance after the org, and give its env file the org's
 credentials:
 
 ```bash
-printf '%s\n' 'PANDO_GC_ARGS="--remote s3://org_2x7f"' 'S3_CREDENTIALS=file' \
-  'S3_CREDENTIALS_FILE=/run/pando/org_2x7f.json' >/etc/pando/gc/org_2x7f.env
+(umask 077 && printf '%s\n' 'PANDO_GC_ARGS="--remote s3://org_2x7f"' 'S3_CREDENTIALS=file' \
+  'S3_CREDENTIALS_FILE=/run/pando/org_2x7f.json' >/etc/pando/gc/org_2x7f.env)
 ```
 
 ```bash
