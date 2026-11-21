@@ -18,11 +18,17 @@ use crate::{Error, Ports, Result};
 pub async fn copy(ports: &Ports, src: &str, dst: &str, max_age: Option<Duration>) -> Result<()> {
     let started = tokio::time::Instant::now();
     let remote = Remote::new(Arc::clone(&ports.store));
-    let (mut r, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
-    r.generation = 0;
-    r.from = Some(src.to_owned());
-    r.log = None;
-    remote.create_ref(ports.rng.as_ref(), dst, &r).await?;
+    let (r, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
+    remote
+        .create_ref(ports.rng.as_ref(), dst, |id| Ref {
+            size: r.size,
+            id,
+            root: r.root,
+            generation: 0,
+            from: Some(src.to_owned()),
+            log: None,
+        })
+        .await?;
     if let Some(max) = max_age
         && started.elapsed() > max
     {
@@ -100,9 +106,8 @@ pub async fn from_checkpoint(
     let remote = Remote::new(Arc::clone(&ports.store));
     let ours = match kept.get(name) {
         Some(c) => {
-            let r = copy_of(&c);
             let (made, now) = futures::join!(
-                remote.create_ref(ports.rng.as_ref(), dst, &r),
+                remote.create_ref(ports.rng.as_ref(), dst, |id| copy_of(&c, id)),
                 remote.get_checkpoint(name)
             );
             made?;
@@ -123,7 +128,9 @@ pub async fn from_checkpoint(
         ),
     };
     if let Some(c) = ours {
-        remote.create_ref(ports.rng.as_ref(), dst, &copy_of(&c)).await?;
+        remote
+            .create_ref(ports.rng.as_ref(), dst, |id| copy_of(&c, id))
+            .await?;
         kept.keep(name, c);
     }
     if let Some(max) = max_age
@@ -157,10 +164,10 @@ pub async fn list_checkpoints(ports: &Ports) -> Result<Vec<(String, Checkpoint)>
     Ok(out)
 }
 
-fn copy_of(c: &Checkpoint) -> Ref {
+fn copy_of(c: &Checkpoint, id: BranchId) -> Ref {
     Ref {
         size: c.size,
-        id: BranchId::NONE,
+        id,
         root: c.root,
         generation: 0,
         from: Some(c.branch.clone()),

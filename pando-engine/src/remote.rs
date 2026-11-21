@@ -152,13 +152,15 @@ impl Remote {
         }
     }
 
-    /// Creates ref `r` as a new life of branch `name`, with an id drawn from `rng` in place of
-    /// its own; [`Error::RefExists`] when there is one.
-    pub(crate) async fn create_ref(&self, rng: &dyn Rng, name: &str, r: &Ref) -> Result<Version> {
-        let r = Ref {
-            id: new_branch_id(rng),
-            ..r.clone()
-        };
+    /// Creates the ref of a new life of branch `name`: the ref `make` builds for a branch id
+    /// drawn from `rng`. [`Error::RefExists`] when there is one.
+    pub(crate) async fn create_ref(
+        &self,
+        rng: &dyn Rng,
+        name: &str,
+        make: impl FnOnce(BranchId) -> Ref,
+    ) -> Result<Version> {
+        let r = make(new_branch_id(rng));
         let body = Bytes::from(r.encode());
         let n = body.len();
         match self.store.create(&keys::reference(name), body).await {

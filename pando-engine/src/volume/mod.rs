@@ -324,13 +324,13 @@ impl Roots for Inner {
 impl Volume {
     /// Creates branch `name` of `size` bytes, all zero.
     pub async fn create(ports: &Ports, name: &str, size: u64) -> Result<()> {
-        let r = Ref {
-            size,
-            root: Entry::EMPTY,
-            ..Ref::default()
-        };
         Remote::new(Arc::clone(&ports.store))
-            .create_ref(ports.rng.as_ref(), name, &r)
+            .create_ref(ports.rng.as_ref(), name, |id| Ref {
+                size,
+                id,
+                root: Entry::EMPTY,
+                ..Ref::default()
+            })
             .await
             .map(drop)
     }

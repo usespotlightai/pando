@@ -129,22 +129,18 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
     let packed = tree.pack(&root, &mut p).await?;
     p.finish().await?;
     remote
-        .create_ref(
-            ports.rng.as_ref(),
-            name,
-            &Ref {
-                size,
-                id: pando_format::BranchId::NONE,
-                root: packed,
+        .create_ref(ports.rng.as_ref(), name, |id| Ref {
+            size,
+            id,
+            root: packed,
+            generation,
+            from: None,
+            log: Some(pando_format::LogPos {
                 generation,
-                from: None,
-                log: Some(pando_format::LogPos {
-                    generation,
-                    closed: true,
-                    ..pando_format::LogPos::default()
-                }),
-            },
-        )
+                closed: true,
+                ..pando_format::LogPos::default()
+            }),
+        })
         .await?;
     Ok(ImportReport {
         size,
