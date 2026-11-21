@@ -8,7 +8,8 @@
 #   stop: systemctl stop drains and leaves the device; systemctl start takes it over.
 #   detach: umount and pando detach; the unit stops for good with status 0.
 #   store: the cache and state are deleted and the unit opens the branch from the store.
-#   gc: pando-gc.service reports on the store once and deletes nothing.
+#   gc: pando-gc@ reports once on each of two stores, the branch's and an empty prefix, with a
+#     cache of its own for each, deletes nothing, and its timer runs once enabled for one store.
 # It changes this host's /usr/local and /etc, so it refuses a host where pando is installed.
 # Run as root with the ublk_drv module loaded. PANDO is the pando binary; RESULTS gets the log.
 # The store is MinIO from the kernel test image (tests/kernel), over TLS on 127.0.0.1:9100.
@@ -37,7 +38,7 @@ uid=$(id -u)
 [[ ${uid} == 0 ]] || fail "run as root"
 [[ -d /run/systemd/system ]] || fail "systemd is not running"
 [[ -e /dev/ublk-control ]] || fail "no /dev/ublk-control: load ublk_drv"
-units=(/etc/systemd/system/pando-attach@.service /etc/systemd/system/pando-gc.service /etc/systemd/system/pando-gc.timer)
+units=(/etc/systemd/system/pando-attach@.service /etc/systemd/system/pando-gc@.service /etc/systemd/system/pando-gc@.timer)
 for p in /usr/local/bin/pando /usr/local/lib/pando /etc/pando "${units[@]}"; do
 	[[ ! -e ${p} ]] || fail "${p} exists: this test installs pando and needs a host without it"
 done
@@ -54,12 +55,13 @@ store() {
 }
 
 cleanup() {
-	journalctl -u "${U}" -u pando-gc.service --no-pager >"${RESULTS}/systemd-journal.log" 2>&1
+	journalctl -u "${U}" -u "pando-gc@*" --no-pager >"${RESULTS}/systemd-journal.log" 2>&1
 	[[ -n ${writer} ]] && kill "${writer}" 2>/dev/null
 	mountpoint -q "${MNT}" && umount -l "${MNT}"
 	systemctl stop "${U}" 2>/dev/null
 	[[ -b ${DEV} ]] && store pando detach --device "${DEV}" --force >/dev/null 2>&1
-	systemctl reset-failed "${U}" pando-gc.service 2>/dev/null
+	systemctl disable --now pando-gc@other.timer 2>/dev/null
+	systemctl reset-failed "${U}" "pando-gc@*" 2>/dev/null
 	docker rm -f pando-systemd-minio >/dev/null 2>&1
 	rm -rf /usr/local/bin/pando /usr/local/lib/pando /etc/pando /var/cache/pando-gc "${units[@]}"
 	systemctl daemon-reload
@@ -232,11 +234,26 @@ check store
 umount "${MNT}" || fail "store: umount failed"
 store pando detach --device "${DEV}" >>"${LOG}" 2>&1 || fail "store: detach failed"
 
-[[ $(systemctl is-enabled pando-gc.timer 2>/dev/null || true) == disabled ]] || fail "gc: the timer is not installed and off"
+printf '' >/etc/pando/gc/root.env
+printf 'PANDO_GC_ARGS="--remote s3://other"\n' >/etc/pando/gc/other.env
 t0=$(date '+%Y-%m-%d %H:%M:%S')
-systemctl start pando-gc.service || fail "gc: the unit failed: $(journalctl -u pando-gc.service --since "${t0}" --no-pager -o cat | tail -1 || true)"
-report=$(journalctl -u pando-gc.service --since "${t0}" --no-pager -o cat | grep "live segments" || true)
-[[ -n ${report} ]] || fail "gc: no report in the journal"
-[[ ${report} != *", deleted"* ]] || fail "gc: the report-only run deleted: ${report}"
-say "gc: ${report}"
+for g in root other; do
+	[[ $(systemctl is-enabled "pando-gc@${g}.timer" 2>/dev/null || true) == disabled ]] || fail "gc ${g}: the timer is not installed and off"
+	systemctl start "pando-gc@${g}.service" ||
+		fail "gc ${g}: the unit failed: $(journalctl -u "pando-gc@${g}.service" --since "${t0}" --no-pager -o cat | tail -1 || true)"
+	report=$(journalctl -u "pando-gc@${g}.service" --since "${t0}" --no-pager -o cat | grep "live segments" || true)
+	[[ -n ${report} ]] || fail "gc ${g}: no report in the journal"
+	[[ ${report} != *", deleted"* ]] || fail "gc ${g}: the report-only run deleted: ${report}"
+	say "gc ${g}: ${report}"
+done
+bound=$(cat /var/cache/pando-gc/root/store || true)
+[[ ${bound} == *"|s3://" ]] || fail "gc: the root store's cache is bound to ${bound}"
+bound=$(cat /var/cache/pando-gc/other/store || true)
+[[ ${bound} == *"|s3://other" ]] || fail "gc: the other store's cache is bound to ${bound}"
+say "gc: each store has a cache of its own"
+systemctl enable --now pando-gc@other.timer >>"${LOG}" 2>&1 || fail "gc: enabling the timer failed"
+[[ $(systemctl is-active pando-gc@other.timer || true) == active ]] || fail "gc: the enabled timer is not active"
+[[ $(systemctl is-enabled pando-gc@root.timer 2>/dev/null || true) == disabled ]] || fail "gc: enabling one store's timer enabled another's"
+systemctl disable --now pando-gc@other.timer >>"${LOG}" 2>&1 || fail "gc: disabling the timer failed"
+say "gc: the timer runs for the one store it was enabled for"
 say "RESULT pass"

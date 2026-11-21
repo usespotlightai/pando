@@ -31,11 +31,11 @@ repository's release workflow from a commit on main.
 | `/usr/local/lib/pando/<version>/` | each installed release: the binary and the unit |
 | `/usr/local/bin/pando` | a link to the current release's binary |
 | `/etc/systemd/system/pando-attach@.service` | the unit that serves a branch |
-| `/etc/systemd/system/pando-gc.service`, `pando-gc.timer` | the daily GC of the store, off until enabled (see [GC](#gc)) |
+| `/etc/systemd/system/pando-gc@.service`, `pando-gc@.timer` | the daily GC of one store, off until enabled for it (see [GC](#gc)) |
 | `/etc/pando/pando.env` | the host's settings, mode 0600: `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_SESSION_TOKEN`, or `S3_CREDENTIALS` set to `instance`, `aws` or `file` (see [tenancy.md](tenancy.md#credentials)), and `PANDO_ARGS` for global flags such as `--cache` |
 | `/etc/pando/attach/<name>.env` | one branch: `PANDO_BRANCH`, `PANDO_DEVICE` (`/dev/ublkbN`), and `PANDO_ATTACH_ARGS` for the other `attach` flags, such as `--remote`, `--dm`, `--images` and `--state` |
-| `/etc/pando/gc.env` | optional: `PANDO_GC_ARGS` for the `gc` flags of `pando-gc.service`, such as `--delete` |
-| `/var/cache/pando-gc/` | the cache of `pando-gc.service` |
+| `/etc/pando/gc/<store>.env` | one store's GC, mode 0600: `PANDO_GC_ARGS` for its `gc` flags, such as `--remote` and `--delete`, and the store's credentials when they differ from the host's |
+| `/var/cache/pando-gc/<store>/` | the cache of `pando-gc@<store>.service` |
 
 Credentials go in the env file, never in `PANDO_ARGS` or `PANDO_ATTACH_ARGS`: those end up on
 the command line. Quote a value that holds spaces: `PANDO_ATTACH_ARGS="--state /data/state --dm b1"`.
@@ -173,11 +173,26 @@ aws s3api put-bucket-lifecycle-configuration --bucket BUCKET --lifecycle-configu
 With MinIO, `mc version enable ALIAS/BUCKET`. A deleted segment stays in the bucket, and is
 billed, for those 14 days; each publish of a branch keeps the ref it replaced for as long.
 
-**Schedule.** `pando-gc.service` runs `pando gc` on the store `pando.env` names, with the
-global flags of `PANDO_ARGS` (such as `--remote`) but a cache of its own, and `pando-gc.timer`
-runs it once a day. Enable the timer on one host: `systemctl enable --now pando-gc.timer`. The
-report is one line in the journal: `journalctl -u pando-gc`. The unit only reports until
-`/etc/pando/gc.env` adds `--delete`: `PANDO_GC_ARGS=--delete`. Add it once the reports have matched
+**Schedule.** Each store gets its own GC, on one host: `pando-gc@<store>.service` runs `pando
+gc` with the settings of `pando.env`, then those of `/etc/pando/gc/<store>.env`, and a cache
+of its own, `/var/cache/pando-gc/<store>`. `pando-gc@<store>.timer` runs it once a day. For a
+store per org, name each instance after the org, and give its env file the org's prefix and
+credentials:
+
+```bash
+printf '%s\n' 'PANDO_GC_ARGS="--remote s3://org_2x7f"' 'S3_CREDENTIALS=file' \
+  'S3_CREDENTIALS_FILE=/run/pando/org_2x7f.json' >/etc/pando/gc/org_2x7f.env
+```
+
+```bash
+systemctl enable --now pando-gc@org_2x7f.timer
+```
+
+A host with one store can leave the env file empty, so the store is the one `pando.env` names.
+A later `--remote` wins over one in `PANDO_ARGS`. The report is one line in the journal,
+`journalctl -u pando-gc@org_2x7f`, and with `--json` in `PANDO_GC_ARGS` it is the `gc` event of
+[cli.md](cli.md), one JSON line with each count, for telemetry. The unit only reports until the
+store's env file adds `--delete` to `PANDO_GC_ARGS`. Add it once the reports have matched
 what you expect for two weeks: `dead` grows with the branches and checkpoints deleted and the
 writes replaced, and `revived` stays near zero. A `revived` that grows means branch copies
 come close to the `--validate` delay.

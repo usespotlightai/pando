@@ -91,7 +91,9 @@ each org:
 
 - its own `--cache`;
 - its own `--state`;
-- with the daemon, its own `serve --socket`.
+- with the daemon, its own `serve --socket`;
+- on one host, its own GC: `pando-gc@<org>.timer`, with the org's prefix and credentials in
+  `/etc/pando/gc/<org>.env` ([hosts.md](hosts.md#gc)).
 
 **Base images may be shared.** The `--images` directory can serve every org:
 
@@ -103,7 +105,8 @@ each org:
 
 ## When an org leaves
 
-1. Detach every branch of the org on every host, and stop the org's daemons.
+1. Detach every branch of the org on every host, stop the org's daemons, and stop its GC:
+   `systemctl disable --now pando-gc@ORG.timer`.
 2. Purge the prefix, naming it twice:
 
    ```
@@ -129,6 +132,7 @@ each org:
 
    `delete-objects` takes at most 1000 keys a call; repeat until the listing is empty.
 4. On each host that served the org, remove the org's `--cache` and `--state` directories, and
-   its `learned/<hash>` directory under `--images`. Base images go with the follower's `--keep`
-   and `--budget`, or remove them by hand.
+   its `learned/<hash>` directory under `--images`. On its GC host, remove
+   `/etc/pando/gc/ORG.env` and `/var/cache/pando-gc/ORG`. Base images go with the follower's
+   `--keep` and `--budget`, or remove them by hand.
 5. Revoke the org's role, or stop minting its credentials.
