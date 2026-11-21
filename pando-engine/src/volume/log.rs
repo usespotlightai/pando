@@ -228,9 +228,9 @@ pub(super) async fn scan(remote: &Remote, cpu: &Arc<dyn Cpu>, name: &str, r: &Re
                     "{name}: more than {REPLAY_MAX} log records to read"
                 )));
             }
-            let Some(b) = retried(|| remote.get_log_record(name, g, n)).await? else {
+            let Some(b) = retried(|| remote.get_log_record(name, r.id, g, n)).await? else {
                 let seal = Bytes::from(LogRecord::encode_seal(g, n));
-                if retried(|| remote.create_log_record(name, g, n, seal.clone())).await? {
+                if retried(|| remote.create_log_record(name, r.id, g, n, seal.clone())).await? {
                     break;
                 }
                 continue;
@@ -272,9 +272,9 @@ pub(crate) async fn seal(remote: &Remote, cpu: &Arc<dyn Cpu>, name: &str, r: &Re
     }
     let mut n = if start.generation == g { start.next } else { 0 };
     for _ in 0..REPLAY_MAX {
-        let Some(b) = retried(|| remote.get_log_record(name, g, n)).await? else {
+        let Some(b) = retried(|| remote.get_log_record(name, r.id, g, n)).await? else {
             let body = Bytes::from(LogRecord::encode_seal(g, n));
-            if retried(|| remote.create_log_record(name, g, n, body.clone())).await? {
+            if retried(|| remote.create_log_record(name, r.id, g, n, body.clone())).await? {
                 return Ok(());
             }
             continue;
@@ -402,6 +402,7 @@ impl Inner {
             (
                 Ref {
                     size: up.published_size,
+                    id: self.id,
                     root: up.published,
                     generation: self.generation,
                     from: self.from.clone(),
@@ -464,7 +465,7 @@ impl Inner {
         loop {
             match self
                 .remote
-                .create_log_record(&self.name, self.generation, n, body.clone())
+                .create_log_record(&self.name, self.id, self.generation, n, body.clone())
                 .await
             {
                 Ok(true) => return true,
@@ -590,7 +591,7 @@ impl Inner {
         for n in from..to {
             if self
                 .remote
-                .delete_log_record(&self.name, self.generation, n)
+                .delete_log_record(&self.name, self.id, self.generation, n)
                 .await
                 .is_err()
             {
@@ -599,7 +600,7 @@ impl Inner {
             done = n + 1;
         }
         self.log.queue.lock().trimmed = done;
-        if older && let Ok(all) = self.remote.list_log(&self.name).await {
+        if older && let Ok(all) = self.remote.list_log(&self.name, self.id).await {
             let mut last: BTreeMap<u64, u64> = BTreeMap::new();
             for &(g, n, _) in &all {
                 let l = last.entry(g).or_insert(n);
@@ -609,7 +610,7 @@ impl Inner {
                 if last.get(&g) == Some(&n) && size == u64_from(LOG_SEAL_LEN) {
                     continue;
                 }
-                let _ = self.remote.delete_log_record(&self.name, g, n).await;
+                let _ = self.remote.delete_log_record(&self.name, self.id, g, n).await;
             }
         }
     }
@@ -673,7 +674,7 @@ mod tests {
     }
 
     fn log_keys(store: &SimStore) -> Vec<String> {
-        store.keys(&keys::log_branch("main"))
+        store.keys(&keys::log_name("main"))
     }
 
     async fn reference(ports: &Ports) -> Ref {
@@ -702,7 +703,11 @@ mod tests {
         assert_eq!(read(&b, data(1).len()).await, data(1));
         b.checkpoint().await.unwrap();
         b.close_log().await.unwrap();
-        assert_eq!(log_keys(&store), [keys::log_record("main", 1, 1)], "a's seal");
+        assert_eq!(
+            log_keys(&store),
+            [keys::log_record("main", reference(&ports).await.id, 1, 1)],
+            "a's seal"
+        );
         b.close().await;
     }
 
@@ -857,7 +862,11 @@ mod tests {
         b.write_at(&data(6), 1000).await.unwrap();
         b.checkpoint().await.unwrap();
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let a_log = format!("{}/{:020}/", keys::log_branch("main"), 1);
+        let a_log = format!(
+            "{}/{:020}/",
+            keys::log_branch("main", reference(&ports).await.id),
+            1
+        );
         assert_eq!(
             log_keys(&store).iter().filter(|k| k.starts_with(&a_log)).count(),
             1,
@@ -934,7 +943,7 @@ mod tests {
         let a = open(ports, "/a", LogMode::Behind).await;
         let reference = keys::reference("main");
         store.hold(StoreOp::Update, &reference);
-        store.hold(StoreOp::Create, &keys::log_branch("main"));
+        store.hold(StoreOp::Create, &keys::log_name("main"));
         a.write_at(&data(seed), 1000).await.unwrap();
         a.flush().await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -962,7 +971,7 @@ mod tests {
         let a = record_waits_while_published(&ports, &store, 12).await;
         let (closed, ()) = tokio::join!(a.close_log(), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            store.release(StoreOp::Create, &keys::log_branch("main"));
+            store.release(StoreOp::Create, &keys::log_name("main"));
         });
         closed.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -982,7 +991,7 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let (closed, ()) = tokio::join!(a.close_log(), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            store.release(StoreOp::Create, &keys::log_branch("main"));
+            store.release(StoreOp::Create, &keys::log_name("main"));
         });
         closed.unwrap();
         assert!(t0.elapsed() < RETRY_AFTER / 2, "{:?}", t0.elapsed());
@@ -1120,9 +1129,9 @@ mod tests {
         a.flush().await.unwrap();
         a.close().await;
         store.clear_faults();
-        let generation = reference(&ports).await.generation;
+        let r = reference(&ports).await;
         Remote::new(Arc::clone(&ports.store))
-            .delete_log_record("main", generation, 1)
+            .delete_log_record("main", r.id, r.generation, 1)
             .await
             .unwrap();
 

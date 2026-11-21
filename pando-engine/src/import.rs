@@ -130,9 +130,11 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
     p.finish().await?;
     remote
         .create_ref(
+            ports.rng.as_ref(),
             name,
             &Ref {
                 size,
+                id: pando_format::BranchId::NONE,
                 root: packed,
                 generation,
                 from: None,

@@ -1,8 +1,9 @@
 //! Hosts that race for one branch. Each opens it, flushes, publishes, detaches, stops or is lost
 //! at random while the others' background tasks run, and now and then the branch is advanced to
-//! an empty branch or to a copy of itself. Every open must hold a prefix of some writer's
-//! flushes, every strict flush that returned since the last advance, and no flush an advance
-//! dropped. A fenced writer's last write, whose flush failed, may follow its flushes: its
+//! an empty branch or to a copy of itself, or deleted and made again under its name. Every open
+//! must hold a prefix of some writer's flushes, every strict flush that returned since the last
+//! advance or delete, and no flush an advance or a delete dropped: a delete drops every flush of
+//! the life it deleted, those its writers make after it included. A fenced writer's last write, whose flush failed, may follow its flushes: its
 //! journal may keep it, and an open that resumes its state then holds it. A write whose
 //! `write_at` failed is in no journal: each write has a chunk of its own, so it fails before the
 //! journal append if at all. The calls on the branch's ref and log, and each write and flush,
@@ -16,7 +17,7 @@ use std::time::Duration;
 use pando_engine::ports::{Rng, Store};
 use pando_engine::sim::{self, SimRng};
 use pando_engine::{Cache, LogMode, Ports, Volume, branch};
-use pando_format::{keys, u64_from, usize_from};
+use pando_format::{Ref, keys, u64_from, usize_from};
 
 use crate::trace::{self, Event, Kind, Step, TracedStore, Tracer};
 
@@ -25,7 +26,7 @@ const FLUSHES: u64 = 40;
 const BRANCH: &str = "main";
 /// The hosts, by name.
 pub const HOSTS: [&str; 2] = ["a", "b"];
-/// The host that runs `pando advance`.
+/// The host that runs `pando advance` and `pando delete`.
 pub const ADVANCER: &str = "x";
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -52,6 +53,10 @@ pub struct Race {
     pub advances: usize,
     /// Seals an advance created.
     pub advance_seals: usize,
+    /// Deletes that made the branch again.
+    pub deletes: usize,
+    /// Records a delete deleted.
+    pub deleted_records: usize,
     /// The trace as module `TraceData`, unless a call had no step in the spec.
     pub module: Option<String>,
     /// Why there is no module.
@@ -72,6 +77,8 @@ struct Writer {
     mode: LogMode,
     /// Index into the race's histories of what this writer holds.
     history: usize,
+    /// The life of the branch the writer's open read.
+    life: usize,
     fenced: bool,
 }
 
@@ -84,7 +91,9 @@ struct World {
     advancer: Arc<TracedStore>,
     advancer_ports: Ports,
     sources: usize,
-    /// The flushes an advance dropped.
+    /// The lives of the branch after its first, one for each delete.
+    deletes: usize,
+    /// The flushes an advance or a delete dropped.
     dropped: BTreeSet<u64>,
     /// Each committed flush's number in the trace: the flushes the trace has, counted from 1.
     traced: BTreeMap<u64, u64>,
@@ -164,7 +173,7 @@ impl World {
         };
         if let Some(back) = held.intersection(&self.dropped).next() {
             return Err(format!(
-                "{at}: the open holds flush {back}, which an advance dropped"
+                "{at}: the open holds flush {back}, which an advance or a delete dropped"
             ));
         }
         if let Some(lost) = acked.difference(&held).next() {
@@ -178,6 +187,7 @@ impl World {
             v,
             mode,
             history: self.histories.len() - 1,
+            life: self.deletes,
             fenced: false,
         });
         Ok(())
@@ -189,6 +199,10 @@ impl World {
         }
         let id = self.next;
         self.next += 1;
+        let deleted = w.life < self.deletes;
+        if deleted {
+            self.dropped.insert(id);
+        }
         let wrote = self.tracer.len();
         if w.v.write_at(&id.to_le_bytes(), id * CHUNK).await.is_err() {
             w.fenced = true;
@@ -207,7 +221,7 @@ impl World {
         self.tracer.insert(at, w.host, Step::Flush);
         self.histories[w.history].push(id);
         self.race.flushes += 1;
-        if w.mode == LogMode::Strict && matches!(r, Ok(Ok(()))) {
+        if w.mode == LogMode::Strict && !deleted && matches!(r, Ok(Ok(()))) {
             self.acked.insert(id);
             self.race.strict += 1;
         }
@@ -274,6 +288,25 @@ impl World {
         Ok(())
     }
 
+    /// Deletes the branch, then makes it again under its name, empty.
+    async fn delete(&mut self, at: &str) -> Result<(), String> {
+        self.advancer.set_deleting(true);
+        let deleted = tokio::time::timeout(WAIT, branch::delete(&self.advancer_ports, BRANCH)).await;
+        let made = Volume::create(&self.advancer_ports, BRANCH, self.size).await;
+        self.advancer.set_deleting(false);
+        match deleted {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("{at}: delete: {e}")),
+            Err(_) => return Err(format!("{at}: the delete took longer than {WAIT:?}")),
+        }
+        made.map_err(|e| format!("{at}: create: {e}"))?;
+        self.race.deletes += 1;
+        self.deletes += 1;
+        self.dropped.extend(1..self.next);
+        self.acked.clear();
+        Ok(())
+    }
+
     async fn step(&mut self, host: &mut Host, at: &str) -> Result<(), String> {
         let Some(mut w) = host.open.take() else {
             return self.open(host, at).await;
@@ -329,6 +362,12 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
         .await
         .map_err(|e| e.to_string())?;
     let tracer = Tracer::new(BRANCH);
+    let first = ports
+        .store
+        .get(&keys::reference(BRANCH))
+        .await
+        .map_err(|e| e.to_string())?;
+    tracer.begin(Ref::decode(&first.body).map_err(|e| e.to_string())?.id);
     let advancer = TracedStore::new(Arc::clone(&ports.store), ADVANCER, Arc::clone(&tracer));
     let mut advancer_ports = ports.clone();
     advancer_ports.store = Arc::<TracedStore>::clone(&advancer);
@@ -356,6 +395,7 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
         advancer,
         advancer_ports,
         sources: 0,
+        deletes: 0,
         dropped: BTreeSet::new(),
         traced: BTreeMap::new(),
         histories: vec![Vec::new()],
@@ -365,9 +405,16 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
         race: Race::default(),
     };
     for step in 0..steps {
-        if w.below(25) == 0 {
-            w.advance(&format!("seed {seed} step {step} advance")).await?;
-            continue;
+        match w.below(50) {
+            0 | 1 => {
+                w.advance(&format!("seed {seed} step {step} advance")).await?;
+                continue;
+            }
+            2 => {
+                w.delete(&format!("seed {seed} step {step} delete")).await?;
+                continue;
+            }
+            _ => {}
         }
         let i = usize_from(w.below(u64_from(hosts.len())));
         let at = format!("seed {seed} step {step} host {}", hosts[i].name);
@@ -382,7 +429,7 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
         race.module = Some(trace::module(
             &HOSTS,
             ADVANCER,
-            (race.opens, usize_from(w.next - 1), w.sources),
+            (race.opens, usize_from(w.next - 1), w.sources, w.deletes),
             &tracer.events(),
         ));
     }
@@ -395,7 +442,8 @@ fn count(race: &mut Race, events: &[Event]) {
     for e in events {
         let host = e.host.as_str();
         if host == ADVANCER {
-            race.advance_seals += usize::from(matches!(e.step, Step::CreateLog(_, _, Kind::Seal, true)));
+            race.advance_seals += usize::from(matches!(e.step, Step::CreateLog(_, _, _, Kind::Seal, true)));
+            race.deleted_records += usize::from(matches!(e.step, Step::DeleteLog(..)));
             continue;
         }
         match e.step {
@@ -412,9 +460,12 @@ fn count(race: &mut Race, events: &[Event]) {
                     race.lost_takes += usize::from(!ok);
                 }
             }
-            Step::CreateLog(_, _, Kind::Seal, true) => race.seals += 1,
-            Step::CreateLog(_, _, Kind::Writes { .. }, false) => race.refused_appends += 1,
-            Step::CreateLog(..)
+            Step::CreateLog(_, _, _, Kind::Seal, true) => race.seals += 1,
+            Step::CreateLog(_, _, _, Kind::Writes { .. }, false) => race.refused_appends += 1,
+            Step::DeleteGet
+            | Step::DeleteRef
+            | Step::CreateRef
+            | Step::CreateLog(..)
             | Step::DeleteLog(..)
             | Step::ListLog
             | Step::Write
