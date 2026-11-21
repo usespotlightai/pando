@@ -1,0 +1,72 @@
+# Changelog
+
+## 0.1.0 (2026-11-21)
+
+
+### Features
+
+* **bench:** add a crash case that reboots the host mid-write ([50806f4](https://github.com/usespotlightai/pando/commit/50806f439354c83ed2787eb9c4ae3422e4e105f9))
+* **bench:** add a crash case that reboots the host mid-write ([edc6a29](https://github.com/usespotlightai/pando/commit/edc6a29fcf92ab93de94b1f7a309c4c484b87b8a))
+* **bench:** probe AgentCore Runtime V2 for the frontends Pando can use ([fb76e57](https://github.com/usespotlightai/pando/commit/fb76e577ca046e75da69ec9a17ae580a93b168ab))
+* **bench:** SOCI, Nydus, ZeroFS and Amazon S3 Files results ([d57f1de](https://github.com/usespotlightai/pando/commit/d57f1de3af48e1dc730524826533bf397b707345))
+* **engine:** bound the cache's object log with --cache-budget ([#38](https://github.com/usespotlightai/pando/issues/38)) ([61673b0](https://github.com/usespotlightai/pando/commit/61673b042bff7574627cff010bd761b401f6d515))
+* **engine:** fail writes cleanly when the local disk is full ([2035c64](https://github.com/usespotlightai/pando/commit/2035c64a68795a5b12c69e5379d420b556b1f672))
+* **engine:** fail writes cleanly when the local disk is full ([ecf49b9](https://github.com/usespotlightai/pando/commit/ecf49b903de9ebd082c1360696a25553396bf4e8))
+* gc --delete needs a versioned bucket, and a daily report-only GC unit ([#43](https://github.com/usespotlightai/pando/issues/43)) ([9022e51](https://github.com/usespotlightai/pando/commit/9022e51602993f2824529d1abac5b14c43f5a57d))
+* give each org a store of its own: credentials from the AWS chain or a refreshed file, caches bound to one store, and pando purge ([#47](https://github.com/usespotlightai/pando/issues/47)) ([0743139](https://github.com/usespotlightai/pando/commit/07431394b1152f3f5b493e5ba1053f7202746ea6))
+* give programs a stable CLI: --json events, exit statuses that name the failure, and check-host ([#46](https://github.com/usespotlightai/pando/issues/46)) ([9e7b378](https://github.com/usespotlightai/pando/commit/9e7b37898ab12518cc62e3af268c68472df3a59f))
+* keep device I/O bounded while the store is unreachable ([8b2d471](https://github.com/usespotlightai/pando/commit/8b2d4714129b08620b328f3afb2fee924d35e438))
+* keep device I/O bounded while the store is unreachable ([b24b4cb](https://github.com/usespotlightai/pando/commit/b24b4cb72639b62c97e147dc841541b9979785a1))
+* **release:** release binaries for x86_64 and aarch64, a checked install, and a systemd test ([5df0854](https://github.com/usespotlightai/pando/commit/5df08545a286bb36029af4df12c6f5c13d859698))
+* **release:** release-please releases for x86_64 and aarch64, a checked install, and a systemd test ([edb558d](https://github.com/usespotlightai/pando/commit/edb558d6f52f808f557b64e563dceec247a7a6e9))
+* report each attached branch's upload lag with pando status ([#39](https://github.com/usespotlightai/pando/issues/39)) ([bd144ca](https://github.com/usespotlightai/pando/commit/bd144cae90387ad91a188b5d1d28c5f29be803d6))
+* run GC per store, so a host serving many orgs collects each one's dead data ([#50](https://github.com/usespotlightai/pando/issues/50)) ([9ebdaa7](https://github.com/usespotlightai/pando/commit/9ebdaa74f198d7eecf6c4cf1a15696096b909dec))
+* run on AgentCore Runtime V2 (FUSE and loop frontend, instance credentials, probe) ([918a00e](https://github.com/usespotlightai/pando/commit/918a00ece50516fa9071e05625a518666b104545))
+* **s3:** sign with a session token, or with the instance role from the metadata service ([e2643bc](https://github.com/usespotlightai/pando/commit/e2643bc5a744bf2f6fbd1379ee2fc66c9bd21766))
+* serve a branch over FUSE with a loop device (attach --fuse) ([6948720](https://github.com/usespotlightai/pando/commit/694872071a5ebc2baf806286e100ccb07eb77c18))
+
+
+### Bug Fixes
+
+* a dispatched soak starts its segments, and compares the log only once it settles ([#45](https://github.com/usespotlightai/pando/issues/45)) ([69cc183](https://github.com/usespotlightai/pando/commit/69cc183a97c42ffbf6e458dac8b029983d623a0f))
+* **bench:** charts read only their own results files ([7854a52](https://github.com/usespotlightai/pando/commit/7854a52f57da41f4e09f88c56d2d29983e8b5137))
+* **bench:** confirm the reboot before waiting for it and clean up after a failed rep ([39679cb](https://github.com/usespotlightai/pando/commit/39679cb9caf6310e393504b9883d1538e0606275))
+* **bench:** crash-reboot skips the systems check ([e2a6a19](https://github.com/usespotlightai/pando/commit/e2a6a1946b08ed4e7cf140345aad9e542578f48e))
+* **bench:** smoke check accepts the host role for Pando ([113b173](https://github.com/usespotlightai/pando/commit/113b1731a4722b109a9f8a0f72fc758e87384744))
+* **engine:** an advance no longer lets the old writer's unpublished writes onto the new root ([#44](https://github.com/usespotlightai/pando/issues/44)) ([3d71ce4](https://github.com/usespotlightai/pando/commit/3d71ce4e24113a881a885424330c892283160063))
+* **engine:** an open no longer sees a resumed writer's flush without the ones it resumed ([#42](https://github.com/usespotlightai/pando/issues/42)) ([2eb87ff](https://github.com/usespotlightai/pando/commit/2eb87ff8d2ae0e4e14abbba8cb11e9634066a216))
+* **engine:** bound the memory writes hold between flushes ([56f8079](https://github.com/usespotlightai/pando/commit/56f8079976da04778b3348b1635429fe8566b019))
+* **engine:** bound the memory writes hold between flushes ([bc9d64e](https://github.com/usespotlightai/pando/commit/bc9d64e9337400eb3948e64165ea1aac6d76f297))
+* **engine:** bound the temporary name search ([c6f2b40](https://github.com/usespotlightai/pando/commit/c6f2b40ed524149e7093dc339e916c3a43f9f1c2))
+* **engine:** count the appends during a sweep toward the next one ([98eca75](https://github.com/usespotlightai/pando/commit/98eca7500b431de51b9eacbee6321f0d7bf8d9a0))
+* **engine:** GC keeps every stored copy of a chunk a branch reaches ([#41](https://github.com/usespotlightai/pando/issues/41)) ([a674d77](https://github.com/usespotlightai/pando/commit/a674d7771b5e4d20de064c3f96d6d835abcb0318))
+* **engine:** keep a cancelled append from stalling its journal shard ([9fd3842](https://github.com/usespotlightai/pando/commit/9fd3842b913d33c4d3f06ebedc82a4aece614ba9))
+* **engine:** keep a dead shipper from holding up a log close ([7df2c06](https://github.com/usespotlightai/pando/commit/7df2c06f86a2b03c3d3b32b4007844631f8a4980))
+* **engine:** keep only what a pinned operation put again, not all its epoch appended ([065dd86](https://github.com/usespotlightai/pando/commit/065dd86704d7351e2542234ccf6fa4e0d262b388))
+* **engine:** keep what a sweep could drop from under a write, a reused branch name or a torn header ([07c8f6d](https://github.com/usespotlightai/pando/commit/07c8f6d91b9a004c366c2be8189d034730a29037))
+* **engine:** let a sweep mark in an epoch older than the pins begun after it ([fc023e4](https://github.com/usespotlightai/pando/commit/fc023e41497842f01c61c353447f44978b9cf34b))
+* **engine:** repeat a commit's failed state write on the next flush ([10e684c](https://github.com/usespotlightai/pando/commit/10e684c606c1e6ccab08872c421c296e5f950035))
+* **engine:** skip temporary file names a killed process left ([ece22d1](https://github.com/usespotlightai/pando/commit/ece22d1ec3710968dfa90c6c0810db514ecbf24e))
+* **engine:** skip temporary file names a killed process left ([5f7c39e](https://github.com/usespotlightai/pando/commit/5f7c39ea918cbb153948342563c31f8105310374))
+* **engine:** start writeback of the journal as it grows ([e6828d9](https://github.com/usespotlightai/pando/commit/e6828d96bffef0c9001960f5d8e0d9dcd5b9cb54))
+* **engine:** start writeback of the journal as it grows ([009892d](https://github.com/usespotlightai/pando/commit/009892d6d8d43d97201875fcc875be821bcf9412))
+* **engine:** sweep the object log, so old chunk versions leave memory and disk ([11a642a](https://github.com/usespotlightai/pando/commit/11a642af0e47c50e50cda65c6782d88dbc0b2057))
+* **engine:** sweep the object log, so old chunk versions leave memory and disk ([7ad5c70](https://github.com/usespotlightai/pando/commit/7ad5c70798d064ea90a490685349374e3e53dca9))
+* **engine:** trim a log record created while the log closes ([16fc055](https://github.com/usespotlightai/pando/commit/16fc055b832f7738696db9242954f2483fc3397f))
+* **engine:** trim a log record created while the log closes ([2248752](https://github.com/usespotlightai/pando/commit/2248752e5093c7a1e3283494edc05d1635286baf))
+* **engine:** wait for the disk when the journal or the object log falls behind ([ce640f1](https://github.com/usespotlightai/pando/commit/ce640f1886e6bec3060382acde99bad05f76278c))
+* **engine:** wait for the disk when the journal or the object log falls behind ([0368d29](https://github.com/usespotlightai/pando/commit/0368d290b0ce00fba5b029de1113929d4e436c72))
+* **fuse:** sync the file system on a signal, and keep serving after a failed unmount ([8975ac1](https://github.com/usespotlightai/pando/commit/8975ac1f27b56bea18e71f016ecd31047a76025d))
+* **host:** draw every random number from the kernel ([655532f](https://github.com/usespotlightai/pando/commit/655532f4a521cd9d2f1de36bd7bfe49bf9e7f93d))
+* never wait on the store under a stripe lock in device I/O ([6e94102](https://github.com/usespotlightai/pando/commit/6e94102753c86007fd22e37c8bb208c391e65cc6))
+* **release:** ask the app only for the permissions its installation has ([7d33df0](https://github.com/usespotlightai/pando/commit/7d33df0a7b1bfbbf1543a9888ea7fd37a13026b7))
+* **release:** ask the app only for the permissions its installation has ([86a0cef](https://github.com/usespotlightai/pando/commit/86a0cef3684ac30ba59c4d9db51f3caac4b0f5ea))
+* **release:** fail --restart without systemd, and publish only tags on main ([962e3b7](https://github.com/usespotlightai/pando/commit/962e3b77f6626504901466133705d90f93f948a8))
+* retry a refused upload for about two minutes before stopping ([a661f32](https://github.com/usespotlightai/pando/commit/a661f32f31f89bd6aff39d5db74bfee3682ce4bb))
+* stop uploads when the store refuses a request for good ([38464ee](https://github.com/usespotlightai/pando/commit/38464ee1eed94f4d3c28d7cd66876a58f8dc65c8))
+
+
+### Performance
+
+* **engine:** keep dirty writes in the journal, not in chunk buffers ([a871f16](https://github.com/usespotlightai/pando/commit/a871f16abe733a850f2d23046648f3fb7438be27))
+* **engine:** keep dirty writes in the journal, not in chunk buffers ([03dcbc8](https://github.com/usespotlightai/pando/commit/03dcbc8f5daac64304bc021dfd441cc2fce34fb2))
