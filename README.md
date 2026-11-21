@@ -70,14 +70,9 @@ on a second host.
 
 ### 2. Install Pando
 
-```bash
-curl -fsSLO https://github.com/usespotlightai/pando/releases/download/v0.1.0/install.sh
-curl -fsSLO https://github.com/usespotlightai/pando/releases/download/v0.1.0/SHA256SUMS
-sha256sum -c --ignore-missing SHA256SUMS
-sudo bash install.sh 0.1.0
-```
-
-Then check that the host can serve branches:
+Install the latest release as [docs/hosts.md](docs/hosts.md#install) shows: four commands
+download `install.sh`, check it against the release's checksums and run it. Then check that the
+host can serve branches:
 
 ```bash
 sudo pando check-host
@@ -104,10 +99,12 @@ S3_SECRET_ACCESS_KEY=...
 ```
 
 For AWS S3, set `S3_ENDPOINT=https://s3.<region>.amazonaws.com` and `S3_REGION` to the bucket's
-region. The rest of this guide runs as root with those settings loaded:
+region.
+
+Every command from here on runs in a root shell that has those settings loaded. Open one with
+`sudo -i`, then load them in it:
 
 ```bash
-sudo -i
 set -a; . /etc/pando/pando.env; set +a
 ```
 
@@ -117,12 +114,14 @@ Create an empty 20 GiB branch called `base`, and serve it as the block device `/
 
 ```bash
 pando init base $((20 << 30))
-pando attach base --device /dev/ublkb0 &
+pando attach base --device /dev/ublkb0 >base.log 2>&1 &
+until grep -q '^attached' base.log; do sleep 0.2; done
 ```
 
-`attach` keeps running while it serves the device. Once you can use it, it prints a line that
-starts `attached base as /dev/ublkb0`. Put a file system on it, mount it, and fill it with what
-every run needs:
+`attach` keeps running in the background while it serves the device, and writes `attached base
+as /dev/ublkb0` once the device can be used; the `until` line waits for that. If it never comes,
+`cat base.log` says why. Put a file system on the device, mount it, and fill it with what every
+run needs:
 
 ```bash
 mkfs.ext4 -q /dev/ublkb0
@@ -154,7 +153,8 @@ next version.
 
 ```bash
 pando branch --checkpoint base-v1 run-1
-pando attach run-1 --device /dev/ublkb1 &
+pando attach run-1 --device /dev/ublkb1 >run-1.log 2>&1 &
+until grep -q '^attached' run-1.log; do sleep 0.2; done
 mkdir -p /mnt/run-1
 mount /dev/ublkb1 /mnt/run-1
 ```
@@ -182,7 +182,8 @@ To serve several branches at once, start the host daemon (`pando serve --socket
 On a second host, install Pando and load the same settings (steps 2 and 3), then:
 
 ```bash
-pando attach run-1 --device /dev/ublkb0 &
+pando attach run-1 --device /dev/ublkb0 >run-1.log 2>&1 &
+until grep -q '^attached' run-1.log; do sleep 0.2; done
 mkdir -p /mnt/run-1
 mount /dev/ublkb0 /mnt/run-1
 ```
@@ -211,8 +212,9 @@ Detach a branch, and unmount it first, before you delete it. `pando gc` only rep
 - **Drive Pando from a program** with `--json` and exit statuses: [docs/cli.md](docs/cli.md).
 - **Keep each customer's data apart**, with a store and credentials per org:
   [docs/tenancy.md](docs/tenancy.md).
-- **Start faster** with the host daemon (`pando serve`), and with `attach --dm --images` to hand
-  the device to the kernel once the branch is local: see [How it works](#how-it-works).
+- **Start faster** with the host daemon (`pando serve`, as in step 6), and with `attach --dm
+  NAME --images DIR`: you mount `/dev/mapper/NAME`, and once the branch is local Pando switches
+  it to a local image in `DIR`, off the I/O path. `pando attach --help` lists every flag.
 - **Cut a release:** [docs/releasing.md](docs/releasing.md).
 
 ## Crates
