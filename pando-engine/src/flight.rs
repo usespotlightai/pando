@@ -109,6 +109,7 @@ impl<K: Eq + Hash + Clone> Claim<'_, K> {
         let outcome = r.map_err(|e| match e {
             Error::Shared(e) => e,
             e @ (Error::Fenced { .. }
+            | Error::Remade { .. }
             | Error::ChunkLost { .. }
             | Error::Store(_)
             | Error::Format(_)

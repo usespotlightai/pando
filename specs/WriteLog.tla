@@ -21,7 +21,8 @@ CONSTANTS
     MaxWrites,      \* writes the writers make in all, each a flush once committed
     MaxOpens,       \* opens in all
     MaxAdvances,    \* `pando advance` runs onto the branch
-    MaxDeletes,     \* `pando delete` runs, each followed by a create under the same name
+    MaxDeletes,     \* `pando delete` runs, each its own process, so they may overlap; each
+                    \* ref they delete may be followed by a create under the same name
     Depth           \* the longest behaviour checked, in steps; 0 for every behaviour
 
 VARIABLES
@@ -36,9 +37,8 @@ VARIABLES
                 \* not dropped by the last one
     acked,      \* strict flushes some writer returned from
     histories,  \* every history a writer committed or a ref held
-    deleted     \* `pando delete`: how many ran, the one running, the branch's lives so
-                \* far, and the writes made on a branch since deleted. A life's id is
-                \* its number
+    deleted     \* `pando delete`: each delete's process, the branch's lives so far, and
+                \* the writes made on a branch since deleted. A life's id is its number
 
 vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, deleted>>
 
@@ -105,7 +105,13 @@ NoAdvance ==
     [count |-> 0, pc |-> "idle", ver |-> <<>>, life |-> 0, gen |-> 0, n |-> 0, floor |-> 0,
      root |-> <<>>]
 
-NoDelete == [count |-> 0, pc |-> "idle", life |-> 0, keys |-> {}, lives |-> 0, old |-> {}]
+Deletes == 1..MaxDeletes
+
+\* A delete's process: "ready" until it runs, "done" once it ended. It names the
+\* life and the version of the ref it read.
+NoDelete ==
+    [by |-> [d \in Deletes |-> [pc |-> "ready", life |-> 0, ver |-> <<>>, keys |-> {}]],
+     lives |-> 0, old |-> {}]
 
 
 Init ==
@@ -523,42 +529,58 @@ AdvanceStop ==
     /\ advances' = [advances EXCEPT !.pc = "idle"]
     /\ UNCHANGED <<deleted, ref, store, disk, proc, nextId, opens, acked, histories>>
 
-\* branch::delete reads the ref, deletes it, lists the log of the life it read
-\* and deletes each record it listed. Nothing fences a writer still running on
-\* the branch, and the delete of the ref is not conditional: a delete that read
-\* a life deleted since deletes whatever life the name holds by then.
-DeleteRead ==
-    /\ deleted.pc = "idle"
-    /\ deleted.count < MaxDeletes
+\* branch::delete reads the ref, deletes it if it still has the version read,
+\* lists the log of the life it read and deletes each record it listed. Nothing
+\* fences a writer still running on the branch. A delete that finds the ref
+\* moved reads it again: a ref of the same life it deletes in turn, and a ref of
+\* another life it leaves (Error::Remade). One that finds no ref goes on to the
+\* log.
+DeleteRead(d) ==
+    /\ deleted.by[d].pc = "ready"
     /\ ref.exists
-    /\ deleted' = [deleted EXCEPT !.count = @ + 1, !.pc = "ref", !.life = ref.id]
+    /\ deleted' = [deleted EXCEPT !.by[d].pc = "ref", !.by[d].life = ref.id,
+                                   !.by[d].ver = Ver(ref)]
     /\ UNCHANGED <<ref, store, disk, proc, nextId, opens, advances, acked, histories>>
 
-DeleteRef ==
-    /\ deleted.pc = "ref"
-    /\ ref' = [ref EXCEPT !.exists = FALSE]
-    /\ deleted' = [deleted EXCEPT !.pc = "list"]
+DeleteRef(d) ==
+    /\ deleted.by[d].pc = "ref"
+    /\ IF ref.exists /\ Ver(ref) = deleted.by[d].ver
+       THEN /\ ref' = [ref EXCEPT !.exists = FALSE]
+            /\ deleted' = [deleted EXCEPT !.by[d].pc = "list"]
+       ELSE /\ deleted' = [deleted EXCEPT !.by[d].pc = "reread"]
+            /\ UNCHANGED ref
     /\ UNCHANGED <<store, disk, proc, nextId, opens, advances, acked, histories>>
 
-DeleteList ==
-    LET listed == {r \in store : r.l = deleted.life}
-    IN /\ deleted.pc = "list"
-       /\ deleted' = [deleted EXCEPT !.pc = IF listed = {} THEN "idle" ELSE "delete",
-                                      !.keys = {<<r.g, r.n>> : r \in listed}]
+DeleteReread(d) ==
+    /\ deleted.by[d].pc = "reread"
+    /\ deleted' =
+        [deleted EXCEPT
+            !.by[d].pc = CASE ~ref.exists -> "list"
+                           [] ref.id = deleted.by[d].life -> "ref"
+                           [] OTHER -> "done",
+            !.by[d].ver = Ver(ref)]
+    /\ UNCHANGED <<ref, store, disk, proc, nextId, opens, advances, acked, histories>>
+
+DeleteList(d) ==
+    LET listed == {r \in store : r.l = deleted.by[d].life}
+    IN /\ deleted.by[d].pc = "list"
+       /\ deleted' = [deleted EXCEPT !.by[d].pc = IF listed = {} THEN "done" ELSE "delete",
+                                      !.by[d].keys = {<<r.g, r.n>> : r \in listed}]
        /\ UNCHANGED <<ref, store, disk, proc, nextId, opens, advances, acked, histories>>
 
-DeleteRecord(k) ==
-    /\ deleted.pc = "delete"
-    /\ k \in deleted.keys
-    /\ store' = store \ At(deleted.life, k[1], k[2])
-    /\ deleted' = [deleted EXCEPT !.keys = @ \ {k},
-                                   !.pc = IF deleted.keys = {k} THEN "idle" ELSE "delete"]
+DeleteRecord(d, k) ==
+    /\ deleted.by[d].pc = "delete"
+    /\ k \in deleted.by[d].keys
+    /\ store' = store \ At(deleted.by[d].life, k[1], k[2])
+    /\ deleted' = [deleted EXCEPT !.by[d].keys = @ \ {k},
+                                   !.by[d].pc = IF deleted.by[d].keys = {k} THEN "done"
+                                                ELSE "delete"]
     /\ UNCHANGED <<ref, disk, proc, nextId, opens, advances, acked, histories>>
 
 \* The delete's process ends before it deleted every record it listed.
-DeleteStop ==
-    /\ deleted.pc /= "idle"
-    /\ deleted' = [deleted EXCEPT !.pc = "idle", !.keys = {}]
+DeleteStop(d) ==
+    /\ deleted.by[d].pc \notin {"ready", "done"}
+    /\ deleted' = [deleted EXCEPT !.by[d].pc = "done", !.by[d].keys = {}]
     /\ UNCHANGED <<ref, store, disk, proc, nextId, opens, advances, acked, histories>>
 
 \* Volume::create under the deleted branch's name: a new life of the branch,
@@ -598,8 +620,10 @@ Next ==
         \/ Stop(h) \/ Lose(h)
     \/ AdvanceRead \/ AdvanceScan \/ AdvanceSeal \/ AdvanceStop
     \/ \E root \in AdvanceRoots : AdvancePut(root)
-    \/ DeleteRead \/ DeleteRef \/ DeleteList \/ \E k \in deleted.keys : DeleteRecord(k)
-    \/ DeleteStop \/ Create
+    \/ \E d \in Deletes :
+        \/ DeleteRead(d) \/ DeleteRef(d) \/ DeleteReread(d) \/ DeleteList(d) \/ DeleteStop(d)
+        \/ \E k \in deleted.by[d].keys : DeleteRecord(d, k)
+    \/ Create
     \/ \E r \in store : GcSweep(r)
 
 Spec == Init /\ [][Next]_vars
@@ -634,6 +658,11 @@ DeleteDropsTheOldBranch ==
     /\ \A h \in Hosts :
         Running(h) /\ proc[h].life = deleted.lives =>
             Range(proc[h].opened) \cap deleted.old = {}
+
+\* A delete deletes only a life of the branch it read: a branch made again under
+\* the name while a delete runs outlives that delete.
+DeleteTakesOnlyWhatItRead ==
+    ~ref.exists => \E d \in Deletes : deleted.by[d].pc /= "ready" /\ deleted.by[d].life = ref.id
 
 \* The ref only ever holds a state some writer committed.
 RefHoldsAWriterState == ref.root \in histories

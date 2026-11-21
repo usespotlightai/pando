@@ -14,6 +14,13 @@ pub enum Error {
         /// The branch whose ref moved.
         branch: String,
     },
+    /// A delete found its branch deleted and made again under its name after it read the ref,
+    /// and left the new branch as it was.
+    #[error("branch {branch} was deleted and made again while this delete ran; it is left as it is")]
+    Remade {
+        /// The branch's name.
+        branch: String,
+    },
     /// A chunk no upload published is gone from the cache or changed, so no later upload can
     /// publish the root that holds it.
     #[error("chunk {hash} lost from the local cache; this writer cannot publish the branch")]
@@ -73,6 +80,7 @@ impl Error {
         match self {
             Error::Shared(e) => e.kind(),
             e @ (Error::Fenced { .. }
+            | Error::Remade { .. }
             | Error::ChunkLost { .. }
             | Error::Store(_)
             | Error::Format(_)

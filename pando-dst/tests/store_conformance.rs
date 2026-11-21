@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use object_store::memory::InMemory;
 use pando_dst::store_conformance;
+use pando_engine::ports::{Store, StoreError};
 use pando_engine::sim::{SimClock, SimStore};
 use pando_s3::S3Store;
 
@@ -14,7 +15,11 @@ async fn sim_store_conforms() {
 
 #[tokio::test]
 async fn s3_adapter_conforms_over_an_in_memory_backend() {
-    store_conformance::check(&S3Store::over(Arc::new(InMemory::new()), "prefix/a")).await;
+    let store = S3Store::over(Arc::new(InMemory::new()), "prefix/a");
+    store_conformance::check_but_conditional_delete(&store).await;
+    let v = store.create("test/delete-if", "x".into()).await.unwrap();
+    let e = store.delete_if("test/delete-if", &v).await;
+    assert!(matches!(e, Err(StoreError::Permanent { .. })), "{e:?}");
 }
 
 /// Runs against a real store named by `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`,

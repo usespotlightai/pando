@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
 pando-engine = { workspace = true, features = ["sim"] }
 pando-format.workspace = true
 parking_lot.workspace = true

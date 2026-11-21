@@ -1,7 +1,10 @@
 //! Pando's [`Store`] port over any S3-compatible object store, through `object_store`.
 //!
 //! Refs need conditional writes: `If-None-Match: *` for create and `If-Match: <etag>` for
-//! update. AWS S3, Cloudflare R2 and `MinIO` support both.
+//! update. AWS S3, Cloudflare R2 and `MinIO` support both. A ref's delete sends
+//! `If-Match: <etag>` too, which AWS S3 honours; a store that ignores it deletes the ref
+//! whatever its version. `object_store` has no conditional delete, so this crate presigns and
+//! sends that request itself.
 
 #![forbid(unsafe_code)]
 
@@ -14,12 +17,15 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut};
+use http::header::IF_MATCH;
+use http::{HeaderValue, Method};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut};
 use object_store::client::{
-    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpResponseBody,
-    HttpService, ReqwestConnector,
+    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpRequestBody, HttpResponse,
+    HttpResponseBody, HttpService, ReqwestConnector,
 };
 use object_store::path::Path;
+use object_store::signer::{SignedUrlOptions, Signer};
 use object_store::{
     ClientOptions, CredentialProvider, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode,
     PutOptions, PutPayload, UpdateVersion,
@@ -161,14 +167,29 @@ impl std::fmt::Debug for Credentials {
 }
 
 /// The [`Store`] port over one bucket and key prefix. Refs use conditional writes, so the
-/// backend must support `If-None-Match` and `If-Match` on PUT.
+/// backend must support `If-None-Match` and `If-Match` on PUT. [`Store::delete_if`] holds only
+/// on a backend that honours `If-Match` on DELETE.
 #[derive(Debug)]
 pub struct S3Store {
     inner: Client,
     prefix: String,
 }
 
-type Built = Result<Arc<dyn ObjectStore>, String>;
+type Built = Result<Backend, String>;
+
+#[derive(Debug)]
+struct Backend {
+    store: Arc<dyn ObjectStore>,
+    deletes: Option<ConditionalDeletes>,
+}
+
+/// Sends `DeleteObject` with `If-Match`, presigned with the store's credentials and sent over
+/// a client with the store's options.
+#[derive(Debug)]
+struct ConditionalDeletes {
+    signer: AmazonS3,
+    http: HttpClient,
+}
 
 /// The `object_store` client. [`S3Store::new`] builds it on a thread of its own: the build
 /// loads the system's root certificates, which takes tens of milliseconds the caller can spend
@@ -181,6 +202,10 @@ struct Client {
 
 impl Client {
     async fn get(&self, key: &str) -> Result<&Arc<dyn ObjectStore>, StoreError> {
+        Ok(&self.backend(key).await?.store)
+    }
+
+    async fn backend(&self, key: &str) -> Result<&Backend, StoreError> {
         let built = self
             .ready
             .get_or_init(|| async {
@@ -204,15 +229,14 @@ impl S3Store {
     /// The port over the store `c` names. It returns before the client is built; the first
     /// request waits for the build and fails with [`StoreError::Permanent`] if the build failed.
     pub fn new(c: &S3Config) -> Result<S3Store, StoreError> {
+        let options = ClientOptions::new()
+            .with_timeout(REQUEST_TIMEOUT)
+            .with_connect_timeout(CONNECT_TIMEOUT)
+            .with_allow_http(c.allow_http);
         let mut b = AmazonS3Builder::new()
             .with_bucket_name(&c.bucket)
             .with_region(&c.region)
-            .with_client_options(
-                ClientOptions::new()
-                    .with_timeout(REQUEST_TIMEOUT)
-                    .with_connect_timeout(CONNECT_TIMEOUT)
-                    .with_allow_http(c.allow_http),
-            )
+            .with_client_options(options.clone())
             .with_http_connector(RefusalConnector)
             .with_conditional_put(S3ConditionalPut::ETagMatch);
         if let Some(e) = &c.endpoint {
@@ -257,7 +281,13 @@ impl S3Store {
             .spawn(move || {
                 let built = b
                     .build()
-                    .map(|s| -> Arc<dyn ObjectStore> { Arc::new(s) })
+                    .and_then(|s| {
+                        let http = RefusalConnector.connect(&options)?;
+                        Ok(Backend {
+                            store: Arc::new(s.clone()),
+                            deletes: Some(ConditionalDeletes { signer: s, http }),
+                        })
+                    })
                     .map_err(|e| map_err(&bucket, e).to_string());
                 let _ = tx.send(built);
             })
@@ -275,10 +305,15 @@ impl S3Store {
     }
 
     /// The port over another `object_store` backend, such as its in-memory store in tests.
+    /// [`Store::delete_if`] fails with [`StoreError::Permanent`]: `object_store` has no
+    /// conditional delete.
     pub fn over(inner: Arc<dyn ObjectStore>, prefix: &str) -> S3Store {
         S3Store {
             inner: Client {
-                ready: OnceCell::new_with(Some(Ok(inner))),
+                ready: OnceCell::new_with(Some(Ok(Backend {
+                    store: inner,
+                    deletes: None,
+                }))),
                 building: Mutex::new(None),
             },
             prefix: prefix.trim_matches('/').to_string(),
@@ -318,6 +353,68 @@ impl S3Store {
             .map_err(|e| map_err(key, e))?;
         Ok(Version(r.e_tag.unwrap_or_default()))
     }
+}
+
+impl ConditionalDeletes {
+    async fn delete_if(&self, key: &str, path: &Path, expected: &Version) -> Result<(), StoreError> {
+        let permanent = |e: Box<dyn std::error::Error + Send + Sync>| StoreError::Permanent {
+            key: key.to_string(),
+            source: e,
+        };
+        let tag = HeaderValue::from_str(&expected.0).map_err(|e| permanent(e.into()))?;
+        let opts = SignedUrlOptions::new().with_signed_header(IF_MATCH, tag.clone());
+        let url = self
+            .signer
+            .signed_url_opts(Method::DELETE, path, REQUEST_TIMEOUT, &opts)
+            .await
+            .map_err(|e| map_err(key, e))?;
+        let req = http::Request::builder()
+            .method(Method::DELETE)
+            .uri(url.as_str())
+            .header(IF_MATCH, tag)
+            .body(HttpRequestBody::empty())
+            .map_err(|e| permanent(e.into()))?;
+        let r = self.http.execute(req).await.map_err(|e| {
+            if refused(&e) {
+                permanent(e.into())
+            } else {
+                StoreError::Transient {
+                    key: key.to_string(),
+                    source: e.into(),
+                }
+            }
+        })?;
+        let status = r.status();
+        match status.as_u16() {
+            200..=299 => return Ok(()),
+            404 => return Err(StoreError::NotFound { key: key.to_string() }),
+            412 => return Err(StoreError::PreconditionFailed { key: key.to_string() }),
+            _ => {}
+        }
+        let body = head(r.into_body()).await.unwrap_or_default();
+        let answered = Answered {
+            status: status.as_u16(),
+            reason: status.canonical_reason().unwrap_or(""),
+            body: String::from_utf8_lossy(&body).into_owned(),
+        };
+        if status.is_server_error() || matches!(status.as_u16(), 408 | 409 | 429) {
+            Err(StoreError::Transient {
+                key: key.to_string(),
+                source: Box::new(answered),
+            })
+        } else {
+            Err(permanent(Box::new(answered)))
+        }
+    }
+}
+
+/// An answer to a conditional delete that is neither a delete nor one of its preconditions.
+#[derive(Debug, thiserror::Error)]
+#[error("the store answered a conditional delete with {status} {reason}: {body}")]
+struct Answered {
+    status: u16,
+    reason: &'static str,
+    body: String,
 }
 
 /// Whether `id`, a version ID the store answered with, names a version it keeps: a store with
@@ -558,8 +655,8 @@ async fn head(body: HttpResponseBody) -> Result<Bytes, HttpError> {
     Ok(Bytes::from(head))
 }
 
-fn refused(e: &object_store::Error) -> bool {
-    let mut at: Option<&(dyn std::error::Error + 'static)> = Some(e);
+fn refused(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut at = Some(e);
     while let Some(e) = at {
         if e.is::<Refused>() {
             return true;
@@ -674,6 +771,16 @@ impl Store for S3Store {
         match self.inner.get(key).await?.delete(&self.path(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(map_err(key, e)),
+        }
+    }
+
+    async fn delete_if(&self, key: &str, expected: &Version) -> Result<(), StoreError> {
+        match &self.inner.backend(key).await?.deletes {
+            Some(d) => d.delete_if(key, &self.path(key), expected).await,
+            None => Err(StoreError::Permanent {
+                key: key.to_string(),
+                source: "this backend has no conditional delete".into(),
+            }),
         }
     }
 
@@ -1202,5 +1309,57 @@ mod tests {
         for s in [401, 403, 404, 408, 409, 412, 429, 500, 503] {
             assert!(!refuses(s, ""), "{s}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_conditional_delete_signs_its_if_match_and_keeps_what_each_answer_means() {
+        let (addr, heads) = serving(Box::new(|head| {
+            if !head.starts_with("delete /b/org/k?") {
+                return ("400 Bad Request", String::new());
+            }
+            match head
+                .lines()
+                .find_map(|l| l.strip_prefix("if-match:"))
+                .map(str::trim)
+            {
+                Some("\"e\"") => ("204 No Content", String::new()),
+                Some("\"gone\"") => ("404 Not Found", "<Error><Code>NoSuchKey</Code></Error>".into()),
+                Some("\"busy\"") => (
+                    "503 Service Unavailable",
+                    "<Error><Code>SlowDown</Code></Error>".into(),
+                ),
+                Some("\"denied\"") => ("403 Forbidden", "<Error><Code>AccessDenied</Code></Error>".into()),
+                _ => ("412 Precondition Failed", String::new()),
+            }
+        }))
+        .await;
+        let s = S3Store::new(&S3Config {
+            bucket: "b".into(),
+            prefix: "org".into(),
+            endpoint: Some(format!("http://{addr}")),
+            region: "us-east-1".into(),
+            credentials: Credentials::Keys {
+                access_key_id: "id".into(),
+                secret_access_key: "secret".into(),
+                session_token: Some("session".into()),
+            },
+            allow_http: true,
+        })
+        .unwrap();
+        let tag = |t: &str| Version(format!("\"{t}\""));
+        s.delete_if("k", &tag("e")).await.unwrap();
+        let head = heads.lock().unwrap()[0].clone();
+        assert!(head.contains("x-amz-signedheaders=host%3bif-match"), "{head}");
+        assert!(head.contains("x-amz-security-token=session"), "{head}");
+        let e = s.delete_if("k", &tag("other")).await.unwrap_err();
+        assert!(matches!(e, StoreError::PreconditionFailed { .. }), "{e}");
+        let e = s.delete_if("k", &tag("gone")).await.unwrap_err();
+        assert!(matches!(e, StoreError::NotFound { .. }), "{e}");
+        let e = s.delete_if("k", &tag("busy")).await.unwrap_err();
+        assert!(matches!(e, StoreError::Transient { .. }), "{e}");
+        let e = s.delete_if("k", &tag("denied")).await.unwrap_err();
+        assert!(matches!(e, StoreError::Permanent { .. }), "{e}");
+        assert!(e.to_string().contains("AccessDenied"), "{e}");
+        assert_eq!(heads.lock().unwrap().len(), 5, "no answer is retried");
     }
 }

@@ -5,6 +5,13 @@ use pando_engine::ports::{Store, StoreError};
 
 /// Runs every check against `store`, using keys under `test/`. Panics on the first failure.
 pub async fn check(store: &dyn Store) {
+    check_but_conditional_delete(store).await;
+    delete_if_needs_the_current_version(store).await;
+}
+
+/// Runs every check but those of [`Store::delete_if`], for a backend that has no conditional
+/// delete. Panics on the first failure.
+pub async fn check_but_conditional_delete(store: &dyn Store) {
     missing_objects_are_not_found(store).await;
     create_does_not_replace(store).await;
     update_needs_the_current_version(store).await;
@@ -106,6 +113,30 @@ async fn list_returns_one_folder_in_key_order(store: &dyn Store) {
         .map(|o| o.key)
         .collect();
     assert_eq!(keys, ["test/dir/a", "test/dir/b", "test/dir/sub/c"]);
+}
+
+async fn delete_if_needs_the_current_version(store: &dyn Store) {
+    let v1 = store.create("test/delete-if", b("one")).await.unwrap();
+    let v2 = store.update("test/delete-if", b("two"), &v1).await.unwrap();
+    let stale = store.delete_if("test/delete-if", &v1).await;
+    assert!(
+        matches!(stale, Err(StoreError::PreconditionFailed { .. })),
+        "{stale:?}"
+    );
+    assert_eq!(store.get("test/delete-if").await.unwrap().body, b("two"));
+    store.delete_if("test/delete-if", &v2).await.unwrap();
+    assert!(matches!(
+        store.get("test/delete-if").await,
+        Err(StoreError::NotFound { .. })
+    ));
+    let missing = store.delete_if("test/delete-if", &v2).await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound { .. } | StoreError::PreconditionFailed { .. })
+        ),
+        "{missing:?}"
+    );
 }
 
 async fn delete_is_idempotent(store: &dyn Store) {

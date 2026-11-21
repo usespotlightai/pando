@@ -210,14 +210,29 @@ pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
 /// Deletes branch `name`, then the write log of the life it deleted. A branch made later under
 /// the name is another life, which reads none of that log, so a delete that stops part way
 /// harms no later branch. Its segments, and any records of its log left behind, go at the next
-/// GC that finds them unreached. The ref's delete is not conditional: a delete that runs while
-/// the branch is deleted and made again elsewhere may delete the new branch.
+/// GC that finds them unreached. The ref is deleted only while it holds the life the delete
+/// read: a writer that moves it meanwhile makes the delete read it again, and a branch made
+/// again under the name meanwhile is left as it is, with [`Error::Remade`].
 pub async fn delete(ports: &Ports, name: &str) -> Result<()> {
     let remote = Remote::new(Arc::clone(&ports.store));
-    let Some((r, _)) = remote.get_ref(name).await? else {
+    let Some((r, mut version)) = remote.get_ref(name).await? else {
         return Ok(());
     };
-    remote.delete_ref(name).await?;
+    loop {
+        match remote.delete_ref_if(name, &version).await {
+            Ok(()) => break,
+            Err(Error::Fenced { .. }) => match remote.get_ref(name).await? {
+                None => break,
+                Some((now, v)) if now.id == r.id => version = v,
+                Some(_) => {
+                    return Err(Error::Remade {
+                        branch: name.to_owned(),
+                    });
+                }
+            },
+            Err(e) => return Err(e),
+        }
+    }
     for (generation, n, _) in remote.list_log(name, r.id).await? {
         remote.delete_log_record(name, r.id, generation, n).await?;
     }
@@ -245,6 +260,7 @@ mod tests {
     use pando_format::CHUNK_SIZE;
 
     use super::*;
+    use crate::ports::Store;
     use crate::{Cache, LogMode, Volume, sim};
 
     async fn write(ports: &Ports, cache: &Arc<Cache>, name: &str, seed: u8) {
@@ -487,6 +503,59 @@ mod tests {
         new.close().await;
 
         assert_eq!(first_byte(&ports, &host(&ports, "/c").await, "foo").await, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_leaves_a_branch_made_again_under_its_name_after_it_read_the_ref() {
+        let (ports, store, _) = sim::ports(8);
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let remote = Remote::new(Arc::clone(&ports.store));
+        let (old, _) = remote.get_ref("foo").await.unwrap().unwrap();
+        let key = pando_format::keys::reference("foo");
+        let made_again = Ref {
+            id: BranchId::from_parts(7, 7),
+            ..old.clone()
+        };
+        store.hold(sim::StoreOp::Delete, &key);
+        let (deleted, ()) = futures::join!(delete(&ports, "foo"), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Store::put(store.as_ref(), &key, made_again.encode().into())
+                .await
+                .unwrap();
+            store.release(sim::StoreOp::Delete, &key);
+        });
+        assert!(matches!(deleted, Err(Error::Remade { .. })), "{deleted:?}");
+        let (now, _) = remote.get_ref("foo").await.unwrap().unwrap();
+        assert_eq!(now, made_again);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_that_a_writer_takes_the_branch_under_still_deletes_it() {
+        let (ports, store, _) = sim::ports(9);
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let key = pando_format::keys::reference("foo");
+        store.hold(sim::StoreOp::Delete, &key);
+        let (deleted, v) = futures::join!(delete(&ports, "foo"), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let v = Volume::open_logged(
+                &ports,
+                host(&ports, "/a").await,
+                Path::new("/a"),
+                "foo",
+                LogMode::Strict,
+            )
+            .await
+            .unwrap();
+            v.wait_generation().await.unwrap();
+            store.release(sim::StoreOp::Delete, &key);
+            v
+        });
+        deleted.unwrap();
+        let remote = Remote::new(Arc::clone(&ports.store));
+        assert!(remote.get_ref("foo").await.unwrap().is_none());
+        v.write_at(&vec![1; CHUNK_SIZE], 0).await.unwrap();
+        assert!(v.checkpoint().await.is_err());
+        v.close().await;
     }
 
     #[tokio::test(start_paused = true)]

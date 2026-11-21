@@ -3,7 +3,7 @@
 `WriteLog.tla` is a TLA+ specification of one branch's write log: the open, the scan and seals,
 the generation take, the shipper, the uploader, the trims, `close_log`, `pando advance`, and
 `pando delete` followed by a new branch under the same name, with hosts that crash, lose their
-disk and race each other on the store. TLC checks it on small models, and traces of
+disk and race each other on the store, and deletes that race each other. TLC checks it on small models, and traces of
 the engine from `pando-dst` are checked against it, so the spec stays the protocol the code
 runs.
 
@@ -21,6 +21,7 @@ histories, which on a real disk is a file system that no flush ever produced.
 | `RefHoldsAWriterState` | The ref only ever holds a state some writer committed. |
 | `AdvanceDropsWhatItReplaced` | A writer that takes the branch after an advance holds no flush older than the advance, unless the root the advance moved to holds it. |
 | `DeleteDropsTheOldBranch` | A branch made under a deleted branch's name holds none of the deleted branch's writes: not in its ref, and not in what a writer that took it opened. |
+| `DeleteTakesOnlyWhatItRead` | A delete deletes only the life of the branch it read: a branch made again under the name while a delete runs outlives that delete. |
 
 Each action names the code it models:
 
@@ -38,7 +39,7 @@ Each action names the code it models:
 | `Ack` | `Inner::wait_logged`, the return of a strict flush |
 | `Stop`, `Lose` | a crash, kill or detach; a host lost with its disk |
 | `AdvanceRead`, `AdvanceScan`, `AdvanceSeal`, `AdvancePut`, `AdvanceStop` | `branch::advance`, `log::seal` |
-| `DeleteRead`, `DeleteRef`, `DeleteList`, `DeleteRecord`, `DeleteStop` | `branch::delete` |
+| `DeleteRead`, `DeleteRef`, `DeleteReread`, `DeleteList`, `DeleteRecord`, `DeleteStop` | `branch::delete`, `Remote::delete_ref_if`; each delete is a process of its own |
 | `Create` | `Volume::create` under the deleted branch's name, with a branch id no earlier life had |
 | `GcSweep` | `gc::collect`, which deletes the records of branch lives no ref names |
 
@@ -46,8 +47,7 @@ The ref's version is a hash of its contents, as an S3 ETag is, so two refs with 
 have the same version; the simulated store in `pando-engine` versions objects the same way.
 
 Not modelled: transient store errors (a failed call is retried or ends the process, which
-`Stop` covers), the contents of segments and checkpoints, two deletes of the branch at once, and
-more than one branch.
+`Stop` covers), the contents of segments and checkpoints, and more than one branch.
 
 ## Running
 
@@ -62,7 +62,9 @@ That checks every model in `specs/*.cfg`, the ones a pull request runs. `WriteLo
 hosts, two writes, three opens and strict mode, and checks every behaviour of up to 24 steps:
 about 3.1 million distinct states. `WriteLog-advance.cfg` adds one advance with two opens, to 16
 steps: about 1.1 million states. `WriteLog-delete.cfg` has two hosts, two writes, two opens and
-one delete followed by a create, to 20 steps: about 2.5 million states.
+one delete followed by a create, to 20 steps: about 2.5 million states. `WriteLog-deletes.cfg`
+has two hosts, one write, two opens and two deletes that may overlap, each followed by a create,
+to 16 steps: about 1.1 million states.
 
 ```bash
 tools/tlc.sh nightly
@@ -85,7 +87,9 @@ A violation prints the behaviour that breaks the invariant, one state per step.
 The race scenario in `pando-dst/tests/scenarios.rs` runs two hosts that open, flush, checkpoint,
 detach, crash and lose their disk on one branch, over a simulated store with latency. A third
 host advances the branch now and then, to a new empty branch or to a copy of what it published,
-or deletes it and makes it again under its name while the other hosts' writers still run. With
+or deletes it and makes it again under its name while the other hosts' writers still run; some
+of those deletes have a writer flush and checkpoint between their read of the ref and their
+delete of it. With
 `PANDO_TLA_TRACES` set, each seed also writes every call on the branch's ref and log, in the
 order the store applied them, and every write and flush of a writer, as
 `race-<seed>/TraceData.tla`.
@@ -159,3 +163,10 @@ known to see it.
   `a_host_does_not_resume_a_deleted_branch_on_one_made_again_under_its_name` and
   `a_branch_made_again_under_a_name_whose_delete_stopped_replays_none_of_its_log` fail without
   it.
+- **Two deletes of a branch at once.** `branch::delete` deleted the ref whatever its version. A
+  delete that read the branch, then fell behind another delete and a create under the name,
+  deleted the new branch, in 5 steps. The ref's delete is now conditional on the version the
+  delete read (`Store::delete_if`, `If-Match` on S3). A delete that finds the ref moved reads it
+  again: it deletes a ref of the life it read in turn, and leaves a ref of another life with
+  `Error::Remade`. The unit test
+  `a_delete_leaves_a_branch_made_again_under_its_name_after_it_read_the_ref` fails without it.

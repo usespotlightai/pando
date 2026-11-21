@@ -24,7 +24,7 @@ pub enum StoreOp {
     Update,
     /// [`Store::list`].
     List,
-    /// [`Store::delete`].
+    /// [`Store::delete`] and [`Store::delete_if`].
     Delete,
 }
 
@@ -249,6 +249,30 @@ impl SimStore {
     }
 }
 
+impl SimStore {
+    fn remove(&self, key: &str, expected: Option<&Version>) -> Result<(), StoreError> {
+        let mut s = self.state.lock();
+        let fault = Self::fault(&mut s, StoreOp::Delete);
+        if let Some(f) = fault.filter(|f| !f.applied) {
+            return Err(Self::failure(key, f));
+        }
+        if let Some(want) = expected {
+            match s.objects.get(key) {
+                None => return Err(StoreError::NotFound { key: key.to_string() }),
+                Some(o) if o.version.to_string() != want.0 => {
+                    return Err(StoreError::PreconditionFailed { key: key.to_string() });
+                }
+                Some(_) => {}
+            }
+        }
+        s.objects.remove(key);
+        if let Some(f) = fault {
+            return Err(Self::failure(key, f));
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Store for SimStore {
     async fn get(&self, key: &str) -> Result<Object, StoreError> {
@@ -314,16 +338,12 @@ impl Store for SimStore {
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.round_trip(StoreOp::Delete, key).await;
-        let mut s = self.state.lock();
-        let fault = Self::fault(&mut s, StoreOp::Delete);
-        if let Some(f) = fault.filter(|f| !f.applied) {
-            return Err(Self::failure(key, f));
-        }
-        s.objects.remove(key);
-        if let Some(f) = fault {
-            return Err(Self::failure(key, f));
-        }
-        Ok(())
+        self.remove(key, None)
+    }
+
+    async fn delete_if(&self, key: &str, expected: &Version) -> Result<(), StoreError> {
+        self.round_trip(StoreOp::Delete, key).await;
+        self.remove(key, Some(expected))
     }
 }
 
