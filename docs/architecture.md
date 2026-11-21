@@ -73,8 +73,10 @@ Each ref has a branch id, drawn at random when the ref is created, and a branch 
 under a deleted branch's name gets another. The id is in the keys of the branch's log and in each
 host's state of the branch, so the new branch reads none of the old one's log, no host resumes
 the old branch's state on it, and a writer still attached to the old branch fails its next ref
-update, since the ref's bytes, and so its ETag, differ. Deleting a branch deletes its log; GC
-deletes what a delete that stopped part way left.
+update, since the ref's bytes, and so its ETag, differ. Deleting a branch deletes its ref only if
+it still has the ETag the delete read (`If-Match`, which AWS S3 honours), so a branch made
+again under the name meanwhile survives the delete, then deletes its log; GC deletes what a delete that stopped part
+way left.
 `pando advance` seals the log and moves the branch to a new writer generation whose log is
 closed: a writer still attached fails its next append or upload, and no open replays its records
 or resumes its state. [specs/README.md](../specs/README.md) describes the TLA+ specification of

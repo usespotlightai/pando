@@ -926,6 +926,7 @@ fn fail_with(up: &mut Up, e: Error) -> Arc<Error> {
     let e = match e {
         Error::Shared(e) => e,
         e @ (Error::Fenced { .. }
+        | Error::Remade { .. }
         | Error::ChunkLost { .. }
         | Error::Store(_)
         | Error::Format(_)

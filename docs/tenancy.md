@@ -59,7 +59,8 @@ prefix:
 }
 ```
 
-The conditional writes of refs (`If-Match`, `If-None-Match`) need only `s3:PutObject`.
+The conditional writes of refs (`If-Match`, `If-None-Match`) need only `s3:PutObject`; the
+conditional delete of a ref (`If-Match`) needs `s3:DeleteObject` and `s3:GetObject`.
 
 - **A role per org:** give the host that role through the `aws` or `instance` source.
 - **One role for the service:** have the control plane call `sts:AssumeRole` with the policy

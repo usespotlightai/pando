@@ -57,6 +57,8 @@ pub struct Race {
     pub deletes: usize,
     /// Records a delete deleted.
     pub deleted_records: usize,
+    /// Ref deletes that found the ref moved since the delete read it.
+    pub moved_deletes: usize,
     /// The trace as module `TraceData`, unless a call had no step in the spec.
     pub module: Option<String>,
     /// Why there is no module.
@@ -87,6 +89,7 @@ struct World {
     tracer: Arc<Tracer>,
     /// The store without a trace, for the branches an advance reads from.
     ports: Ports,
+    sim: Arc<sim::SimStore>,
     size: u64,
     advancer: Arc<TracedStore>,
     advancer_ports: Ports,
@@ -288,10 +291,26 @@ impl World {
         Ok(())
     }
 
-    /// Deletes the branch, then makes it again under its name, empty.
-    async fn delete(&mut self, at: &str) -> Result<(), String> {
+    /// Deletes the branch, then makes it again under its name, empty. With `racing`, that writer
+    /// flushes and checkpoints between the delete's read of the ref and its delete of the ref.
+    async fn delete(&mut self, racing: Option<&mut Writer>, at: &str) -> Result<(), String> {
         self.advancer.set_deleting(true);
-        let deleted = tokio::time::timeout(WAIT, branch::delete(&self.advancer_ports, BRANCH)).await;
+        let ports = self.advancer_ports.clone();
+        let deleting = tokio::time::timeout(WAIT, async move { branch::delete(&ports, BRANCH).await });
+        let deleted = match racing {
+            Some(w) => {
+                let key = keys::reference(BRANCH);
+                self.sim.hold(sim::StoreOp::Delete, &key);
+                let (deleted, ()) = futures::join!(deleting, async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    self.flush(w).await;
+                    let _ = tokio::time::timeout(WAIT / 2, w.v.checkpoint()).await;
+                    self.sim.release(sim::StoreOp::Delete, &key);
+                });
+                deleted
+            }
+            None => deleting.await,
+        };
         let made = Volume::create(&self.advancer_ports, BRANCH, self.size).await;
         self.advancer.set_deleting(false);
         match deleted {
@@ -391,6 +410,7 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
         rng: SimRng::new(seed ^ 0x7ace),
         tracer: Arc::clone(&tracer),
         ports: ports.clone(),
+        sim: Arc::clone(&store),
         size,
         advancer,
         advancer_ports,
@@ -411,7 +431,10 @@ pub async fn race(seed: u64, steps: usize) -> Result<Race, String> {
                 continue;
             }
             2 => {
-                w.delete(&format!("seed {seed} step {step} delete")).await?;
+                let i = usize_from(w.below(u64_from(hosts.len())));
+                let racing = hosts[i].open.as_mut().filter(|_| w.below(2) == 0);
+                w.delete(racing, &format!("seed {seed} step {step} delete"))
+                    .await?;
                 continue;
             }
             _ => {}
@@ -444,6 +467,7 @@ fn count(race: &mut Race, events: &[Event]) {
         if host == ADVANCER {
             race.advance_seals += usize::from(matches!(e.step, Step::CreateLog(_, _, _, Kind::Seal, true)));
             race.deleted_records += usize::from(matches!(e.step, Step::DeleteLog(..)));
+            race.moved_deletes += usize::from(matches!(e.step, Step::DeleteRef(true, false)));
             continue;
         }
         match e.step {
@@ -462,8 +486,8 @@ fn count(race: &mut Race, events: &[Event]) {
             }
             Step::CreateLog(_, _, _, Kind::Seal, true) => race.seals += 1,
             Step::CreateLog(_, _, _, Kind::Writes { .. }, false) => race.refused_appends += 1,
-            Step::DeleteGet
-            | Step::DeleteRef
+            Step::DeleteGet(_)
+            | Step::DeleteRef(..)
             | Step::CreateRef
             | Step::CreateLog(..)
             | Step::DeleteLog(..)

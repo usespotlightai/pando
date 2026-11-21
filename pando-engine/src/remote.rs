@@ -177,6 +177,18 @@ impl Remote {
         Ok(self.store.delete(&keys::reference(name)).await?)
     }
 
+    /// Deletes a ref only if it still has version `expected`; [`Error::Fenced`] when another
+    /// writer moved it or it is gone.
+    pub(crate) async fn delete_ref_if(&self, name: &str, expected: &Version) -> Result<()> {
+        match self.store.delete_if(&keys::reference(name), expected).await {
+            Ok(()) => Ok(()),
+            Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => Err(Error::Fenced {
+                branch: name.to_owned(),
+            }),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub(crate) async fn list_refs(&self) -> Result<Vec<String>> {
         let prefix = format!("{}/", keys::REFS);
         Ok(self

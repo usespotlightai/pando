@@ -45,7 +45,7 @@ pub enum StoreError {
         /// The key.
         key: String,
     },
-    /// A conditional update found another version: another writer moved the object.
+    /// A conditional update or delete found another version: another writer moved the object.
     #[error("{key}: changed by another writer")]
     PreconditionFailed {
         /// The key.
@@ -90,6 +90,10 @@ pub trait Store: Send + Sync + fmt::Debug {
     async fn list(&self, dir: &str) -> Result<Vec<ObjectInfo>, StoreError>;
     /// Deleting a missing object is not an error.
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
+    /// Deletes the object at `key` only if it still has version `expected`:
+    /// [`StoreError::PreconditionFailed`] when it has another, [`StoreError::NotFound`] when
+    /// there is none.
+    async fn delete_if(&self, key: &str, expected: &Version) -> Result<(), StoreError>;
     /// Whether the store keeps an object's earlier versions when it is replaced or deleted, so
     /// a delete can be undone. Finding out may put an empty object at [`pando_format::keys::VERSIONS`].
     async fn keeps_versions(&self) -> Result<bool, StoreError>;

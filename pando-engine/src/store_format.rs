@@ -164,6 +164,9 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<(), StoreError> {
             self.inner.delete(key).await
         }
+        async fn delete_if(&self, key: &str, expected: &Version) -> Result<(), StoreError> {
+            self.inner.delete_if(key, expected).await
+        }
         async fn keeps_versions(&self) -> Result<bool, StoreError> {
             self.inner.keeps_versions().await
         }

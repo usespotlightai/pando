@@ -90,6 +90,7 @@ fn shared(e: Error) -> Arc<Error> {
     match e {
         Error::Shared(e) => e,
         e @ (Error::Fenced { .. }
+        | Error::Remade { .. }
         | Error::ChunkLost { .. }
         | Error::Store(_)
         | Error::Format(_)

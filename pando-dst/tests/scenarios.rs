@@ -112,6 +112,7 @@ async fn racing_hosts_open_prefixes_and_keep_strict_flushes() {
         total.advance_seals += r.advance_seals;
         total.deletes += r.deletes;
         total.deleted_records += r.deleted_records;
+        total.moved_deletes += r.moved_deletes;
     }
     eprintln!("{total:?}");
     assert!(
@@ -124,6 +125,7 @@ async fn racing_hosts_open_prefixes_and_keep_strict_flushes() {
             && total.advance_seals > 0
             && total.deletes > 0
             && total.deleted_records > 0
+            && total.moved_deletes > 0
             && total.taken < total.opens,
         "{total:?}"
     );

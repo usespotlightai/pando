@@ -50,10 +50,15 @@ CloseWrites(e, p) ==
 
 Moved(e) == e.ok <=> ref' /= ref
 
+\* The deletes are alike and the trace does not name them, so a delete that
+\* starts takes the first that has not started.
+First(d) == \A c \in WL!Deletes : c < d => deleted.by[c].pc /= "ready"
+
 \* The calls of branch::advance: the read of the ref, the seal of the writer's
 \* log, and the update of the ref to the root the trace names. Those of
-\* branch::delete: the read of the ref, its delete, the list of the log and
-\* the delete of each record; then the create of the next life's ref.
+\* branch::delete: each read of the ref, each conditional delete of it, the list
+\* of the log and the delete of each record; then the create of the next life's
+\* ref.
 Advancing(e) ==
     CASE e.op = "get_ref" -> WL!AdvanceRead
       [] e.op = "get_log" ->
@@ -64,12 +69,21 @@ Advancing(e) ==
             /\ advances.pc = "seal" /\ advances.life = e.l /\ advances.gen = e.g
             /\ advances.n = e.n /\ e.kind = "seal" /\ Free(e)
             /\ WL!AdvanceSeal
-      [] e.op = "delete_get" -> WL!DeleteRead
-      [] e.op = "delete_ref" -> WL!DeleteRef
-      [] e.op = "list_log" -> WL!DeleteList
+      [] e.op = "delete_get" ->
+            \E d \in WL!Deletes :
+                /\ e.found = ref.exists
+                /\ \/ First(d) /\ WL!DeleteRead(d)
+                   \/ WL!DeleteReread(d)
+      [] e.op = "delete_ref" ->
+            \E d \in WL!Deletes :
+                /\ e.found = ref.exists
+                /\ WL!DeleteRef(d)
+                /\ e.ok = (deleted'.by[d].pc = "list")
+      [] e.op = "list_log" -> \E d \in WL!Deletes : WL!DeleteList(d)
       [] e.op = "delete_log" ->
-            /\ deleted.life = e.l
-            /\ WL!DeleteRecord(<<e.g, e.n>>)
+            \E d \in WL!Deletes :
+                /\ deleted.by[d].life = e.l
+                /\ WL!DeleteRecord(d, <<e.g, e.n>>)
       [] e.op = "create_ref" -> WL!Create
       [] e.op = "update_ref" ->
             /\ advances.pc = "put" /\ e.gen = advances.gen + 1

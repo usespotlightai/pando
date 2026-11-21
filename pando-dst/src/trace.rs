@@ -45,10 +45,11 @@ pub struct Event {
 pub enum Step {
     /// An open's read of the ref, with the mode the open logs in.
     GetRef(LogMode),
-    /// A delete's read of the ref.
-    DeleteGet,
-    /// The delete of the ref.
-    DeleteRef,
+    /// A delete's read of the ref; true when there was one.
+    DeleteGet(bool),
+    /// A delete of the ref if it still had the version the delete read: whether there was a
+    /// ref, and whether it was deleted.
+    DeleteRef(bool, bool),
     /// The create of the ref of a new life of the branch.
     CreateRef,
     /// A read of a record, and what it found.
@@ -239,7 +240,15 @@ impl Store for TracedStore {
         }
         if key == self.tracer.reference {
             if *self.deleting.lock() {
-                self.push(Step::DeleteGet);
+                let found = match &r {
+                    Ok(_) => true,
+                    Err(StoreError::NotFound { .. }) => false,
+                    Err(e) => {
+                        self.failed(key, e);
+                        false
+                    }
+                };
+                self.push(Step::DeleteGet(found));
             } else {
                 let mode = *self.mode.lock();
                 self.push(Step::GetRef(mode));
@@ -347,16 +356,37 @@ impl Store for TracedStore {
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         let r = self.inner.delete(key).await;
         if key == self.tracer.reference {
-            if *self.deleting.lock() && r.is_ok() {
-                self.push(Step::DeleteRef);
-            } else {
-                self.tracer
-                    .refuse(format!("{key}: a delete of the ref outside a delete"));
-            }
+            self.tracer
+                .refuse(format!("{key}: an unconditional delete of the ref"));
         }
         if let Some((l, g, n)) = self.tracer.record(key) {
             self.push(Step::DeleteLog(l, g, n));
         }
+        r
+    }
+
+    async fn delete_if(&self, key: &str, expected: &Version) -> Result<(), StoreError> {
+        let r = self.inner.delete_if(key, expected).await;
+        if key != self.tracer.reference {
+            self.tracer
+                .refuse(format!("{key}: a conditional delete of a key other than the ref"));
+            return r;
+        }
+        if !*self.deleting.lock() {
+            self.tracer
+                .refuse(format!("{key}: a delete of the ref outside a delete"));
+            return r;
+        }
+        let (found, ok) = match &r {
+            Ok(()) => (true, true),
+            Err(StoreError::PreconditionFailed { .. }) => (true, false),
+            Err(StoreError::NotFound { .. }) => (false, false),
+            Err(e) => {
+                self.failed(key, e);
+                (false, false)
+            }
+        };
+        self.push(Step::DeleteRef(found, ok));
         r
     }
 }
@@ -373,7 +403,8 @@ struct Row<'a> {
     l: u64,
     g: u64,
     n: u64,
-    found: Option<Kind>,
+    found: bool,
+    kind: Option<Kind>,
     ok: bool,
     generation: u64,
     log: LogPos,
@@ -392,21 +423,30 @@ impl<'a> Row<'a> {
                 },
                 ..op("get_ref")
             },
-            Step::DeleteGet => op("delete_get"),
-            Step::DeleteRef => op("delete_ref"),
+            Step::DeleteGet(found) => Row {
+                found,
+                ..op("delete_get")
+            },
+            Step::DeleteRef(found, ok) => Row {
+                found,
+                ok,
+                ..op("delete_ref")
+            },
             Step::CreateRef => op("create_ref"),
-            Step::GetLog(l, g, n, found) => Row {
+            Step::GetLog(l, g, n, kind) => Row {
                 l,
                 g,
                 n,
-                found,
+                found: kind.is_some(),
+                kind,
                 ..op("get_log")
             },
             Step::CreateLog(l, g, n, kind, ok) => Row {
                 l,
                 g,
                 n,
-                found: Some(kind),
+                found: true,
+                kind: Some(kind),
                 ok,
                 ..op("create_log")
             },
@@ -432,10 +472,10 @@ impl<'a> Row<'a> {
     }
 
     fn tla(&self, host: &str) -> String {
-        let (found, kind, from, to) = match self.found {
-            None => (false, "none", 0, 0),
-            Some(Kind::Seal) => (true, "seal", 0, 0),
-            Some(Kind::Writes { from, to }) => (true, "writes", from, to),
+        let (kind, from, to) = match self.kind {
+            None => ("none", 0, 0),
+            Some(Kind::Seal) => ("seal", 0, 0),
+            Some(Kind::Writes { from, to }) => ("writes", from, to),
         };
         let root: Vec<String> = self.root.iter().map(u64::to_string).collect();
         format!(
@@ -447,7 +487,7 @@ impl<'a> Row<'a> {
             self.l,
             self.g,
             self.n,
-            tla_bool(found),
+            tla_bool(self.found),
             tla_bool(self.ok),
             self.generation,
             self.log.generation,

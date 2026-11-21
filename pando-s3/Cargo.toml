@@ -12,6 +12,7 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono = { workspace = true, features = ["std"] }
 futures.workspace = true
+http.workspace = true
 object_store = { workspace = true, features = ["aws"] }
 pando-engine.workspace = true
 pando-format.workspace = true
