@@ -8,8 +8,8 @@
 # Each version lives in /usr/local/lib/pando/VERSION. /usr/local/bin/pando is a link to the
 # current one, replaced in one rename: a running daemon keeps the binary it started with, and
 # every process started after the rename runs the new one. Installs the release's systemd
-# units, pando-attach@.service and pando-gc.service with pando-gc.timer, which stays off until
-# enabled, and creates /etc/pando/attach, mode 0700.
+# units, pando-attach@.service and pando-gc@.service with pando-gc@.timer, which stays off until
+# enabled for a store, and creates /etc/pando/attach and /etc/pando/gc, mode 0700.
 # --restart then restarts each running pando-attach@ unit, one at a time: its daemon drains and
 # the new binary takes its device over. It stops at the first unit that fails to come back, and
 # fails when systemd is not running.
@@ -87,7 +87,7 @@ if [[ ! -x ${dir}/pando ]]; then
 fi
 
 running=$("${dir}/pando" --version)
-install -d -m 0700 /etc/pando /etc/pando/attach
+install -d -m 0700 /etc/pando /etc/pando/attach /etc/pando/gc
 for f in "${dir}"/*.service "${dir}"/*.timer; do
 	[[ -e ${f} ]] || continue
 	unit=/etc/systemd/system/${f##*/}

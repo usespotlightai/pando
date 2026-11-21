@@ -38,8 +38,8 @@ stage=$(mktemp -d)
 trap 'rm -rf "${stage}"' EXIT
 mkdir "${stage}/${name}"
 install -m 0755 "${binary}" "${stage}/${name}/pando"
-install -m 0644 "${here}/systemd/pando-attach@.service" "${here}/systemd/pando-gc.service" \
-	"${here}/systemd/pando-gc.timer" "${stage}/${name}/"
+install -m 0644 "${here}/systemd/pando-attach@.service" "${here}/systemd/pando-gc@.service" \
+	"${here}/systemd/pando-gc@.timer" "${stage}/${name}/"
 mkdir -p "${out}"
 tar -C "${stage}" --sort=name --mtime=@"${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
 	-cf - "${name}" | gzip -n -9 >"${out}/${name}.tar.gz"

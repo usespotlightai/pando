@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily Pando GC of the store
+Description=Daily Pando GC of the store %i
 Documentation=https://github.com/usespotlightai/pando/blob/main/docs/hosts.md
 
 [Timer]
