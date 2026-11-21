@@ -2,9 +2,9 @@ name: kernel
 
 # The tests that need a Linux kernel with ublk, device-mapper and loop devices, in a privileged
 # container (tests/kernel). fio verify, the crash checks, discard, drain, the store outage, a
-# full local disk, the FUSE frontend and the daemon's memory in a small cgroup run on every
-# push to main; the
-# dm-log-writes tests run each night. xfstests has its own workflow, xfstests.yml. The FUSE
+# full local disk, the cache budget, GC and its restore on a versioned bucket, the FUSE frontend
+# and the daemon's memory in a small cgroup run on every push to main; the dm-log-writes tests
+# run each night. xfstests has its own workflow, xfstests.yml. The FUSE
 # frontend and the memory test also run on an aarch64 runner, the architecture of AgentCore
 # Runtime, whose kernels offer FUSE and loop devices but not ublk.
 # The systemd test also runs on every push: on the runner itself, it installs pando with
@@ -23,7 +23,7 @@ on:
       tests:
         description: "Tests to run, from tests/kernel, or systemd"
         type: string
-        default: "fio-verify crash discard drain outage diskfull budget fuse memory cli systemd"
+        default: "fio-verify crash discard drain outage diskfull budget gc fuse memory cli systemd"
       asan:
         description: "Build pando with AddressSanitizer"
         type: boolean
@@ -58,7 +58,7 @@ jobs:
           case $EVENT in
             schedule) tests="log-writes" ;;
             workflow_dispatch) tests=$ASKED ;;
-            *) tests="fio-verify crash discard drain outage diskfull budget fuse memory cli systemd" ;;
+            *) tests="fio-verify crash discard drain outage diskfull budget gc fuse memory cli systemd" ;;
           esac
           case $tests in *[!a-z0-9\ -]*) echo "tests: names from tests/kernel, or systemd" >&2; exit 2 ;; esac
           inside=

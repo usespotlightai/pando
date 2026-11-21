@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packs a release archive of pando: the binary and the systemd unit, in a directory named after
+# Packs a release archive of pando: the binary and the systemd units, in a directory named after
 # the archive. The same inputs give the same bytes.
 #   packaging/package.sh VERSION ARCH BINARY OUTDIR
 # Writes OUTDIR/pando-VERSION-ARCH-linux.tar.gz. ARCH is x86_64 or aarch64 and must be the
@@ -38,7 +38,8 @@ stage=$(mktemp -d)
 trap 'rm -rf "${stage}"' EXIT
 mkdir "${stage}/${name}"
 install -m 0755 "${binary}" "${stage}/${name}/pando"
-install -m 0644 "${here}/systemd/pando-attach@.service" "${stage}/${name}/"
+install -m 0644 "${here}/systemd/pando-attach@.service" "${here}/systemd/pando-gc.service" \
+	"${here}/systemd/pando-gc.timer" "${stage}/${name}/"
 mkdir -p "${out}"
 tar -C "${stage}" --sort=name --mtime=@"${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
 	-cf - "${name}" | gzip -n -9 >"${out}/${name}.tar.gz"

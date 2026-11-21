@@ -33,7 +33,11 @@ use tokio::sync::{OnceCell, watch};
 const DEFAULT_CACHE: &str = "/data/cache";
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Branchable copy-on-write block devices on object storage")]
+#[command(
+    version,
+    about = "Branchable copy-on-write block devices on object storage",
+    args_override_self = true
+)]
 struct Cli {
     #[command(flatten)]
     store: config::StoreArgs,
@@ -140,6 +144,10 @@ enum Command {
         /// Mark again after this long; branch copies must finish within it.
         #[arg(long, value_parser = parse_duration, default_value = "30s")]
         validate: Duration,
+        /// Delete even from a store that keeps no earlier versions of what it deletes, so no
+        /// delete can be undone. Without it, `--delete` refuses such a store.
+        #[arg(long, requires = "delete")]
+        unversioned: bool,
     },
     /// Shows what the store holds.
     Stat,
@@ -610,7 +618,11 @@ pub(crate) async fn run(host: &Host, command: Command, out: &Out) -> Result<()> 
             delete,
             keep_young,
             validate,
+            unversioned,
         } => {
+            if delete && !unversioned {
+                versions_kept(ports.store.as_ref()).await?;
+            }
             let opts = GcOptions {
                 delete,
                 keep_young,
@@ -786,6 +798,21 @@ async fn checkpoints(ports: &Ports, out: &Out) -> Result<()> {
     Ok(())
 }
 
+/// Fails unless `store` keeps the earlier versions of what GC deletes.
+async fn versions_kept(store: &dyn pando_engine::ports::Store) -> Result<()> {
+    if !store
+        .keeps_versions()
+        .await
+        .context("finding out whether the store keeps earlier versions, which needs write access")?
+    {
+        bail!(
+            "the store keeps no earlier versions, so a wrong delete could not be undone: turn on \
+             versioning for the bucket (docs/hosts.md), or pass --unversioned"
+        );
+    }
+    Ok(())
+}
+
 async fn collect(ports: &Ports, cache: &Arc<Cache>, opts: &GcOptions, out: &Out) -> Result<()> {
     let r = gc::collect(cache, ports.clock.as_ref(), opts).await?;
     let human = format!(
@@ -847,6 +874,19 @@ async fn refs(ports: &Ports, out: &Out) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gc_deletes_only_from_a_store_that_keeps_versions() {
+        let s = pando_engine::sim::SimStore::new(Arc::new(pando_engine::sim::SimClock::new()));
+        let e = versions_kept(&s).await.unwrap_err();
+        assert!(e.to_string().contains("--unversioned"), "{e}");
+        s.set_versioned(true);
+        versions_kept(&s).await.unwrap();
+        assert!(Cli::try_parse_from(["pando", "gc", "--unversioned"]).is_err());
+        let cli = Cli::try_parse_from(["pando", "--cache", "/a", "--cache", "/b", "gc"]).unwrap();
+        assert_eq!(cli.cache.as_deref(), Some(Path::new("/b")), "a later flag wins");
+        assert!(Cli::try_parse_from(["pando", "gc", "--delete", "--unversioned"]).is_ok());
+    }
 
     #[test]
     fn relative_paths_resolve_against_the_client_directory() {

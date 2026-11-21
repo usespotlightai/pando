@@ -7,12 +7,13 @@
 # kept, as after a reboot, then reads every block back. Each segment then cycles until
 # SOAK_SECONDS: a checked read of the read region, random reads, and a checked rewrite of the
 # write region, while it samples the log's disk every 10 s. It ends with a drain (SIGTERM) and
-# `gc --delete`, so the store stays bounded. With SOAK_LAST, the segment detaches instead, a
-# fresh host reads the branch whole, and the log's disk over the whole run is checked: from 30 s
-# after each attach, within twice the budget and the write region (the log passes the budget by
-# what one sweep's reads fetch, and by writes not uploaded yet), and no higher in the last
-# segment than in the first, each over its second half, once the first has an hour of samples;
-# nor the daemon's memory. SOAK_SECONDS counts from after the attach and the read-back.
+# `gc --delete --unversioned`, so the store stays bounded: a versioned bucket would keep every
+# rewrite. With SOAK_LAST, the segment detaches instead, a fresh host reads the branch whole,
+# and the log's disk over the whole run is checked: from 30 s after each attach, within twice
+# the budget and the write region (the log passes the budget by what one sweep's reads fetch,
+# and by writes not uploaded yet), and no higher in the last segment than in the first, each
+# over its second half, once the first has an hour of samples; nor the daemon's memory.
+# SOAK_SECONDS counts from after the attach and the read-back.
 #   SOAK_PHASE=start|resume  SOAK_SECONDS=17400  SOAK_SEGMENT=1  SOAK_LAST=1
 # ublk ids 77-78.
 TEST=soak
@@ -179,7 +180,7 @@ if [[ -z ${SOAK_LAST:-} ]]; then
 		check "drain" "still running after 180 s"
 	fi
 	pid=
-	if pando "$W/gc-cache" gc --delete --keep-young 10m --validate 5s >"$W/gc.out" 2>&1; then
+	if pando "$W/gc-cache" gc --delete --unversioned --keep-young 10m --validate 5s >"$W/gc.out" 2>&1; then
 		check "gc" "ok, $(tail -1 "$W/gc.out" || true)"
 	else
 		check "gc" "$(tail -1 "$W/gc.out" || true)"

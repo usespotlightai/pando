@@ -1239,6 +1239,7 @@ dependencies = [
  "futures",
  "object_store",
  "pando-engine",
+ "pando-format",
  "parking_lot 0.13.0",
  "serde_json",
  "tempfile",

@@ -25,6 +25,7 @@ use object_store::{
     PutOptions, PutPayload, UpdateVersion,
 };
 use pando_engine::ports::{Object, ObjectInfo, Store, StoreError, Version};
+use pando_format::keys;
 use tokio::sync::{OnceCell, oneshot};
 
 /// The longest one request may take. A segment PUT shares the uplink with the other PUTs in
@@ -317,6 +318,12 @@ impl S3Store {
             .map_err(|e| map_err(key, e))?;
         Ok(Version(r.e_tag.unwrap_or_default()))
     }
+}
+
+/// Whether `id`, a version ID the store answered with, names a version it keeps: a store with
+/// versioning suspended answers `null`.
+fn names_a_version(id: &str) -> bool {
+    !id.is_empty() && id != "null"
 }
 
 /// The key of [`Credentials::File`], read again when the file changes.
@@ -669,6 +676,22 @@ impl Store for S3Store {
             Err(e) => Err(map_err(key, e)),
         }
     }
+
+    async fn keeps_versions(&self) -> Result<bool, StoreError> {
+        let key = keys::VERSIONS;
+        let path = self.path(key);
+        let client = self.inner.get(key).await?;
+        match client.head(&path).await {
+            Ok(m) if m.version.as_deref().is_some_and(names_a_version) => return Ok(true),
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(map_err(key, e)),
+        }
+        let r = client
+            .put(&path, PutPayload::new())
+            .await
+            .map_err(|e| map_err(key, e))?;
+        Ok(r.version.as_deref().is_some_and(names_a_version))
+    }
 }
 
 #[cfg(test)]
@@ -680,7 +703,7 @@ mod tests {
 
     use super::*;
 
-    async fn answer(mut c: TcpStream, status: &str, body: &str) {
+    async fn answer(mut c: TcpStream, status: &str, headers: &str, body: &str) {
         let mut req = Vec::new();
         let mut buf = [0; 4096];
         let head_end = loop {
@@ -702,7 +725,7 @@ mod tests {
             req.extend_from_slice(&buf[..n]);
         }
         let reply = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
         if c.write_all(reply.as_bytes()).await.is_ok() {
@@ -711,6 +734,14 @@ mod tests {
     }
 
     async fn answering(status: &'static str, body: &'static str) -> (S3Store, Arc<AtomicUsize>) {
+        answering_with(status, "", body).await
+    }
+
+    async fn answering_with(
+        status: &'static str,
+        headers: &'static str,
+        body: &'static str,
+    ) -> (S3Store, Arc<AtomicUsize>) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let seen = Arc::new(AtomicUsize::new(0));
@@ -719,7 +750,7 @@ mod tests {
             loop {
                 let (c, _) = l.accept().await.unwrap();
                 n.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(answer(c, status, body));
+                tokio::spawn(answer(c, status, headers, body));
             }
         });
         let s = S3Store::new(&S3Config {
@@ -768,6 +799,29 @@ mod tests {
             "{} bytes",
             e.to_string().len()
         );
+    }
+
+    #[tokio::test]
+    async fn a_version_id_means_the_store_keeps_versions() {
+        const MODIFIED: &str = "last-modified: Wed, 21 Oct 2026 07:28:00 GMT\r\netag: \"e\"\r\n";
+        let (s, seen) = answering_with(
+            "200 OK",
+            "last-modified: Wed, 21 Oct 2026 07:28:00 GMT\r\netag: \"e\"\r\nx-amz-version-id: 3HL4kqtJ\r\n",
+            "",
+        )
+        .await;
+        assert!(s.keeps_versions().await.unwrap());
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a versioned marker needs no put");
+        let (s, seen) = answering_with(
+            "200 OK",
+            "last-modified: Wed, 21 Oct 2026 07:28:00 GMT\r\netag: \"e\"\r\nx-amz-version-id: null\r\n",
+            "",
+        )
+        .await;
+        assert!(!s.keeps_versions().await.unwrap());
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        let (s, _) = answering_with("200 OK", MODIFIED, "").await;
+        assert!(!s.keeps_versions().await.unwrap());
     }
 
     #[tokio::test]

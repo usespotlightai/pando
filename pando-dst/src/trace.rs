@@ -288,6 +288,10 @@ impl Store for TracedStore {
         r
     }
 
+    async fn keeps_versions(&self) -> Result<bool, StoreError> {
+        self.inner.keeps_versions().await
+    }
+
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         let r = self.inner.delete(key).await;
         if key == self.tracer.reference {
