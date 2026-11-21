@@ -116,7 +116,7 @@ if ! serve "$W/cache-o" "$log" "$A"; then
 fi
 if readback "$A" 0 1 "$W/data" 0; then check "read before the outage" ok; else check "read before the outage" "differs"; fi
 st=$("$PANDO" status --device "$A" 2>&1 || true)
-if [[ $st == "$A"$'\t'o$'\t'*$'\t'serving ]]; then check "status before the outage" ok; else check "status before the outage" "$st"; fi
+if [[ $st == "$A"$'\t'o$'\t'*$'\t'serving || $st == "$A"$'\t'o$'\t'*$'\t'serving$'\t'* ]]; then check "status before the outage" ok; else check "status before the outage" "$st"; fi
 
 mark "pando outage: SIGSTOP"
 sleep 1
