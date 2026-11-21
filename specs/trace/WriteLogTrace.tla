@@ -5,7 +5,9 @@
 (* the branch's ref and log is one step of the spec, with the same host,   *)
 (* record numbers, flush numbers, log position and outcome, and so is each *)
 (* flush a writer committed; the advancer's calls are the steps of an      *)
-(* advance. The steps no call shows (the replay, the start of a record or  *)
+(* advance, or of a delete and the create of the branch's next life.       *)
+(* Records are named by their life, numbered as the spec numbers them.     *)
+(* The steps no call shows (the replay, the start of a record or           *)
 (* an upload, the stop of a log) happen between them wherever the spec     *)
 (* allows.                                                                 *)
 (*                                                                         *)
@@ -16,13 +18,13 @@
 (***************************************************************************)
 EXTENDS TraceData, Naturals, Sequences, TLC
 
-VARIABLES ref, store, disk, proc, nextId, opens, advances, acked, histories, i
+VARIABLES ref, store, disk, proc, nextId, opens, advances, acked, histories, deleted, i
 
-vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, i>>
+vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, deleted, i>>
 
 WL == INSTANCE WriteLog WITH Hosts <- TraceHosts, Modes <- {"behind", "strict"},
                              MaxWrites <- TraceWrites, MaxOpens <- TraceOpens,
-                             MaxAdvances <- TraceAdvances, Depth <- 0
+                             MaxAdvances <- TraceAdvances, MaxDeletes <- TraceDeletes, Depth <- 0
 
 Init == WL!Init /\ i = 0
 
@@ -30,10 +32,12 @@ LogIs(e, pos) == pos = WL!Pos(e.lgen, e.lflush, e.lnext, e.lclosed)
 
 Found(e) ==
     IF e.found
-    THEN \E r \in WL!At(e.g, e.n) :
+    THEN \E r \in WL!At(e.l, e.g, e.n) :
             /\ r.kind = e.kind
             /\ e.kind = "writes" => r.from = e.from /\ r.to = e.to
-    ELSE WL!At(e.g, e.n) = {}
+    ELSE WL!At(e.l, e.g, e.n) = {}
+
+Free(e) == e.ok <=> WL!At(e.l, e.g, e.n) = {}
 
 \* The ref each kind of conditional PUT writes.
 TakeWrites(e, p) == p.pc = "take" /\ e.gen = p.gen /\ LogIs(e, p.start)
@@ -47,16 +51,26 @@ CloseWrites(e, p) ==
 Moved(e) == e.ok <=> ref' /= ref
 
 \* The calls of branch::advance: the read of the ref, the seal of the writer's
-\* log, and the update of the ref to the root the trace names.
+\* log, and the update of the ref to the root the trace names. Those of
+\* branch::delete: the read of the ref, its delete, the list of the log and
+\* the delete of each record; then the create of the next life's ref.
 Advancing(e) ==
     CASE e.op = "get_ref" -> WL!AdvanceRead
       [] e.op = "get_log" ->
-            /\ advances.pc = "scan" /\ advances.gen = e.g /\ advances.n = e.n /\ Found(e)
+            /\ advances.pc = "scan" /\ advances.life = e.l /\ advances.gen = e.g
+            /\ advances.n = e.n /\ Found(e)
             /\ WL!AdvanceScan
       [] e.op = "create_log" ->
-            /\ advances.pc = "seal" /\ advances.gen = e.g /\ advances.n = e.n
-            /\ e.kind = "seal" /\ (e.ok <=> WL!At(e.g, e.n) = {})
+            /\ advances.pc = "seal" /\ advances.life = e.l /\ advances.gen = e.g
+            /\ advances.n = e.n /\ e.kind = "seal" /\ Free(e)
             /\ WL!AdvanceSeal
+      [] e.op = "delete_get" -> WL!DeleteRead
+      [] e.op = "delete_ref" -> WL!DeleteRef
+      [] e.op = "list_log" -> WL!DeleteList
+      [] e.op = "delete_log" ->
+            /\ deleted.life = e.l
+            /\ WL!DeleteRecord(<<e.g, e.n>>)
+      [] e.op = "create_ref" -> WL!Create
       [] e.op = "update_ref" ->
             /\ advances.pc = "put" /\ e.gen = advances.gen + 1
             /\ LogIs(e, WL!Pos(advances.gen + 1, 0, 0, TRUE))
@@ -69,24 +83,24 @@ Observe(e) ==
     IN CASE e.host = TraceAdvancer -> Advancing(e)
          [] e.op = "get_ref" -> WL!Open(h, e.mode)
          [] e.op = "get_log" ->
-                /\ p.pc = "scan" /\ p.g = e.g /\ p.n = e.n /\ Found(e)
+                /\ p.pc = "scan" /\ p.life = e.l /\ p.g = e.g /\ p.n = e.n /\ Found(e)
                 /\ WL!ScanRead(h)
          [] e.op = "create_log" /\ e.kind = "seal" ->
-                /\ p.pc = "seal" /\ p.g = e.g /\ p.n = e.n
-                /\ e.ok <=> WL!At(e.g, e.n) = {}
+                /\ p.pc = "seal" /\ p.life = e.l /\ p.g = e.g /\ p.n = e.n /\ Free(e)
                 /\ WL!ScanSeal(h)
          [] e.op = "create_log" ->
-                /\ p.pc = "run" /\ p.shipping /\ ~p.refused
+                /\ p.pc = "run" /\ p.shipping /\ ~p.refused /\ p.life = e.l
                 /\ p.gen = e.g /\ p.shipN = e.n /\ p.shipFrom = e.from /\ p.shipTo = e.to
-                /\ e.ok <=> WL!At(e.g, e.n) = {}
+                /\ Free(e)
                 /\ WL!ShipCreate(h)
          [] e.op = "update_ref" ->
                 \/ TakeWrites(e, p) /\ WL!Take(h) /\ Moved(e)
                 \/ UploadWrites(e, p) /\ WL!UploadPut(h) /\ Moved(e)
                 \/ CloseWrites(e, p) /\ WL!ClosePut(h) /\ Moved(e)
          [] e.op = "delete_log" ->
-                \/ p.gen = e.g /\ WL!TrimOwn(h, e.n)
-                \/ WL!TrimDeleteOlder(h, <<e.g, e.n>>)
+                /\ p.life = e.l
+                /\ \/ p.gen = e.g /\ WL!TrimOwn(h, e.n)
+                   \/ WL!TrimDeleteOlder(h, <<e.g, e.n>>)
          [] e.op = "list_log" -> WL!TrimListOlder(h)
          [] e.op = "write" -> \E kept \in BOOLEAN : WL!Write(h, kept)
          [] e.op = "flush" -> WL!Commit(h, TRUE, TRUE)

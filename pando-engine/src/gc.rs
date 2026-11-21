@@ -1,5 +1,6 @@
 //! Garbage collection: deletes segments no branch or checkpoint reaches, change lists no branch
-//! or checkpoint reads, and the write logs of deleted branches.
+//! or checkpoint reads, and the write logs of deleted branches and of earlier lives of branches
+//! made again under their name.
 //!
 //! A segment nothing reaches is a fenced writer's leftover when its writer generation is older
 //! than its branch's current one, or its branch is gone. It is kept while its writer is still
@@ -12,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pando_format::{CHUNK_SIZE, Entry, Hash, SegId, WriterId};
+use pando_format::{BranchId, CHUNK_SIZE, Entry, Hash, SegId, WriterId};
 
 use crate::cache::Cache;
 use crate::dedup::learned;
@@ -69,7 +70,8 @@ pub struct GcReport {
     pub revived: usize,
     /// Change lists whose root no branch holds, older than [`GcOptions::keep_young`].
     pub stale_change_lists: usize,
-    /// Write log records of branches that no longer exist.
+    /// Write log records of branch lives that no longer exist: deleted branches, and earlier
+    /// lives of branches made again under a deleted name.
     pub stale_log_records: usize,
     /// Whether the dead segments and stale change lists were deleted.
     pub deleted: bool,
@@ -182,10 +184,10 @@ pub async fn collect(cache: &Arc<Cache>, clock: &dyn Clock, opts: &GcOptions) ->
     let mut current: HashMap<[u8; 8], u32> = HashMap::new();
     let mut roots: HashSet<Hash> = HashSet::new();
     let logs = remote.list_all_logs().await?;
-    let mut names: HashSet<Hash> = HashSet::new();
+    let mut lives: HashSet<(Hash, BranchId)> = HashSet::new();
     for name in remote.list_refs().await? {
-        names.insert(Hash::of(name.as_bytes()));
         if let Some((r, _)) = remote.get_ref(&name).await? {
+            lives.insert((Hash::of(name.as_bytes()), r.id));
             current.insert(
                 WriterId::new(&name, 0).branch,
                 WriterId::new(&name, r.generation).generation,
@@ -252,8 +254,8 @@ pub async fn collect(cache: &Arc<Cache>, clock: &dyn Clock, opts: &GcOptions) ->
             remote.delete_change_list(l.root, l.from).await?;
         }
     }
-    for (key, branch, modified) in logs {
-        if names.contains(&branch) || young(modified) {
+    for (key, branch, id, modified) in logs {
+        if lives.contains(&(branch, id)) || young(modified) {
             continue;
         }
         report.stale_log_records += 1;
@@ -428,14 +430,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_log_of_a_deleted_branch_goes() {
+    async fn the_log_of_a_deleted_branch_or_of_an_earlier_life_goes() {
         let (ports, _, _) = sim::ports(4);
         Volume::create(&ports, "main", 1 << 20).await.unwrap();
         Volume::create(&ports, "gone", 1 << 20).await.unwrap();
         let c = host(&ports, "/c").await;
         let seal = |n| bytes::Bytes::from(pando_format::LogRecord::encode_seal(1, n));
-        for name in ["main", "gone"] {
-            c.remote().create_log_record(name, 1, 0, seal(0)).await.unwrap();
+        let remote = c.remote();
+        let main = remote.get_ref("main").await.unwrap().unwrap().0.id;
+        let gone = remote.get_ref("gone").await.unwrap().unwrap().0.id;
+        let earlier = BranchId::from_parts(1, 2);
+        for (name, id) in [("main", main), ("gone", gone), ("main", earlier)] {
+            c.remote()
+                .create_log_record(name, id, 1, 0, seal(0))
+                .await
+                .unwrap();
         }
         c.remote().delete_ref("gone").await.unwrap();
         tokio::time::sleep(Duration::from_hours(25)).await;
@@ -449,16 +458,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(r.stale_log_records, 1);
-        let main: Vec<_> = c
+        assert_eq!(r.stale_log_records, 2);
+        let kept: Vec<_> = c
             .remote()
-            .list_log("main")
+            .list_log("main", main)
             .await
             .unwrap()
             .into_iter()
             .map(|(g, n, _)| (g, n))
             .collect();
-        assert_eq!(main, [(1, 0)]);
-        assert_eq!(c.remote().list_log("gone").await.unwrap(), []);
+        assert_eq!(kept, [(1, 0)]);
+        assert_eq!(c.remote().list_log("main", earlier).await.unwrap(), []);
+        assert_eq!(c.remote().list_log("gone", gone).await.unwrap(), []);
     }
 }

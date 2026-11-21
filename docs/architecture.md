@@ -45,8 +45,8 @@ A flush commits locally first: the chunks go to the cache log, one sync, then th
 recorded. Two background tasks then take it to the store:
 
 - The **shipper** merges the flushes that wait into one record of the branch's write log and
-  creates it at `log/<hash of the branch name>/<writer generation>/<n>`. Records are numbered
-  from 0 without gaps, and a create fails when the number is taken.
+  creates it at `log/<hash of the branch name>/<branch id>/<writer generation>/<n>`. Records
+  are numbered from 0 without gaps, and a create fails when the number is taken.
 - The **uploader** packs pending chunks and tree nodes into segments and moves the ref. The ref's
   `log` line says which records its root covers; the shipper then deletes them.
 
@@ -69,7 +69,12 @@ the next open then reads no records. An open that resumes this host's own state 
 nothing: a lock on that state means the process that wrote it has stopped. When that state is
 ahead of the ref, the new writer logs no flush until an upload has published it, since an open
 elsewhere would apply the records to the ref's root, without the flushes the writer resumed.
-Deleting a branch deletes its log, so a branch made later under the same name starts with none.
+Each ref has a branch id, drawn at random when the ref is created, and a branch made later
+under a deleted branch's name gets another. The id is in the keys of the branch's log and in each
+host's state of the branch, so the new branch reads none of the old one's log, no host resumes
+the old branch's state on it, and a writer still attached to the old branch fails its next ref
+update, since the ref's bytes, and so its ETag, differ. Deleting a branch deletes its log; GC
+deletes what a delete that stopped part way left.
 `pando advance` seals the log and moves the branch to a new writer generation whose log is
 closed: a writer still attached fails its next append or upload, and no open replays its records
 or resumes its state. [specs/README.md](../specs/README.md) describes the TLA+ specification of

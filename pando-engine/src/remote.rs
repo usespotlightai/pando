@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use pando_format::{Checkpoint, Hash, Recording, Ref, SegId, SegmentIndex, keys, u64_from};
+use pando_format::{BranchId, Checkpoint, Hash, Recording, Ref, SegId, SegmentIndex, keys, u64_from};
 
-use crate::ports::{Store, StoreError, Version};
+use crate::ports::{Rng, Store, StoreError, Version};
 use crate::{Error, Result};
 
 /// Counts of the store requests one [`Remote`] made since it was opened.
@@ -152,8 +152,13 @@ impl Remote {
         }
     }
 
-    /// Creates a ref; [`Error::RefExists`] when there is one.
-    pub(crate) async fn create_ref(&self, name: &str, r: &Ref) -> Result<Version> {
+    /// Creates ref `r` as a new life of branch `name`, with an id drawn from `rng` in place of
+    /// its own; [`Error::RefExists`] when there is one.
+    pub(crate) async fn create_ref(&self, rng: &dyn Rng, name: &str, r: &Ref) -> Result<Version> {
+        let r = Ref {
+            id: new_branch_id(rng),
+            ..r.clone()
+        };
         let body = Bytes::from(r.encode());
         let n = body.len();
         match self.store.create(&keys::reference(name), body).await {
@@ -222,9 +227,16 @@ impl Remote {
             .collect())
     }
 
-    /// The bytes of record `n` of writer `generation` in branch `name`'s write log, or `None`.
-    pub(crate) async fn get_log_record(&self, name: &str, generation: u64, n: u64) -> Result<Option<Bytes>> {
-        match self.store.get(&keys::log_record(name, generation, n)).await {
+    /// The bytes of record `n` of writer `generation` in the write log of life `id` of branch
+    /// `name`, or `None`.
+    pub(crate) async fn get_log_record(
+        &self,
+        name: &str,
+        id: BranchId,
+        generation: u64,
+        n: u64,
+    ) -> Result<Option<Bytes>> {
+        match self.store.get(&keys::log_record(name, id, generation, n)).await {
             Ok(o) => {
                 self.got(o.body.len());
                 Ok(Some(o.body))
@@ -240,6 +252,7 @@ impl Remote {
     pub(crate) async fn create_log_record(
         &self,
         name: &str,
+        id: BranchId,
         generation: u64,
         n: u64,
         body: Bytes,
@@ -247,7 +260,7 @@ impl Remote {
         let len = body.len();
         match self
             .store
-            .create(&keys::log_record(name, generation, n), body.clone())
+            .create(&keys::log_record(name, id, generation, n), body.clone())
             .await
         {
             Ok(_) => {
@@ -255,24 +268,36 @@ impl Remote {
                 Ok(true)
             }
             Err(StoreError::AlreadyExists { .. }) => Ok(self
-                .get_log_record(name, generation, n)
+                .get_log_record(name, id, generation, n)
                 .await?
                 .is_some_and(|now| now == body)),
-            Err(e @ StoreError::Transient { .. }) => match self.get_log_record(name, generation, n).await {
-                Ok(Some(now)) if now == body => Ok(true),
-                _ => Err(e.into()),
-            },
+            Err(e @ StoreError::Transient { .. }) => {
+                match self.get_log_record(name, id, generation, n).await {
+                    Ok(Some(now)) if now == body => Ok(true),
+                    _ => Err(e.into()),
+                }
+            }
             Err(e) => Err(e.into()),
         }
     }
 
-    pub(crate) async fn delete_log_record(&self, name: &str, generation: u64, n: u64) -> Result<()> {
-        Ok(self.store.delete(&keys::log_record(name, generation, n)).await?)
+    pub(crate) async fn delete_log_record(
+        &self,
+        name: &str,
+        id: BranchId,
+        generation: u64,
+        n: u64,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .delete(&keys::log_record(name, id, generation, n))
+            .await?)
     }
 
-    /// The generation, number and size of every record in branch `name`'s write log.
-    pub(crate) async fn list_log(&self, name: &str) -> Result<Vec<(u64, u64, u64)>> {
-        let dir = keys::log_branch(name);
+    /// The generation, number and size of every record in the write log of life `id` of branch
+    /// `name`.
+    pub(crate) async fn list_log(&self, name: &str, id: BranchId) -> Result<Vec<(u64, u64, u64)>> {
+        let dir = keys::log_branch(name, id);
         let prefix = format!("{dir}/");
         Ok(self
             .store
@@ -287,8 +312,8 @@ impl Remote {
     }
 
     /// Every write log record in the store: the key and its upload time, with the hash of its
-    /// branch's name.
-    pub(crate) async fn list_all_logs(&self) -> Result<Vec<(String, Hash, SystemTime)>> {
+    /// branch's name and its branch's life.
+    pub(crate) async fn list_all_logs(&self) -> Result<Vec<(String, Hash, BranchId, SystemTime)>> {
         let prefix = format!("{}/", keys::LOG);
         Ok(self
             .store
@@ -296,9 +321,8 @@ impl Remote {
             .await?
             .into_iter()
             .filter_map(|o| {
-                let (branch, rest) = o.key.strip_prefix(&prefix)?.split_once('/')?;
-                keys::parse_log_record(rest)?;
-                Some((o.key.clone(), branch.parse().ok()?, o.modified))
+                let (branch, id, _, _) = keys::parse_log_key(o.key.strip_prefix(&prefix)?)?;
+                Some((o.key.clone(), branch, id, o.modified))
             })
             .collect())
     }
@@ -401,5 +425,15 @@ impl Remote {
 
     pub(crate) async fn delete_change_list(&self, root: Hash, from: Hash) -> Result<()> {
         Ok(self.store.delete(&keys::change_list(root, from)).await?)
+    }
+}
+
+/// A branch id drawn from `rng`, never [`BranchId::NONE`].
+pub(crate) fn new_branch_id(rng: &dyn Rng) -> BranchId {
+    loop {
+        let id = BranchId::from_parts(rng.next_u64(), rng.next_u64());
+        if id != BranchId::NONE {
+            return id;
+        }
     }
 }

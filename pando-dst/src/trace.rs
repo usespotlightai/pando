@@ -1,6 +1,7 @@
 //! Traces of one branch's ref and write log: every call a host makes on them, in the order the
 //! store applies them, and each flush a writer commits, written as a TLA+ module that
-//! `specs/trace/WriteLogTrace.tla` checks against `specs/WriteLog.tla`.
+//! `specs/trace/WriteLogTrace.tla` checks against `specs/WriteLog.tla`. The branch's lives are
+//! numbered from 0 in the order their refs were created, as the spec numbers them.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -13,7 +14,7 @@ use parking_lot::Mutex;
 
 use pando_engine::LogMode;
 use pando_engine::ports::{Object, ObjectInfo, Store, StoreError, Version};
-use pando_format::{LogBody, LogPos, LogRecord, Ref, keys};
+use pando_format::{BranchId, LogBody, LogPos, LogRecord, Ref, keys, u64_from};
 
 /// What a log record holds, as a trace names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,21 +40,27 @@ pub struct Event {
 }
 
 /// A call on the branch's ref or log, a commit, or the end of a host's process. Records are
-/// named by writer generation, then number.
+/// named by the life of the branch, writer generation, then number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
     /// An open's read of the ref, with the mode the open logs in.
     GetRef(LogMode),
+    /// A delete's read of the ref.
+    DeleteGet,
+    /// The delete of the ref.
+    DeleteRef,
+    /// The create of the ref of a new life of the branch.
+    CreateRef,
     /// A read of a record, and what it found.
-    GetLog(u64, u64, Option<Kind>),
+    GetLog(u64, u64, u64, Option<Kind>),
     /// A create of a record holding a [`Kind`]; true when no record was there.
-    CreateLog(u64, u64, Kind, bool),
+    CreateLog(u64, u64, u64, Kind, bool),
     /// A conditional update of the ref to a writer generation and log position; true when the
     /// ref still had the version the host named. An advance also names the flushes of the
     /// root it moves the ref to, in the order they were committed.
     UpdateRef(u64, LogPos, bool, Vec<u64>),
     /// A delete of a record.
-    DeleteLog(u64, u64),
+    DeleteLog(u64, u64, u64),
     /// A list of the branch's log.
     ListLog,
     /// The host's writer wrote the data of a flush.
@@ -71,6 +78,7 @@ pub enum Step {
 pub struct Tracer {
     reference: String,
     log: String,
+    lives: Mutex<Vec<BranchId>>,
     events: Mutex<Vec<Event>>,
     unsupported: Mutex<Option<String>>,
 }
@@ -80,7 +88,8 @@ impl Tracer {
     pub fn new(branch: &str) -> Arc<Tracer> {
         Arc::new(Tracer {
             reference: keys::reference(branch),
-            log: keys::log_branch(branch),
+            log: keys::log_name(branch),
+            lives: Mutex::default(),
             events: Mutex::default(),
             unsupported: Mutex::default(),
         })
@@ -128,8 +137,31 @@ impl Tracer {
         self.unsupported.lock().get_or_insert(why);
     }
 
-    fn record(&self, key: &str) -> Option<(u64, u64)> {
-        keys::parse_log_record(key.strip_prefix(&self.log)?.strip_prefix('/')?)
+    /// Numbers life `id` of the branch next, as the life its ref was created for.
+    pub fn begin(&self, id: BranchId) {
+        self.lives.lock().push(id);
+    }
+
+    fn number(&self, id: BranchId) -> u64 {
+        let lives = self.lives.lock();
+        match lives.iter().position(|&l| l == id) {
+            Some(i) => u64_from(i),
+            None => {
+                drop(lives);
+                self.refuse(format!("{id}: a life of the branch with no create"));
+                0
+            }
+        }
+    }
+
+    fn life(&self, dir: &str) -> Option<BranchId> {
+        dir.strip_prefix(&self.log)?.strip_prefix('/')?.parse().ok()
+    }
+
+    fn record(&self, key: &str) -> Option<(u64, u64, u64)> {
+        let (id, rest) = key.strip_prefix(&self.log)?.strip_prefix('/')?.split_once('/')?;
+        let (g, n) = keys::parse_log_record(rest)?;
+        Some((self.number(id.parse().ok()?), g, n))
     }
 }
 
@@ -143,6 +175,7 @@ pub struct TracedStore {
     tracer: Arc<Tracer>,
     mode: Mutex<LogMode>,
     root: Mutex<Vec<u64>>,
+    deleting: Mutex<bool>,
     read_back: Mutex<HashSet<String>>,
 }
 
@@ -155,8 +188,15 @@ impl TracedStore {
             tracer,
             mode: Mutex::new(LogMode::default()),
             root: Mutex::default(),
+            deleting: Mutex::default(),
             read_back: Mutex::default(),
         })
+    }
+
+    /// Whether the calls of this host are a delete's, from its read of the ref to the create of
+    /// the new life's.
+    pub fn set_deleting(&self, on: bool) {
+        *self.deleting.lock() = on;
     }
 
     /// The mode the next open on this host logs in.
@@ -201,9 +241,13 @@ impl Store for TracedStore {
             return r;
         }
         if key == self.tracer.reference {
-            let mode = *self.mode.lock();
-            self.push(Step::GetRef(mode));
-        } else if let Some((g, n)) = self.tracer.record(key) {
+            if *self.deleting.lock() {
+                self.push(Step::DeleteGet);
+            } else {
+                let mode = *self.mode.lock();
+                self.push(Step::GetRef(mode));
+            }
+        } else if let Some((l, g, n)) = self.tracer.record(key) {
             let found = match &r {
                 Ok(o) => Some(self.kind(key, &o.body)),
                 Err(StoreError::NotFound { .. }) => None,
@@ -212,7 +256,7 @@ impl Store for TracedStore {
                     None
                 }
             };
-            self.push(Step::GetLog(g, n, found));
+            self.push(Step::GetLog(l, g, n, found));
         }
         r
     }
@@ -234,9 +278,20 @@ impl Store for TracedStore {
 
     async fn create(&self, key: &str, body: Bytes) -> Result<Version, StoreError> {
         if key == self.tracer.reference {
-            self.tracer.refuse(format!("{key}: a create of the ref"));
+            let made = Ref::decode(&body);
+            let r = self.inner.create(key, body).await;
+            match (&r, made) {
+                (Ok(_), Ok(made)) if *self.deleting.lock() => {
+                    self.tracer.begin(made.id);
+                    self.push(Step::CreateRef);
+                }
+                _ => self
+                    .tracer
+                    .refuse(format!("{key}: a create of the ref outside a delete")),
+            }
+            return r;
         }
-        let Some((g, n)) = self.tracer.record(key) else {
+        let Some((l, g, n)) = self.tracer.record(key) else {
             return self.inner.create(key, body).await;
         };
         let kind = self.kind(key, &body);
@@ -252,7 +307,7 @@ impl Store for TracedStore {
                 false
             }
         };
-        self.push(Step::CreateLog(g, n, kind, ok));
+        self.push(Step::CreateLog(l, g, n, kind, ok));
         r
     }
 
@@ -264,7 +319,7 @@ impl Store for TracedStore {
         let r = self.inner.update(key, body, expected).await;
         let ok = match &r {
             Ok(_) => true,
-            Err(StoreError::PreconditionFailed { .. }) => false,
+            Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => false,
             Err(e) => {
                 self.failed(key, e);
                 false
@@ -282,7 +337,7 @@ impl Store for TracedStore {
 
     async fn list(&self, dir: &str) -> Result<Vec<ObjectInfo>, StoreError> {
         let r = self.inner.list(dir).await;
-        if dir == self.tracer.log {
+        if self.tracer.life(dir).is_some() {
             self.push(Step::ListLog);
         }
         r
@@ -295,10 +350,15 @@ impl Store for TracedStore {
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         let r = self.inner.delete(key).await;
         if key == self.tracer.reference {
-            self.tracer.refuse(format!("{key}: a delete of the ref"));
+            if *self.deleting.lock() && r.is_ok() {
+                self.push(Step::DeleteRef);
+            } else {
+                self.tracer
+                    .refuse(format!("{key}: a delete of the ref outside a delete"));
+            }
         }
-        if let Some((g, n)) = self.tracer.record(key) {
-            self.push(Step::DeleteLog(g, n));
+        if let Some((l, g, n)) = self.tracer.record(key) {
+            self.push(Step::DeleteLog(l, g, n));
         }
         r
     }
@@ -313,6 +373,7 @@ fn tla_bool(b: bool) -> &'static str {
 struct Row<'a> {
     op: &'a str,
     mode: &'a str,
+    l: u64,
     g: u64,
     n: u64,
     found: Option<Kind>,
@@ -334,13 +395,18 @@ impl<'a> Row<'a> {
                 },
                 ..op("get_ref")
             },
-            Step::GetLog(g, n, found) => Row {
+            Step::DeleteGet => op("delete_get"),
+            Step::DeleteRef => op("delete_ref"),
+            Step::CreateRef => op("create_ref"),
+            Step::GetLog(l, g, n, found) => Row {
+                l,
                 g,
                 n,
                 found,
                 ..op("get_log")
             },
-            Step::CreateLog(g, n, kind, ok) => Row {
+            Step::CreateLog(l, g, n, kind, ok) => Row {
+                l,
                 g,
                 n,
                 found: Some(kind),
@@ -354,7 +420,8 @@ impl<'a> Row<'a> {
                 root,
                 ..op("update_ref")
             },
-            Step::DeleteLog(g, n) => Row {
+            Step::DeleteLog(l, g, n) => Row {
+                l,
                 g,
                 n,
                 ..op("delete_log")
@@ -375,11 +442,12 @@ impl<'a> Row<'a> {
         };
         let root: Vec<String> = self.root.iter().map(u64::to_string).collect();
         format!(
-            "[op |-> \"{}\", host |-> \"{host}\", mode |-> \"{}\", g |-> {}, n |-> {}, found |-> {}, \
+            "[op |-> \"{}\", host |-> \"{host}\", mode |-> \"{}\", l |-> {}, g |-> {}, n |-> {}, found |-> {}, \
              kind |-> \"{kind}\", from |-> {from}, to |-> {to}, ok |-> {}, gen |-> {}, lgen |-> {}, \
              lflush |-> {}, lnext |-> {}, lclosed |-> {}, root |-> <<{}>>]",
             self.op,
             self.mode,
+            self.l,
             self.g,
             self.n,
             tla_bool(found),
@@ -394,10 +462,15 @@ impl<'a> Row<'a> {
     }
 }
 
-/// The trace as module `TraceData`: the hosts, the host that runs advances, bounds on opens,
-/// writes and advances, and the events.
-pub fn module(hosts: &[&str], advancer: &str, bounds: (usize, usize, usize), events: &[Event]) -> String {
-    let (opens, writes, advances) = bounds;
+/// The trace as module `TraceData`: the hosts, the host that runs advances and deletes, bounds
+/// on opens, writes, advances and deletes, and the events.
+pub fn module(
+    hosts: &[&str],
+    advancer: &str,
+    bounds: (usize, usize, usize, usize),
+    events: &[Event],
+) -> String {
+    let (opens, writes, advances, deletes) = bounds;
     let names: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
     let mut out = String::from("---- MODULE TraceData ----\n");
     let _ = writeln!(out, "TraceHosts == {{{}}}", names.join(", "));
@@ -405,6 +478,7 @@ pub fn module(hosts: &[&str], advancer: &str, bounds: (usize, usize, usize), eve
     let _ = writeln!(out, "TraceWrites == {writes}");
     let _ = writeln!(out, "TraceAdvancer == \"{advancer}\"");
     let _ = writeln!(out, "TraceAdvances == {advances}");
+    let _ = writeln!(out, "TraceDeletes == {deletes}");
     out.push_str("Trace == <<\n");
     for (i, e) in events.iter().enumerate() {
         let sep = if i + 1 == events.len() { "" } else { "," };
