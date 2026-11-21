@@ -143,15 +143,12 @@ impl Tracer {
     }
 
     fn number(&self, id: BranchId) -> u64 {
-        let lives = self.lives.lock();
-        match lives.iter().position(|&l| l == id) {
-            Some(i) => u64_from(i),
-            None => {
-                drop(lives);
-                self.refuse(format!("{id}: a life of the branch with no create"));
-                0
-            }
+        let found = self.lives.lock().iter().position(|&l| l == id);
+        if let Some(i) = found {
+            return u64_from(i);
         }
+        self.refuse(format!("{id}: a life of the branch with no create"));
+        0
     }
 
     fn life(&self, dir: &str) -> Option<BranchId> {

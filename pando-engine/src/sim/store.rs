@@ -59,7 +59,7 @@ struct State {
 }
 
 /// An object store in memory, with S3's conditional write rules. An object's version is the hash
-/// of its bytes, as an S3 ETag is, so writing the same bytes again gives the same version.
+/// of its bytes, as an S3 `ETag` is, so writing the same bytes again gives the same version.
 #[derive(Debug)]
 pub struct SimStore {
     state: Mutex<State>,

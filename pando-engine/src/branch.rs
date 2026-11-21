@@ -457,7 +457,10 @@ mod tests {
             permanent: false,
         });
         assert!(delete(&ports, "foo").await.is_err());
-        assert!(!store.keys(&pando_format::keys::log_name("foo")).is_empty());
+        assert_ne!(
+            store.keys(&pando_format::keys::log_name("foo")),
+            Vec::<String>::new()
+        );
         Volume::create(&ports, "foo", 1 << 20).await.unwrap();
         let new = Volume::open_logged(
             &ports,
