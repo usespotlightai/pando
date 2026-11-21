@@ -1968,7 +1968,7 @@ mod tests {
         let big = u64::MAX / 2;
         fs.set_capacity(Some(big));
         let used = big - fs.available(Path::new("/a")).await.unwrap();
-        fs.set_capacity(Some(used + (24 << 20)));
+        fs.set_capacity(Some(used + (6 << 20)));
         let mut acked = Vec::new();
         for i in 0..SIZE >> 20 {
             match v
@@ -2338,7 +2338,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sweeps_drop_old_chunk_versions_and_keep_what_any_branch_still_needs() {
-        use crate::ports::LocalImage;
         let (ports, store, fs) = sim::ports(6);
         branch(&ports, "main").await;
         branch(&ports, "other").await;
@@ -2377,7 +2376,9 @@ mod tests {
             }
         }
         cache.sweep().await.unwrap();
-        let used = fs.allocated(Path::new("/a/objects")).await.unwrap();
+        let used = crate::local::log_allocated(&fs, Path::new("/a/objects"))
+            .await
+            .unwrap();
         assert!(
             used < 2 * 11 * u64_from(CHUNK_SIZE),
             "40 versions of {chunks} chunks went in; the log keeps {used} bytes"
@@ -2416,7 +2417,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cache_budget_keeps_the_chunks_read_last_and_fetches_the_rest_again() {
-        use crate::ports::LocalImage;
         let (ports, store, fs) = sim::ports(7);
         branch(&ports, "main").await;
         let cache = host(&ports, "/a").await;
@@ -2435,7 +2435,12 @@ mod tests {
         assert_eq!(read(&v, 0, hot).await, all[..hot]);
         cache.sweep().await.unwrap();
         assert!(cache.log_bytes() <= budget, "{} bytes kept", cache.log_bytes());
-        assert!(fs.allocated(Path::new("/a/objects")).await.unwrap() <= budget + 64 * 4096);
+        assert!(
+            crate::local::log_allocated(&fs, Path::new("/a/objects"))
+                .await
+                .unwrap()
+                <= budget + 64 * 4096
+        );
 
         store.refuse(StoreOp::Get);
         assert_eq!(read(&v, 0, hot).await, all[..hot], "the chunks read last stay");

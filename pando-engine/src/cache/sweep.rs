@@ -253,7 +253,8 @@ impl Cache {
 
     /// Drops the records of the object log that no root, pin or closed branch on this host
     /// reaches. A sweep marks in an epoch of its own, older than the one puts mark in from
-    /// then on, so a pin begun after it keeps only what was put again since.
+    /// then on, so a pin begun after it keeps only what was put again since. It then compacts
+    /// the log; when that fails, what it dropped stays dropped.
     pub(crate) async fn sweep(&self) -> Result<Swept> {
         let _one = self.sweeper.running.lock().await;
         self.sweeper.busy.store(true, Ordering::Release);
@@ -337,6 +338,7 @@ impl Cache {
             }
             self.sweeper.write_states().await?;
         }
+        self.log.compact(self.sweeper.floor).await?;
         Ok(swept)
     }
 

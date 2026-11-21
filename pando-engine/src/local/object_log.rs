@@ -32,9 +32,27 @@ const PADS_MAX: usize = 1 << 20;
 /// The longest padding a sweep writes over the records it drops.
 const PAD_MAX: u64 = 1 << 30;
 const PAGE: u64 = 4096;
+/// An offset in the log is `segment << SEG_SHIFT | offset in the segment's file`.
+const SEG_SHIFT: u32 = 40;
+/// A segment takes no record that would end past this, unless it is empty.
+const SEG_ROLL: u64 = if cfg!(test) { 1 << 20 } else { 16 << 30 };
 
-/// The local tier: one append-only file of records `[hash][length][data]`, with an index in
-/// memory. A record may instead name another file that holds the object (a clone of a
+fn seg_of(off: u64) -> u64 {
+    off >> SEG_SHIFT
+}
+
+fn seg_pos(off: u64) -> u64 {
+    off & ((1 << SEG_SHIFT) - 1)
+}
+
+fn seg_base(id: u64) -> u64 {
+    id << SEG_SHIFT
+}
+
+/// The local tier: an append-only log of records `[hash][length][data]`, with an index in
+/// memory. The log is a directory of segment files, each named by its number; appends go to
+/// the last, and [`ObjectLog::compact`] moves the few records left in an earlier one to the
+/// end and removes its file, so the log's files stay near the size of what it keeps. A record may instead name another file that holds the object (a clone of a
 /// handed-off image): `[hash][REF_FLAG | length][object length u32][offset u64][path]`. Such a
 /// file must not change while records name it; once it is dropped, its records read as misses.
 ///
@@ -53,7 +71,7 @@ const PAGE: u64 = 4096;
 #[derive(Debug)]
 pub(crate) struct ObjectLog {
     fs: Arc<dyn LocalFs>,
-    file: Arc<dyn LocalFile>,
+    segs: Arc<Segments>,
     path: PathBuf,
     end: AtomicU64,
     shards: Vec<RwLock<HashMap<Hash, Arc<Loc>>>>,
@@ -88,6 +106,10 @@ pub(crate) struct ObjectLog {
     fresh_from: AtomicU64,
     /// Records of objects the log had already when they landed, which the next sweep drops.
     orphans: Mutex<Vec<(u64, u64)>>,
+    /// The runs of padding a sweep wrote or a scan found, by start, with their ends. A sweep
+    /// pads the records it drops together with the padding next to them, so the page of each
+    /// earlier run's header is freed with them.
+    padded: Mutex<BTreeMap<u64, u64>>,
     /// The runs of `<log>.pads` whose padding may not be durable yet.
     pads: tokio::sync::Mutex<Pads>,
 }
@@ -106,9 +128,70 @@ struct Pads {
     dropped: usize,
 }
 
+/// The files of the log's segments, by number.
+#[derive(Debug)]
+struct Segments {
+    fs: Arc<dyn LocalFs>,
+    dir: PathBuf,
+    files: RwLock<BTreeMap<u64, Arc<dyn LocalFile>>>,
+    creating: tokio::sync::Mutex<()>,
+    /// The segments written since a sync, each with the count of writes at its last write.
+    dirty: Mutex<BTreeMap<u64, u64>>,
+    writes: AtomicU64,
+}
+
+impl Segments {
+    fn get(&self, id: u64) -> Option<Arc<dyn LocalFile>> {
+        self.files.read().get(&id).cloned()
+    }
+
+    fn path(&self, id: u64) -> PathBuf {
+        self.dir.join(id.to_string())
+    }
+
+    /// The file of segment `id`, created when there is none yet.
+    async fn open(&self, id: u64) -> io::Result<Arc<dyn LocalFile>> {
+        if let Some(f) = self.get(id) {
+            return Ok(f);
+        }
+        let _c = self.creating.lock().await;
+        if let Some(f) = self.get(id) {
+            return Ok(f);
+        }
+        let f = self.fs.open(&self.path(id), Open::Create).await?;
+        self.fs.sync_dir(&self.dir).await?;
+        self.files.write().insert(id, Arc::clone(&f));
+        Ok(f)
+    }
+
+    /// Records that a write to segment `id` landed, so the next [`Self::sync`] covers it.
+    fn written(&self, id: u64) {
+        let n = self.writes.fetch_add(1, Ordering::AcqRel);
+        self.dirty.lock().insert(id, n);
+    }
+
+    /// Makes every write that landed before it durable.
+    async fn sync(&self) -> io::Result<()> {
+        let dirty: Vec<(u64, u64)> = self.dirty.lock().iter().map(|(a, b)| (*a, *b)).collect();
+        for (id, n) in dirty {
+            if let Some(f) = self.get(id) {
+                f.sync_data().await?;
+            }
+            let mut d = self.dirty.lock();
+            if d.get(&id) == Some(&n) {
+                d.remove(&id);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct Loc {
     off: u64,
+    /// Where the object was first appended since the log opened; a move by
+    /// [`ObjectLog::compact`] keeps it, so a sweep tells old records from new ones by it.
+    born: u64,
     len: u32,
     touched: AtomicBool,
     ext: Option<(Arc<ExtFile>, u64)>,
@@ -124,6 +207,7 @@ impl Loc {
     fn new(off: u64, len: u32, ext: Option<(Arc<ExtFile>, u64)>, used: u64) -> Arc<Loc> {
         Arc::new(Loc {
             off,
+            born: off,
             len,
             touched: AtomicBool::new(false),
             ext,
@@ -282,6 +366,51 @@ fn next_sweep(kept: u64, budget: u64) -> u64 {
     n.min(budget.saturating_sub(kept).max(budget / 8).max(1))
 }
 
+/// The records of a segment [`ObjectLog::compact`] may move: their bytes, whether one is from
+/// below the floor, and each with its object.
+#[derive(Default)]
+struct Held {
+    bytes: u64,
+    old: bool,
+    locs: Vec<(Hash, Arc<Loc>)>,
+}
+
+/// Gives `new`, the copy of the record at `old`, the marks, reads and store location of `old`.
+fn take_uses(old: &Loc, new: &Loc) {
+    new.mark
+        .fetch_max(old.mark.load(Ordering::Acquire), Ordering::AcqRel);
+    new.used
+        .fetch_max(old.used.load(Ordering::Acquire), Ordering::AcqRel);
+    if old.touched.load(Ordering::Acquire) {
+        new.touched.store(true, Ordering::Release);
+    }
+    let stored = *old.stored.lock();
+    let mut s = new.stored.lock();
+    if s.is_none() {
+        *s = stored;
+    }
+}
+
+/// The payload of a reference record of object `h`, the `len` bytes at `offset` of `path`,
+/// with its length.
+fn ref_payload(h: Hash, path: &Path, offset: u64, len: u32) -> Result<(u32, Bytes)> {
+    let p = path.as_os_str().as_encoded_bytes();
+    let mut payload = Vec::with_capacity(12 + p.len());
+    payload.extend_from_slice(&len.to_le_bytes());
+    payload.extend_from_slice(&offset.to_le_bytes());
+    payload.extend_from_slice(p);
+    let plen = u32::try_from(payload.len())
+        .ok()
+        .filter(|n| n & REF_FLAG == 0)
+        .ok_or_else(|| {
+            Error::Corrupt(format!(
+                "reference object {h}: the path {} is too long",
+                path.display()
+            ))
+        })?;
+    Ok((plen, Bytes::from(payload)))
+}
+
 fn header(h: Hash, len: u32) -> Bytes {
     let mut b = Vec::with_capacity(HEADER);
     b.extend_from_slice(&h.0);
@@ -301,11 +430,34 @@ impl ObjectLog {
                 format!("the object log {} is in use: {e}", path.display()),
             ))
         })?;
-        let file = fs.open(path, Open::Create).await?;
+        fs.create_dir_all(path).await?;
         fs.sync_dir(dir).await?;
+        let segs = Segments {
+            fs: Arc::clone(&fs),
+            dir: path.to_path_buf(),
+            files: RwLock::default(),
+            creating: tokio::sync::Mutex::default(),
+            dirty: Mutex::default(),
+            writes: AtomicU64::new(0),
+        };
+        for e in fs.list(path).await? {
+            let id = e
+                .name
+                .parse::<u64>()
+                .ok()
+                .filter(|&id| !e.is_dir && id < 1 << (64 - SEG_SHIFT))
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "{} is not a segment of the object log",
+                        path.join(&e.name).display()
+                    ))
+                })?;
+            let f = fs.open(&segs.path(id), Open::ReadWrite).await?;
+            segs.files.write().insert(id, f);
+        }
         let log = ObjectLog {
             fs: Arc::clone(&fs),
-            file,
+            segs: Arc::new(segs),
             path: path.to_path_buf(),
             end: AtomicU64::new(0),
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
@@ -327,6 +479,7 @@ impl ObjectLog {
             budget: AtomicU64::new(0),
             fresh_from: AtomicU64::new(0),
             orphans: Mutex::default(),
+            padded: Mutex::default(),
             pads: tokio::sync::Mutex::default(),
         };
         let synced = match read_file(fs.as_ref(), &log.synced_path()).await? {
@@ -338,9 +491,6 @@ impl ObjectLog {
         };
         log.redo_pads().await?;
         let end = log.scan(synced).await?;
-        if end < log.file.size().await? {
-            log.file.set_len(end).await?;
-        }
         log.end.store(end, Ordering::Release);
         log.fresh_from.store(end, Ordering::Release);
         Ok(log)
@@ -357,16 +507,24 @@ impl ObjectLog {
     /// Writes padding over each run `[a, b)` of records and makes it durable.
     async fn pad_runs(&self, runs: &[(u64, u64)]) -> Result<()> {
         self.write_pads(runs).await?;
-        self.file.sync_data().await?;
+        self.segs.sync().await?;
         Ok(())
     }
 
-    /// Writes padding over each run `[a, b)` of records, without waiting for the disk.
+    /// Writes padding over each run `[a, b)` of records, without waiting for the disk. A run in
+    /// a segment that is gone needs none.
     async fn write_pads(&self, runs: &[(u64, u64)]) -> Result<()> {
         for &(a, b) in runs {
             let len = u32::try_from(b - a - HEADER_LEN)
-                .map_err(|_| Error::Corrupt(format!("padding of {} bytes at {a}", b - a)))?;
-            self.file.write_at(vec![header(pad_hash(a, len), len)], a).await?;
+                .ok()
+                .filter(|_| seg_of(a) == seg_of(b))
+                .ok_or_else(|| Error::Corrupt(format!("padding of {} bytes at {a}", b - a)))?;
+            let Some(f) = self.segs.get(seg_of(a)) else {
+                continue;
+            };
+            f.write_at(vec![header(pad_hash(a, len), len)], seg_pos(a))
+                .await?;
+            self.segs.written(seg_of(a));
         }
         Ok(())
     }
@@ -455,42 +613,75 @@ impl ObjectLog {
         PathBuf::from(s)
     }
 
-    /// Indexes the records, checking those at or past `synced`; returns where the valid log ends.
+    /// Indexes the records, checking those at or past `synced`; returns where the valid log
+    /// ends. The segment with the first record that is not valid is cut there, and the
+    /// segments after it are removed: they hold only appends a sync did not cover.
     async fn scan(&self, synced: u64) -> Result<u64> {
-        let size = self.file.size().await?;
+        let ids: Vec<u64> = self.segs.files.read().keys().copied().collect();
+        let mut end = 0;
+        let mut cut = false;
+        for id in ids {
+            if cut {
+                self.segs.files.write().remove(&id);
+                self.fs.remove(&self.segs.path(id)).await?;
+                continue;
+            }
+            let Some(f) = self.segs.get(id) else {
+                continue;
+            };
+            let size = f.size().await?;
+            let valid = self.scan_segment(f.as_ref(), seg_base(id), size, synced).await?;
+            if valid < size {
+                f.set_len(valid).await?;
+                cut = true;
+            }
+            end = seg_base(id) + valid;
+        }
+        if cut {
+            self.fs.sync_dir(&self.path).await?;
+        }
+        Ok(end)
+    }
+
+    /// [`Self::scan`] of the `size` bytes of the segment that starts at `base` of the log;
+    /// returns where its valid records end in its file.
+    async fn scan_segment(&self, f: &dyn LocalFile, base: u64, size: u64, synced: u64) -> Result<u64> {
         let mut w = Window::default();
-        let mut off = 0u64;
-        while off + HEADER_LEN <= size {
-            let hdr = w.read_small(self.file.as_ref(), off, HEADER).await?;
+        let mut pos = 0u64;
+        while pos + HEADER_LEN <= size {
+            let off = base + pos;
+            let hdr = w.read_small(f, pos, HEADER).await?;
             let mut rest: &[u8] = &hdr;
             let (Some(h), Some(n)) = (take::<32>(&mut rest), take::<4>(&mut rest)) else {
                 break;
             };
             let (h, n) = (Hash(h), u32::from_le_bytes(n));
             let plen = u64::from(n & !REF_FLAG);
-            let body = off + HEADER_LEN;
+            let body = pos + HEADER_LEN;
             if body + plen > size {
                 break;
             }
+            let next = body + plen;
             if n & REF_FLAG == 0 && h == pad_hash(off, n) {
-                off = body + plen;
+                self.padded.lock().insert(off, base + next);
+                pos = next;
                 continue;
             }
             if h == Hash::ZERO {
                 if off >= synced {
                     break;
                 }
-                off = body + plen;
+                pos = next;
                 continue;
             }
             if n & REF_FLAG != 0 {
-                let payload = w.read_small(self.file.as_ref(), body, usize_from(plen)).await?;
+                let payload = w.read_small(f, body, usize_from(plen)).await?;
                 let Some((len, ext, ext_off)) = self.read_ref(&payload) else {
                     break;
                 };
-                if let Some(f) = ext.open(self.fs.as_ref()).await {
+                if let Some(x) = ext.open(self.fs.as_ref()).await {
                     if off >= synced {
-                        let data = f.read_at(len as usize, ext_off).await?;
+                        let data = x.read_at(len as usize, ext_off).await?;
                         if Hash::of(&data) != h {
                             break;
                         }
@@ -499,7 +690,7 @@ impl ObjectLog {
                 }
             } else {
                 if off >= synced {
-                    let data = w.read(self.file.as_ref(), body, n as usize).await?;
+                    let data = w.read(f, body, n as usize).await?;
                     if data.len() != n as usize || Hash::of(&data) != h {
                         break;
                     }
@@ -507,9 +698,9 @@ impl ObjectLog {
                 self.index(h, Loc::new(off, n, None, 0));
                 self.live.fetch_add(HEADER_LEN + u64::from(n), Ordering::AcqRel);
             }
-            off = body + plen;
+            pos = next;
         }
-        Ok(off)
+        Ok(pos)
     }
 
     /// The object length, file and offset in that file that a reference record's payload names.
@@ -561,33 +752,46 @@ impl ObjectLog {
         self.lookup(h).is_some_and(|l| l.ext.is_none())
     }
 
-    /// Writes a record at the end of the log. The write runs on its own task, so a caller that
-    /// stops waiting leaves no hole: a failed write leaves padding instead.
+    /// Writes a record at the end of the log, in a new segment when it would end past
+    /// [`SEG_ROLL`] of the last. The write runs on its own task, so a caller that stops waiting
+    /// leaves no hole: a failed write leaves padding instead.
     async fn append(&self, h: Hash, hdr: Bytes, body: Bytes) -> Result<u64> {
         let pad_len = u32::try_from(body.len())
             .map_err(|_| Error::Corrupt(format!("object {h} has a record of {} bytes", body.len())))?;
         let n = u64_from(hdr.len() + body.len());
         let at = {
             let mut f = self.in_flight.lock();
-            let at = self.end.fetch_add(n, Ordering::AcqRel);
+            let mut at = self.end.load(Ordering::Acquire);
+            if seg_pos(at) > 0 && seg_pos(at) + n > SEG_ROLL {
+                at = seg_base(seg_of(at) + 1);
+            }
+            self.end.store(at + n, Ordering::Release);
             f.insert(at);
             at
         };
-        let (file, in_flight, landed, unpadded) = (
-            Arc::clone(&self.file),
+        let (segs, in_flight, landed, unpadded) = (
+            Arc::clone(&self.segs),
             Arc::clone(&self.in_flight),
             Arc::clone(&self.landed),
             Arc::clone(&self.unpadded),
         );
         let task = tokio::spawn(async move {
-            let r = file.write_at(vec![hdr, body], at).await;
+            let (id, pos) = (seg_of(at), seg_pos(at));
+            let r = match segs.open(id).await {
+                Ok(file) => file.write_at(vec![hdr, body], pos).await,
+                Err(e) => Err(e),
+            };
             let settled = if let Ok(()) = r {
                 true
             } else {
                 let pad = header(pad_hash(at, pad_len), pad_len);
-                file.write_at(vec![pad], at).await.is_ok()
+                match segs.open(id).await {
+                    Ok(file) => file.write_at(vec![pad], pos).await.is_ok(),
+                    Err(_) => false,
+                }
             };
             if settled {
+                segs.written(id);
                 in_flight.lock().remove(&at);
             } else {
                 unpadded.lock().insert(at, pad_len);
@@ -634,23 +838,8 @@ impl ObjectLog {
             )));
         }
         ext.needs_sync.store(true, Ordering::Release);
-        let p = path.as_os_str().as_encoded_bytes();
-        let mut payload = Vec::with_capacity(12 + p.len());
-        payload.extend_from_slice(&len.to_le_bytes());
-        payload.extend_from_slice(&offset.to_le_bytes());
-        payload.extend_from_slice(p);
-        let plen = u32::try_from(payload.len())
-            .ok()
-            .filter(|n| n & REF_FLAG == 0)
-            .ok_or_else(|| {
-                Error::Corrupt(format!(
-                    "reference object {h}: the path {} is too long",
-                    path.display()
-                ))
-            })?;
-        let at = self
-            .append(h, header(h, REF_FLAG | plen), Bytes::from(payload))
-            .await?;
+        let (plen, payload) = ref_payload(h, path, offset, len)?;
+        let at = self.append(h, header(h, REF_FLAG | plen), payload).await?;
         let n = u64::from(plen) + HEADER_LEN;
         self.index(h, Loc::new(at, len, Some((ext, offset)), self.tick()));
         self.appended(n);
@@ -783,7 +972,7 @@ impl ObjectLog {
     ) -> Result<Swept> {
         let fresh = self.fresh_from.swap(below, Ordering::AcqRel);
         let droppable = |l: &Loc| {
-            (floor..below).contains(&l.off) && (l.mark.load(Ordering::Acquire) < keep_from || l.dead())
+            (floor..below).contains(&l.born) && (l.mark.load(Ordering::Acquire) < keep_from || l.dead())
         };
         let budget = self.budget.load(Ordering::Acquire);
         let keep: HashSet<Hash> = if budget == 0 {
@@ -799,7 +988,7 @@ impl ObjectLog {
                 for (h, l) in s.read().iter() {
                     if !droppable(l) {
                         base += l.own_bytes();
-                    } else if nodes.contains(h) || (wanted.contains(h) && l.off >= fresh) {
+                    } else if nodes.contains(h) || (wanted.contains(h) && l.born >= fresh) {
                         base += l.own_bytes();
                         keep.insert(*h);
                     } else {
@@ -846,6 +1035,7 @@ impl ObjectLog {
                 _ => runs.push((a, b)),
             }
         }
+        let runs = self.join_padded(runs);
         for (_, l) in &gone {
             while Arc::strong_count(l) > 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -853,12 +1043,44 @@ impl ObjectLog {
         }
         let dropped = gone.into_iter().map(|(h, _)| h).collect();
         match self.pad_and_free(&runs).await {
-            Ok(freed) => Ok(Swept { dropped, freed, kept }),
+            Ok(freed) => {
+                self.padded.lock().extend(runs.iter().copied());
+                Ok(Swept { dropped, freed, kept })
+            }
             Err(e) => {
                 self.orphans.lock().extend(runs);
                 Err(e)
             }
         }
+    }
+
+    /// `runs`, sorted and apart, each extended over the padding that ends where it starts and
+    /// the padding that starts where it ends, and joined with the next run it then meets, while
+    /// a run stays within [`PAD_MAX`]. The padding a run took in is forgotten: the run's own
+    /// padding covers it.
+    fn join_padded(&self, runs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        let mut padded = self.padded.lock();
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
+        for mut r in runs {
+            if let Some((&a, &b)) = padded.range(..r.0).next_back()
+                && b == r.0
+                && r.1 - a <= PAD_MAX
+            {
+                padded.remove(&a);
+                r.0 = a;
+            }
+            if let Some(&b) = padded.get(&r.1)
+                && b - r.0 <= PAD_MAX
+            {
+                padded.remove(&r.1);
+                r.1 = b;
+            }
+            match out.last_mut() {
+                Some(l) if l.1 == r.0 && r.1 - l.0 <= PAD_MAX => l.1 = r.1,
+                _ => out.push(r),
+            }
+        }
+        out
     }
 
     /// Writes padding over `runs` of dropped records and frees their pages; returns the bytes
@@ -874,7 +1096,7 @@ impl ObjectLog {
             self.write_pads(runs).await?;
             p.headed = p.text.len();
             if p.text.len() > PADS_MAX {
-                self.file.sync_data().await?;
+                self.segs.sync().await?;
                 let n = p.headed;
                 self.unlist_pads(&mut p, n).await?;
             }
@@ -882,12 +1104,140 @@ impl ObjectLog {
         let mut freed = 0;
         for &(a, b) in runs {
             let (from, to) = ((a + HEADER_LEN).next_multiple_of(PAGE), b / PAGE * PAGE);
-            if from < to {
-                self.file.punch(from, to - from).await?;
+            if from < to
+                && let Some(f) = self.segs.get(seg_of(a))
+            {
+                f.punch(seg_pos(from), to - from).await?;
                 freed += to - from;
             }
         }
         Ok(freed)
+    }
+
+    /// Removes each segment before the last whose records take at most a quarter of
+    /// [`SEG_ROLL`], once it moved them to the end of the log and a sync made them durable
+    /// there. A segment with a record from below `floor`, or with an append not settled yet,
+    /// stays. A crash before the removal leaves both copies, and the next sweep drops the
+    /// later one.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "the records of each segment are moved in any order"
+    )]
+    pub(crate) async fn compact(&self, floor: u64) -> Result<()> {
+        let last = seg_of(self.end());
+        let mut busy: HashSet<u64> = self.in_flight.lock().iter().map(|&a| seg_of(a)).collect();
+        busy.extend(self.unpadded.lock().keys().map(|&a| seg_of(a)));
+        let ids: Vec<u64> = self
+            .segs
+            .files
+            .read()
+            .keys()
+            .copied()
+            .filter(|id| *id < last && !busy.contains(id))
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut held: HashMap<u64, Held> = HashMap::new();
+        for s in &self.shards {
+            for (h, l) in s.read().iter() {
+                if seg_of(l.off) < last {
+                    let e = held.entry(seg_of(l.off)).or_default();
+                    e.bytes += l.end() - l.off;
+                    e.old |= l.born < floor;
+                    e.locs.push((*h, Arc::clone(l)));
+                }
+            }
+        }
+        let mut moved = Vec::new();
+        let mut gone = Vec::new();
+        for id in ids {
+            let Held { bytes, old, locs } = held.remove(&id).unwrap_or_default();
+            if old || bytes > SEG_ROLL / 4 {
+                continue;
+            }
+            moved.extend(self.relocate(locs).await?);
+            gone.push(id);
+        }
+        drop(held);
+        if gone.is_empty() {
+            return Ok(());
+        }
+        self.sync().await?;
+        for (old, new) in &moved {
+            while Arc::strong_count(old) > 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            take_uses(old, new);
+        }
+        for id in gone {
+            let span = seg_base(id)..seg_base(id + 1);
+            self.padded.lock().retain(|a, _| !span.contains(a));
+            self.orphans.lock().retain(|(a, _)| !span.contains(a));
+            self.segs.files.write().remove(&id);
+            self.segs.dirty.lock().remove(&id);
+            self.fs.remove(&self.segs.path(id)).await?;
+        }
+        self.fs.sync_dir(&self.path).await?;
+        Ok(())
+    }
+
+    /// Appends each record of `locs` again and indexes the copy in its place; returns each old
+    /// location with its copy. The record of a file that is gone is dropped instead.
+    async fn relocate(&self, locs: Vec<(Hash, Arc<Loc>)>) -> Result<Vec<(Arc<Loc>, Arc<Loc>)>> {
+        let mut out = Vec::with_capacity(locs.len());
+        for (h, old) in locs {
+            if old.dead() {
+                let mut m = self.shard(&h).write();
+                if m.get(&h).is_some_and(|l| Arc::ptr_eq(l, &old)) {
+                    m.remove(&h);
+                }
+                continue;
+            }
+            let (hdr, body) = match &old.ext {
+                None => {
+                    let f = self
+                        .segs
+                        .get(seg_of(old.off))
+                        .ok_or_else(|| Error::Corrupt(format!("object {h} at {} has no segment", old.off)))?;
+                    let b = f.read_at(old.len as usize, seg_pos(old.off) + HEADER_LEN).await?;
+                    if b.len() != old.len as usize || Hash::of(&b) != h {
+                        return Err(Error::Corrupt(format!(
+                            "object {h} at {} of the object log {} does not match its hash",
+                            old.off,
+                            self.path.display()
+                        )));
+                    }
+                    (header(h, old.len), b)
+                }
+                Some((e, off)) => {
+                    let (plen, p) = ref_payload(h, &e.path, *off, old.len)?;
+                    (header(h, REF_FLAG | plen), p)
+                }
+            };
+            let at = self.append(h, hdr, body).await?;
+            let new = Arc::new(Loc {
+                off: at,
+                born: old.born,
+                len: old.len,
+                touched: AtomicBool::new(false),
+                ext: old.ext.clone(),
+                mark: AtomicU64::new(0),
+                used: AtomicU64::new(0),
+                stored: Mutex::new(None),
+            });
+            let mut m = self.shard(&h).write();
+            if m.get(&h).is_some_and(|l| Arc::ptr_eq(l, &old)) {
+                take_uses(&old, &new);
+                m.insert(h, Arc::clone(&new));
+                drop(m);
+                out.push((old, new));
+            } else {
+                drop(m);
+                self.orphans.lock().push((at, new.end()));
+            }
+        }
+        Ok(out)
     }
 
     /// Turns every record that names `path` into a miss; call it before removing the file.
@@ -899,7 +1249,10 @@ impl ObjectLog {
 
     async fn source(&self, loc: &Loc) -> Option<(Arc<dyn LocalFile>, u64)> {
         match &loc.ext {
-            None => Some((Arc::clone(&self.file), loc.off + HEADER_LEN)),
+            None => self
+                .segs
+                .get(seg_of(loc.off))
+                .map(|f| (f, seg_pos(loc.off) + HEADER_LEN)),
             Some((e, off)) => e.open(self.fs.as_ref()).await.map(|f| (f, *off)),
         }
     }
@@ -938,7 +1291,10 @@ impl ObjectLog {
             )));
         }
         let (f, at) = match &loc.ext {
-            None => (Arc::clone(&self.file), loc.off + HEADER_LEN),
+            None => match self.segs.get(seg_of(loc.off)) {
+                Some(f) => (f, seg_pos(loc.off) + HEADER_LEN),
+                None => return Ok(false),
+            },
             Some((e, off)) => match e.opened() {
                 Some(f) => (f, *off),
                 None => return Ok(false),
@@ -967,7 +1323,14 @@ impl ObjectLog {
     async fn pad(&self) -> Result<()> {
         let pending: Vec<(u64, u32)> = self.unpadded.lock().iter().map(|(a, n)| (*a, *n)).collect();
         for (at, len) in pending {
-            if let Err(e) = self.file.write_at(vec![header(pad_hash(at, len), len)], at).await {
+            let r = match self.segs.open(seg_of(at)).await {
+                Ok(f) => {
+                    f.write_at(vec![header(pad_hash(at, len), len)], seg_pos(at))
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = r {
                 return Err(Error::Io(io::Error::new(
                     e.kind(),
                     format!(
@@ -976,6 +1339,7 @@ impl ObjectLog {
                     ),
                 )));
             }
+            self.segs.written(seg_of(at));
             self.unpadded.lock().remove(&at);
             self.in_flight.lock().remove(&at);
         }
@@ -993,8 +1357,19 @@ impl ObjectLog {
         self.unwritten.store(0, Ordering::Release);
         let _behind = self.behind.lock().await;
         let end = self.end.load(Ordering::Acquire);
-        self.file.start_writeback().await;
-        self.file.write_behind(end.saturating_sub(BEHIND_BYTES)).await;
+        let last = self.segs.get(seg_of(end));
+        if let Some(f) = &last {
+            f.start_writeback().await;
+        }
+        let below = end.saturating_sub(BEHIND_BYTES);
+        if seg_of(below) == seg_of(end) {
+            if let Some(f) = &last {
+                f.write_behind(seg_pos(below)).await;
+            }
+        } else if let Some(f) = self.segs.get(seg_of(below)) {
+            f.start_writeback().await;
+            f.write_behind(seg_pos(below)).await;
+        }
     }
 
     fn write_back(&self) {
@@ -1002,11 +1377,13 @@ impl ObjectLog {
             return;
         }
         self.unwritten.store(0, Ordering::Release);
-        let (file, flag) = (Arc::clone(&self.file), Arc::clone(&self.writing_back));
+        let (file, flag) = (self.segs.get(seg_of(self.end())), Arc::clone(&self.writing_back));
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
                 rt.spawn(async move {
-                    file.start_writeback().await;
+                    if let Some(file) = file {
+                        file.start_writeback().await;
+                    }
                     flag.store(false, Ordering::Release);
                 });
             }
@@ -1051,7 +1428,7 @@ impl ObjectLog {
             let p = self.pads.lock().await;
             p.dropped + p.headed
         };
-        self.file.sync_data().await?;
+        self.segs.sync().await?;
         write_atomic(
             self.fs.as_ref(),
             &self.synced_path(),
@@ -1063,6 +1440,17 @@ impl ObjectLog {
         self.unlist_pads(&mut p, n).await?;
         Ok(())
     }
+}
+
+/// The disk the files of the log at `log` take.
+#[cfg(all(test, feature = "sim"))]
+pub(crate) async fn allocated(fs: &crate::sim::SimFs, log: &Path) -> io::Result<u64> {
+    use crate::ports::LocalImage;
+    let mut n = 0;
+    for e in fs.list(log).await? {
+        n += fs.allocated(&log.join(&e.name)).await?;
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1124,7 +1512,7 @@ mod tests {
         let ((h1, b1), (h2, b2)) = (obj(1), obj(2));
         log.put(h1, b1).await.unwrap();
         drop(log);
-        let f = fs.open(path, Open::ReadWrite).await.unwrap();
+        let f = fs.open(&path.join("0"), Open::ReadWrite).await.unwrap();
         let at = f.size().await.unwrap();
         let tail = vec![
             header(Hash::ZERO, 100),
@@ -1188,7 +1576,7 @@ mod tests {
         let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         let (h1, b1) = obj(1);
         log.put(h1, b1).await.unwrap();
-        let f = fs.open(path, Open::ReadWrite).await.unwrap();
+        let f = fs.open(&path.join("0"), Open::ReadWrite).await.unwrap();
         let size = f.size().await.unwrap();
         f.write_at(vec![Bytes::from(vec![9; 50])], size).await.unwrap();
         drop(log);
@@ -1199,7 +1587,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_sweep_drops_what_no_epoch_marked_frees_its_disk_and_survives_a_reopen() {
-        use crate::ports::LocalImage;
         let fs = SimFs::default();
         let path = Path::new("/c/objects");
         let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
@@ -1218,7 +1605,7 @@ mod tests {
         let below = log.end();
         let (late_h, late_b) = big(7);
         log.put(late_h, late_b.clone()).await.unwrap();
-        let before = fs.allocated(path).await.unwrap();
+        let before = allocated(&fs, path).await.unwrap();
         let swept = log.sweep(0, below, epoch, &[], &[]).await.unwrap();
         let dropped: HashSet<Hash> = swept.dropped.into_iter().collect();
         let want: Vec<Hash> = [0, 2, 3, 5].iter().map(|&i| objs[i].0).collect();
@@ -1227,7 +1614,7 @@ mod tests {
             want.iter().copied().collect(),
             "the marked, the put again and the appended after stay"
         );
-        let after = fs.allocated(path).await.unwrap();
+        let after = allocated(&fs, path).await.unwrap();
         assert!(
             before - after >= 3 * 20_000,
             "{before} -> {after}, freed {}",
@@ -1267,6 +1654,230 @@ mod tests {
         let swept = log.sweep(0, below, keep_from, &[], &[]).await.unwrap();
         assert_eq!(swept.dropped, vec![h1], "an append alone marks nothing");
         assert_eq!(log.get(&h2).await.unwrap(), Some(b2));
+    }
+
+    #[tokio::test]
+    async fn sweeps_that_each_drop_the_record_before_leave_no_disk_behind() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let rec = |i: u32| {
+            let b = Bytes::from(
+                (0..65_536u32)
+                    .map(|j| u8::try_from((i * 7 + j) % 251).unwrap() | 1)
+                    .collect::<Vec<u8>>(),
+            );
+            (Hash::of(&b), b)
+        };
+        for i in 0..200 {
+            let (h, b) = rec(i);
+            log.put(h, b).await.unwrap();
+            let epoch = log.next_epoch();
+            assert!(log.mark(&h, epoch));
+            log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+            log.compact(0).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        let allocated = allocated(&fs, path).await.unwrap();
+        assert!(
+            allocated <= 2 * (65_536 + 2 * PAGE),
+            "{allocated} bytes allocated for one record of 64 KiB, the log ending at {}",
+            log.end()
+        );
+        drop(log);
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let (h, b) = rec(199);
+        assert_eq!(again.get(&h).await.unwrap(), Some(b));
+        assert!(!again.has(&rec(198).0));
+    }
+
+    #[tokio::test]
+    async fn padding_between_two_runs_a_sweep_drops_joins_them_into_one() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let rec = |i: u8| {
+            let b = Bytes::from(vec![i; 30_000]);
+            (Hash::of(&b), b)
+        };
+        let recs: Vec<(Hash, Bytes)> = (1..=3).map(rec).collect();
+        for (h, b) in &recs {
+            log.put(*h, b.clone()).await.unwrap();
+        }
+        let epoch = log.next_epoch();
+        assert!(log.mark(&recs[0].0, epoch) && log.mark(&recs[2].0, epoch));
+        log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+        let epoch = log.next_epoch();
+        log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+        log.sync().await.unwrap();
+        assert_eq!(
+            allocated(&fs, path).await.unwrap(),
+            2 * PAGE,
+            "one run of padding over all three, which keeps only the page of its header and the \
+             page it ends in"
+        );
+        drop(log);
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert!(recs.iter().all(|(h, _)| !again.has(h)));
+        assert_eq!(again.end(), 3 * (HEADER_LEN + 30_000));
+    }
+
+    async fn segments(fs: &SimFs, path: &Path) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = fs
+            .list(path)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name.parse().unwrap(), e.len))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn rec(i: u32) -> (Hash, Bytes) {
+        let b = Bytes::from(
+            (0..65_536u32)
+                .map(|j| u8::try_from((i * 7 + j) % 251).unwrap() | 1)
+                .collect::<Vec<u8>>(),
+        );
+        (Hash::of(&b), b)
+    }
+
+    #[tokio::test]
+    async fn a_log_that_keeps_one_record_through_much_churn_keeps_its_files_small() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let (kh, kb) = obj(1);
+        log.put(kh, kb.clone()).await.unwrap();
+        for i in 0..400 {
+            let (h, b) = rec(i);
+            log.put(h, b).await.unwrap();
+            let epoch = log.next_epoch();
+            assert!(log.mark(&h, epoch) && log.mark(&kh, epoch));
+            log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+            log.compact(0).await.unwrap();
+        }
+        assert!(seg_of(log.end()) > 20, "the log ends at {}", log.end());
+        let segs = segments(&fs, path).await;
+        assert!(segs.len() <= 2, "{segs:?}");
+        let apparent: u64 = segs.iter().map(|s| s.1).sum();
+        assert!(apparent <= 2 * SEG_ROLL, "{apparent} bytes in {segs:?}");
+        assert_eq!(log.get(&kh).await.unwrap(), Some(kb.clone()));
+        drop(log);
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(again.get(&kh).await.unwrap(), Some(kb));
+        assert_eq!(again.get(&rec(399).0).await.unwrap(), Some(rec(399).1));
+        assert!(!again.has(&rec(398).0));
+    }
+
+    #[tokio::test]
+    async fn a_moved_record_keeps_its_marks_and_age_and_survives_a_crash() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let img = fs.open(Path::new("/c/img"), Open::CreateNew).await.unwrap();
+        let ((kh, kb), (rh, rb), (oh, ob)) = (obj(1), obj(2), obj(3));
+        img.write_at(vec![rb.clone()], 0).await.unwrap();
+        fs.sync_dir(Path::new("/c")).await.unwrap();
+        log.put(kh, kb.clone()).await.unwrap();
+        log.put(oh, ob.clone()).await.unwrap();
+        log.put_ref(rh, Path::new("/c/img"), 0, u32::try_from(rb.len()).unwrap())
+            .await
+            .unwrap();
+        let before = log.end();
+        for i in 0..20 {
+            let (h, b) = rec(i);
+            log.put(h, b).await.unwrap();
+        }
+        assert!(seg_of(log.end()) > 0);
+        let epoch = log.next_epoch();
+        for h in [kh, rh, oh] {
+            assert!(log.mark(&h, epoch));
+        }
+        log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+        log.compact(0).await.unwrap();
+        assert!(
+            segments(&fs, path).await.iter().all(|s| s.0 > 0),
+            "the first segment is gone"
+        );
+        assert!(log.lookup(&kh).unwrap().off >= before);
+        assert_eq!(log.lookup(&kh).unwrap().born, 0);
+        assert_eq!(log.get(&kh).await.unwrap(), Some(kb.clone()));
+        assert_eq!(log.get(&rh).await.unwrap(), Some(rb.clone()));
+
+        let older = log.next_epoch();
+        assert!(log.mark(&kh, older) && log.mark(&rh, older));
+        let swept = log.sweep(0, before, older, &[], &[]).await.unwrap();
+        assert_eq!(
+            swept.dropped,
+            vec![oh],
+            "a moved record is as old as where it was first appended"
+        );
+        fs.crash();
+        drop(log);
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(again.get(&kh).await.unwrap(), Some(kb));
+        assert_eq!(again.get(&rh).await.unwrap(), Some(rb));
+    }
+
+    #[tokio::test]
+    async fn a_segment_that_holds_more_than_a_quarter_stays() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        for i in 0..20 {
+            let (h, b) = rec(i);
+            log.put(h, b).await.unwrap();
+        }
+        let epoch = log.next_epoch();
+        for i in 0..6 {
+            assert!(log.mark(&rec(i).0, epoch));
+        }
+        log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+        log.compact(0).await.unwrap();
+        assert_eq!(
+            segments(&fs, path).await[0].0,
+            0,
+            "six records of 64 KiB are kept in place"
+        );
+        let epoch = log.next_epoch();
+        assert!(log.mark(&rec(0).0, epoch));
+        log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+        log.compact(1).await.unwrap();
+        assert_eq!(
+            segments(&fs, path).await[0].0,
+            0,
+            "a record below the floor stays in place"
+        );
+        log.compact(0).await.unwrap();
+        assert_ne!(segments(&fs, path).await[0].0, 0);
+        assert_eq!(log.get(&rec(0).0).await.unwrap(), Some(rec(0).1));
+    }
+
+    #[tokio::test]
+    async fn a_torn_record_removes_the_segments_after_it() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        for i in 0..20 {
+            let (h, b) = rec(i);
+            log.put(h, b).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        let last = seg_of(log.end());
+        assert!(last > 0);
+        assert_eq!(seg_of(log.lookup(&rec(0).0).unwrap().off), 0);
+        drop(log);
+        let f = fs.open(&path.join("0"), Open::ReadWrite).await.unwrap();
+        let size = f.size().await.unwrap();
+        f.write_at(vec![Bytes::from(vec![9; 50])], size).await.unwrap();
+        fs.remove(Path::new("/c/objects.synced")).await.unwrap();
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert!(again.has(&rec(0).0));
+        assert!(!again.has(&rec(19).0), "the record in a later segment is gone");
+        assert_eq!(segments(&fs, path).await.len(), 1);
+        assert_eq!(again.end(), size);
     }
 
     #[tokio::test]
@@ -1311,7 +1922,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_sweep_that_fails_to_pad_leaves_its_runs_to_the_next() {
-        use crate::ports::LocalImage;
         let fs = SimFs::default();
         let path = Path::new("/c/objects");
         let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
@@ -1320,7 +1930,7 @@ mod tests {
             log.put(Hash::of(&b), b).await.unwrap();
         }
         log.sync().await.unwrap();
-        let before = fs.allocated(path).await.unwrap();
+        let before = allocated(&fs, path).await.unwrap();
         fs.stop_after(Some(0));
         let epoch = log.next_epoch();
         assert!(log.sweep(0, log.end(), epoch, &[], &[]).await.is_err());
@@ -1329,7 +1939,7 @@ mod tests {
         let swept = log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
         assert!(swept.dropped.is_empty(), "the failed sweep dropped them");
         assert!(swept.freed > 0, "the next sweep frees their pages");
-        assert!(fs.allocated(path).await.unwrap() < before);
+        assert!(allocated(&fs, path).await.unwrap() < before);
         drop(log);
         let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         assert_eq!(log.live(), 0, "an open finds padding only");
@@ -1337,7 +1947,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_budget_keeps_the_wanted_records_read_last_and_never_the_marked_ones() {
-        use crate::ports::LocalImage;
         let fs = SimFs::default();
         let path = Path::new("/c/objects");
         let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
@@ -1378,7 +1987,7 @@ mod tests {
         for i in [0, 1, 3, 4, 6] {
             assert!(!log.has(&objs[i].0), "object {i} goes");
         }
-        assert!(fs.allocated(path).await.unwrap() <= 4 * record + 8 * PAGE);
+        assert!(allocated(&fs, path).await.unwrap() <= 4 * record + 8 * PAGE);
 
         log.set_budget(0);
         let epoch = log.next_epoch();

@@ -82,8 +82,9 @@ then flushes the image without Pando. With `--log off`, only uploads reach the s
 
 ## Cache log
 
-The cache log is one append-only file of the objects this host holds: the chunks and tree nodes
-it wrote, and those it fetched. Each commit appends new versions of the chunks it changed, so a
+The cache log is an append-only log of the objects this host holds: the chunks and tree nodes
+it wrote, and those it fetched. It is a directory, `<cache>/objects`, of segment files: appends go
+to the last one, and a record that would take it past 16 GiB starts the next. Each commit appends new versions of the chunks it changed, so a
 sweep drops the old ones. A sweep runs once 1 GiB has been appended since the last one, or as many
 bytes as that sweep kept, if that is more. It keeps:
 
@@ -102,6 +103,13 @@ a sweep that finds more than 1 MiB listed syncs the log itself. A sweep marks in
 than the one later puts use, so a commit that starts after a sweep keeps only what it puts again.
 Under constant random writes, the log stays near the live data plus the trees that uploads in
 flight still need.
+
+Hole punches free the disk of dropped records, but not their place in a file, so after each
+sweep the log compacts: each segment before the last whose records take at most a quarter of it
+has them appended again at the end, and once a sync makes the copies durable, its file is
+removed. A moved record counts as old as where it was first appended. A segment with appends not
+yet settled stays for a later sweep. The log's files thus stay near four times what it keeps,
+plus the last segment, well within the largest file a file system takes.
 
 With `--cache-budget`, the chunks an open branch reaches that are already in the store stay only
 while they fit. A sweep keeps what it must, the chunks appended since the last sweep began, and
