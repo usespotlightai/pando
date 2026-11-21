@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use pando_format::{u64_from, usize_from};
+use pando_format::{Hash, u64_from, usize_from};
 
 use crate::ports::{Clock, Object, ObjectInfo, Store, StoreError, Version};
 
@@ -44,14 +44,13 @@ pub struct Fault {
 #[derive(Debug)]
 struct Stored {
     body: Bytes,
-    version: u64,
+    version: Hash,
     modified: SystemTime,
 }
 
 #[derive(Debug, Default)]
 struct State {
     objects: BTreeMap<String, Stored>,
-    next_version: u64,
     faults: VecDeque<Fault>,
     refused: Vec<StoreOp>,
     latency: Duration,
@@ -59,7 +58,8 @@ struct State {
     versioned: bool,
 }
 
-/// An object store in memory, with S3's conditional write rules.
+/// An object store in memory, with S3's conditional write rules. An object's version is the hash
+/// of its bytes, as an S3 `ETag` is, so writing the same bytes again gives the same version.
 #[derive(Debug)]
 pub struct SimStore {
     state: Mutex<State>,
@@ -201,7 +201,7 @@ impl SimStore {
         }
     }
 
-    fn read(&self, key: &str) -> Result<(Bytes, u64), StoreError> {
+    fn read(&self, key: &str) -> Result<(Bytes, Hash), StoreError> {
         let mut s = self.state.lock();
         if let Some(f) = Self::fault(&mut s, StoreOp::Get) {
             return Err(Self::failure(key, f));
@@ -233,8 +233,7 @@ impl SimStore {
             }
             _ => {}
         }
-        s.next_version += 1;
-        let version = s.next_version;
+        let version = Hash::of(&body);
         s.objects.insert(
             key.to_string(),
             Stored {

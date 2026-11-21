@@ -89,6 +89,50 @@ impl Writer {
     }
 }
 
+/// One life of a branch, drawn at random when its ref is created, so a branch made again under
+/// a deleted name has another. Its ref, the keys of its write log and a host's state of it all
+/// carry it: nothing of an earlier life under the name is read, resumed or replaced as this
+/// one's, and the ref's bytes differ from any earlier life's, so a write conditional on an
+/// earlier life's version fails.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct BranchId(pub [u8; 16]);
+
+impl BranchId {
+    /// The id of a ref that has none, as the Go proof of concept writes them. A ref this build
+    /// creates never has it.
+    pub const NONE: BranchId = BranchId([0; 16]);
+
+    /// The id whose bytes are `hi` then `lo`, big-endian.
+    pub fn from_parts(hi: u64, lo: u64) -> BranchId {
+        let mut b = [0; 16];
+        b[..8].copy_from_slice(&hi.to_be_bytes());
+        b[8..].copy_from_slice(&lo.to_be_bytes());
+        BranchId(b)
+    }
+}
+
+impl fmt::Display for BranchId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl fmt::Debug for BranchId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BranchId({self})")
+    }
+}
+
+impl FromStr for BranchId {
+    type Err = FormatError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut id = [0; 16];
+        hex::decode_to_slice(s, &mut id).map_err(|e| FormatError::malformed("branch id", e.to_string()))?;
+        Ok(BranchId(id))
+    }
+}
+
 impl fmt::Display for SegId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
@@ -114,6 +158,14 @@ impl FromStr for SegId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_ids_parse_back() {
+        let id = BranchId::from_parts(1, u64::MAX);
+        assert_eq!(id.to_string(), "0000000000000001ffffffffffffffff");
+        assert_eq!(id.to_string().parse::<BranchId>().unwrap(), id);
+        assert!("0001".parse::<BranchId>().is_err());
+    }
 
     #[test]
     fn segment_ids_carry_their_writer_and_count_up() {

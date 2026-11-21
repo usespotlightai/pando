@@ -1,8 +1,9 @@
 # Specs
 
 `WriteLog.tla` is a TLA+ specification of one branch's write log: the open, the scan and seals,
-the generation take, the shipper, the uploader, the trims, `close_log` and `pando advance`, with
-hosts that crash, lose their disk and race each other on the store. TLC checks it on small models, and traces of
+the generation take, the shipper, the uploader, the trims, `close_log`, `pando advance`, and
+`pando delete` followed by a new branch under the same name, with hosts that crash, lose their
+disk and race each other on the store. TLC checks it on small models, and traces of
 the engine from `pando-dst` are checked against it, so the spec stays the protocol the code
 runs.
 
@@ -19,6 +20,7 @@ histories, which on a real disk is a file system that no flush ever produced.
 | `StrictFlushesSurvive` | A writer that takes the branch holds every strict flush that any writer returned from before the take. |
 | `RefHoldsAWriterState` | The ref only ever holds a state some writer committed. |
 | `AdvanceDropsWhatItReplaced` | A writer that takes the branch after an advance holds no flush older than the advance, unless the root the advance moved to holds it. |
+| `DeleteDropsTheOldBranch` | A branch made under a deleted branch's name holds none of the deleted branch's writes: not in its ref, and not in what a writer that took it opened. |
 
 Each action names the code it models:
 
@@ -36,10 +38,16 @@ Each action names the code it models:
 | `Ack` | `Inner::wait_logged`, the return of a strict flush |
 | `Stop`, `Lose` | a crash, kill or detach; a host lost with its disk |
 | `AdvanceRead`, `AdvanceScan`, `AdvanceSeal`, `AdvancePut`, `AdvanceStop` | `branch::advance`, `log::seal` |
+| `DeleteRead`, `DeleteRef`, `DeleteList`, `DeleteRecord`, `DeleteStop` | `branch::delete` |
+| `Create` | `Volume::create` under the deleted branch's name, with a branch id no earlier life had |
+| `GcSweep` | `gc::collect`, which deletes the records of branch lives no ref names |
+
+The ref's version is a hash of its contents, as an S3 ETag is, so two refs with the same contents
+have the same version; the simulated store in `pando-engine` versions objects the same way.
 
 Not modelled: transient store errors (a failed call is retried or ends the process, which
-`Stop` covers), the contents of segments and checkpoints, deleting a branch and making a new one
-under the same name, and more than one branch.
+`Stop` covers), the contents of segments and checkpoints, two deletes of the branch at once, and
+more than one branch.
 
 ## Running
 
@@ -52,16 +60,17 @@ tools/tlc.sh
 
 That checks every model in `specs/*.cfg`, the ones a pull request runs. `WriteLog.cfg` has two
 hosts, two writes, three opens and strict mode, and checks every behaviour of up to 24 steps:
-about 3.8 million distinct states. `WriteLog-advance.cfg` adds one advance with two opens, to 16
-steps: about 1.1 million states.
+about 3.1 million distinct states. `WriteLog-advance.cfg` adds one advance with two opens, to 16
+steps: about 1.1 million states. `WriteLog-delete.cfg` has two hosts, two writes, two opens and
+one delete followed by a create, to 20 steps: about 2.5 million states.
 
 ```bash
 tools/tlc.sh nightly
 ```
 
 That checks `specs/nightly/*.cfg`: every behaviour of the first model with no bound on its
-length, both log modes, three hosts, and an advance with three opens. `deep.yml` runs them each
-night.
+length, both log modes, three hosts, an advance with three opens, and two deletes with three
+opens. `deep.yml` runs them each night.
 
 A single model takes TLC's arguments after it, such as `-depth` or `-simulate`:
 
@@ -75,7 +84,8 @@ A violation prints the behaviour that breaks the invariant, one state per step.
 
 The race scenario in `pando-dst/tests/scenarios.rs` runs two hosts that open, flush, checkpoint,
 detach, crash and lose their disk on one branch, over a simulated store with latency. A third
-host advances the branch now and then, to a new empty branch or to a copy of what it published. With
+host advances the branch now and then, to a new empty branch or to a copy of what it published,
+or deletes it and makes it again under its name while the other hosts' writers still run. With
 `PANDO_TLA_TRACES` set, each seed also writes every call on the branch's ref and log, in the
 order the store applied them, and every write and flush of a writer, as
 `race-<seed>/TraceData.tla`.
@@ -126,3 +136,26 @@ known to see it.
   `an_advance_drops_and_fences_a_running_writer` and
   `a_host_does_not_resume_what_an_advance_dropped` each fail without their half of the fix, and
   the race scenario fails at seed 0 on the old `advance` and on one that keeps the generation.
+- **Deleting a branch and making it again under its name.** A branch's ref, log keys and local
+  state named it only by its name, so the new branch took over parts of the deleted one. TLC
+  found four ways, each with the earlier ones patched out:
+  - A writer of the deleted branch published onto the new one, in 12 steps. Its ref was
+    byte-identical to the deleted branch's at the same generation, so it had the same ETag and
+    the writer's conditional update succeeded. The simulated store numbered versions, which
+    hid this; it now hashes the bytes.
+  - A delete that listed the log after the new branch's writer had logged a strict flush deleted
+    that flush's record, in 18 steps.
+  - A host that had committed on the deleted branch, but not uploaded, resumed that state on the
+    new branch, in 14 steps: the root and generation matched.
+  - Records an interrupted delete left, or that a writer of the deleted branch shipped after the
+    delete listed the log, were replayed onto the new branch or fenced its first writer, in
+    21 steps.
+
+  The fix is a branch id in each ref, drawn at random when the ref is created. It
+  is in the keys of the branch's log and in each host's state of the branch, so the new branch
+  reads and deletes none of the old one's records, no host resumes the old one's state on it,
+  and the old writers' updates fail. GC deletes the records of lives no ref names. The unit
+  tests `a_writer_of_a_deleted_branch_cannot_publish_to_one_made_again_under_its_name`,
+  `a_host_does_not_resume_a_deleted_branch_on_one_made_again_under_its_name` and
+  `a_branch_made_again_under_a_name_whose_delete_stopped_replays_none_of_its_log` fail without
+  it.

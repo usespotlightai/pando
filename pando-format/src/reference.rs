@@ -1,14 +1,17 @@
-use crate::{Entry, FormatError, LogPos};
+use crate::{BranchId, Entry, FormatError, LogPos};
 
 /// A branch: its size, its root, and the generation of its current writer. Opening a branch
 /// for writing takes generation + 1, which fences every older writer at once. `from` names the
 /// ref the branch was forked from, so hosts can follow it. `log` is where the branch's write
 /// log stands; a branch without it has no records the root lacks, except from its current
-/// writer.
+/// writer. `id` names this life of the branch: a branch made again under a deleted name has
+/// another.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ref {
     /// The branch's size in bytes.
     pub size: u64,
+    /// This life of the branch; [`BranchId::NONE`] only in a ref the Go proof of concept wrote.
+    pub id: BranchId,
     /// The root of the branch's tree; empty for a branch with no data.
     pub root: Entry,
     /// The generation of the branch's current writer.
@@ -20,11 +23,17 @@ pub struct Ref {
 }
 
 impl Ref {
-    /// `<size> <generation> <root entry>\n`, then `from <ref>\n` when forked, then
+    /// `<size> <generation> <root entry>\n`, then `id <hex>\n` unless the id is
+    /// [`BranchId::NONE`], then `from <ref>\n` when forked, then
     /// `log <generation> <flush> <next>\n`, with ` closed` before the newline when closed, when
     /// it has a log position.
     pub fn encode(&self) -> Vec<u8> {
         let mut s = format!("{} {} {}\n", self.size, self.generation, self.root);
+        if self.id != BranchId::NONE {
+            s.push_str("id ");
+            s.push_str(&self.id.to_string());
+            s.push('\n');
+        }
         if let Some(from) = &self.from {
             s.push_str("from ");
             s.push_str(from);
@@ -56,9 +65,19 @@ impl Ref {
         let (Some(size), Some(generation), Some(root)) = (f.next(), f.next(), f.next()) else {
             return Err(bad("want size, generation and root"));
         };
-        let (mut from, mut log) = (None, None);
+        let (mut id, mut from, mut log) = (None, None, None);
         for line in lines.map(str::trim).filter(|l| !l.is_empty()) {
-            if let Some(f) = line.strip_prefix("from ")
+            if let Some(i) = line.strip_prefix("id ")
+                && id.is_none()
+                && from.is_none()
+                && log.is_none()
+            {
+                let i: BranchId = i.parse()?;
+                if i == BranchId::NONE {
+                    return Err(bad("zero id"));
+                }
+                id = Some(i);
+            } else if let Some(f) = line.strip_prefix("from ")
                 && from.is_none()
                 && log.is_none()
             {
@@ -73,6 +92,7 @@ impl Ref {
         }
         Ok(Ref {
             size: size.parse().map_err(|_| bad("size"))?,
+            id: id.unwrap_or(BranchId::NONE),
             generation: generation.parse().map_err(|_| bad("generation"))?,
             root: Entry::parse_text(root)?,
             from,
@@ -126,10 +146,15 @@ mod tests {
                 closed: true,
             }),
         ];
-        for from in [None, Some("main".to_string())] {
+        for (id, from) in [
+            (BranchId::NONE, None),
+            (BranchId::from_parts(7, 9), None),
+            (BranchId::from_parts(7, 9), Some("main".to_string())),
+        ] {
             for log in logs {
                 let r = Ref {
                     size: 1 << 30,
+                    id,
                     root: Entry {
                         hash: Hash::of(b"x"),
                         ..Entry::EMPTY
@@ -158,6 +183,20 @@ mod tests {
         let mut b = Ref::default().encode();
         b.extend_from_slice(b"log 1 2 3\nlog 1 2 3\n");
         assert!(Ref::decode(&b).is_err());
+    }
+
+    #[test]
+    fn ref_with_a_bad_or_late_id_is_rejected() {
+        for tail in [
+            "id 00000000000000000000000000000000\n",
+            "id 0001\n",
+            "id 00000000000000070000000000000009\nid 00000000000000070000000000000009\n",
+            "from main\nid 00000000000000070000000000000009\n",
+        ] {
+            let mut b = Ref::default().encode();
+            b.extend_from_slice(tail.as_bytes());
+            assert!(Ref::decode(&b).is_err(), "{tail:?}");
+        }
     }
 
     #[test]

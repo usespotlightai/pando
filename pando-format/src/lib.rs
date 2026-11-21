@@ -33,7 +33,7 @@ pub use entry::{ENTRY_SIZE, Entry, Loc};
 pub use error::{FormatError, IntegrityError};
 pub use frame::{DecodedFrame, FRAME_MAX, FrameBuilder, ZSTD_LEVEL, decode_frame};
 pub use hash::Hash;
-pub use ids::{SegId, Writer, WriterId};
+pub use ids::{BranchId, SegId, Writer, WriterId};
 pub use index::SegmentIndex;
 pub use log::{
     LOG_CHUNKS_MAX, LOG_DATA_CHUNKS_MAX, LOG_MAGIC, LOG_SEAL_LEN, LOG_ZSTD_LEVEL, LogBody, LogPos, LogRecord,

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pando_format::{Checkpoint, LogPos, Ref};
+use pando_format::{BranchId, Checkpoint, LogPos, Ref};
 
 use crate::remote::Remote;
 use crate::volume::seal_log;
@@ -18,11 +18,17 @@ use crate::{Error, Ports, Result};
 pub async fn copy(ports: &Ports, src: &str, dst: &str, max_age: Option<Duration>) -> Result<()> {
     let started = tokio::time::Instant::now();
     let remote = Remote::new(Arc::clone(&ports.store));
-    let (mut r, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
-    r.generation = 0;
-    r.from = Some(src.to_owned());
-    r.log = None;
-    remote.create_ref(dst, &r).await?;
+    let (r, _) = remote.get_ref(src).await?.ok_or_else(|| no_branch(src))?;
+    remote
+        .create_ref(ports.rng.as_ref(), dst, |id| Ref {
+            size: r.size,
+            id,
+            root: r.root,
+            generation: 0,
+            from: Some(src.to_owned()),
+            log: None,
+        })
+        .await?;
     if let Some(max) = max_age
         && started.elapsed() > max
     {
@@ -100,8 +106,10 @@ pub async fn from_checkpoint(
     let remote = Remote::new(Arc::clone(&ports.store));
     let ours = match kept.get(name) {
         Some(c) => {
-            let r = copy_of(&c);
-            let (made, now) = futures::join!(remote.create_ref(dst, &r), remote.get_checkpoint(name));
+            let (made, now) = futures::join!(
+                remote.create_ref(ports.rng.as_ref(), dst, |id| copy_of(&c, id)),
+                remote.get_checkpoint(name)
+            );
             made?;
             match now {
                 Ok(Some(now)) if now == c => None,
@@ -120,7 +128,9 @@ pub async fn from_checkpoint(
         ),
     };
     if let Some(c) = ours {
-        remote.create_ref(dst, &copy_of(&c)).await?;
+        remote
+            .create_ref(ports.rng.as_ref(), dst, |id| copy_of(&c, id))
+            .await?;
         kept.keep(name, c);
     }
     if let Some(max) = max_age
@@ -154,9 +164,10 @@ pub async fn list_checkpoints(ports: &Ports) -> Result<Vec<(String, Checkpoint)>
     Ok(out)
 }
 
-fn copy_of(c: &Checkpoint) -> Ref {
+fn copy_of(c: &Checkpoint, id: BranchId) -> Ref {
     Ref {
         size: c.size,
+        id,
         root: c.root,
         generation: 0,
         from: Some(c.branch.clone()),
@@ -196,13 +207,19 @@ pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
     remote.put_ref(dst, &to, &version).await.map(drop)
 }
 
-/// Deletes branch `name`, then its write log, so a branch made later under the name starts
-/// with none. Its segments go at the next GC that finds them unreached.
+/// Deletes branch `name`, then the write log of the life it deleted. A branch made later under
+/// the name is another life, which reads none of that log, so a delete that stops part way
+/// harms no later branch. Its segments, and any records of its log left behind, go at the next
+/// GC that finds them unreached. The ref's delete is not conditional: a delete that runs while
+/// the branch is deleted and made again elsewhere may delete the new branch.
 pub async fn delete(ports: &Ports, name: &str) -> Result<()> {
     let remote = Remote::new(Arc::clone(&ports.store));
+    let Some((r, _)) = remote.get_ref(name).await? else {
+        return Ok(());
+    };
     remote.delete_ref(name).await?;
-    for (generation, n, _) in remote.list_log(name).await? {
-        remote.delete_log_record(name, generation, n).await?;
+    for (generation, n, _) in remote.list_log(name, r.id).await? {
+        remote.delete_log_record(name, r.id, generation, n).await?;
     }
     Ok(())
 }
@@ -338,7 +355,7 @@ mod tests {
 
         delete(&ports, "foo").await.unwrap();
         assert_eq!(
-            store.keys(&pando_format::keys::log_branch("foo")),
+            store.keys(&pando_format::keys::log_name("foo")),
             Vec::<String>::new()
         );
         copy(&ports, "main", "foo", None).await.unwrap();
@@ -358,6 +375,118 @@ mod tests {
         v.write_at(&vec![2; CHUNK_SIZE], 0).await.unwrap();
         v.flush().await.unwrap();
         v.close().await;
+    }
+
+    async fn host(ports: &Ports, dir: &str) -> Arc<Cache> {
+        Arc::new(Cache::open(ports, Path::new(dir)).await.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_of_a_deleted_branch_cannot_publish_to_one_made_again_under_its_name() {
+        let (ports, store, _) = sim::ports(5);
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let old = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "foo")
+            .await
+            .unwrap();
+        store.hold(sim::StoreOp::Create, pando_format::keys::SEGMENTS);
+        old.write_at(&vec![9; CHUNK_SIZE], 0).await.unwrap();
+        old.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        delete(&ports, "foo").await.unwrap();
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let new = Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "foo")
+            .await
+            .unwrap();
+        store.release(sim::StoreOp::Create, pando_format::keys::SEGMENTS);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        old.close().await;
+        new.close().await;
+
+        assert_eq!(first_byte(&ports, &host(&ports, "/c").await, "foo").await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_does_not_resume_a_deleted_branch_on_one_made_again_under_its_name() {
+        let (ports, store, fs) = sim::ports(6);
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let old = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "foo")
+            .await
+            .unwrap();
+        store.refuse(sim::StoreOp::Create);
+        old.write_at(&vec![9; CHUNK_SIZE], 0).await.unwrap();
+        old.flush().await.unwrap();
+        old.close().await;
+        drop(old);
+        fs.crash();
+        store.accept();
+
+        delete(&ports, "foo").await.unwrap();
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        Volume::open(&ports, host(&ports, "/b").await, Path::new("/b"), "foo")
+            .await
+            .unwrap()
+            .close()
+            .await;
+
+        let again = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "foo")
+            .await
+            .unwrap();
+        let mut b = [0; 1];
+        again.read_at(&mut b, 0).await.unwrap();
+        again.close().await;
+        assert_eq!(b[0], 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_branch_made_again_under_a_name_whose_delete_stopped_replays_none_of_its_log() {
+        let (ports, store, _) = sim::ports(7);
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let old = Volume::open_logged(
+            &ports,
+            host(&ports, "/a").await,
+            Path::new("/a"),
+            "foo",
+            LogMode::Strict,
+        )
+        .await
+        .unwrap();
+        old.wait_generation().await.unwrap();
+        store.refuse(sim::StoreOp::Update);
+        old.write_at(&vec![9; CHUNK_SIZE], 0).await.unwrap();
+        old.flush().await.unwrap();
+        old.close().await;
+        store.accept();
+
+        store.inject(sim::Fault {
+            op: sim::StoreOp::Delete,
+            applied: true,
+            permanent: false,
+        });
+        assert!(delete(&ports, "foo").await.is_err());
+        assert_ne!(
+            store.keys(&pando_format::keys::log_name("foo")),
+            Vec::<String>::new()
+        );
+        Volume::create(&ports, "foo", 1 << 20).await.unwrap();
+        let new = Volume::open_logged(
+            &ports,
+            host(&ports, "/b").await,
+            Path::new("/b"),
+            "foo",
+            LogMode::Strict,
+        )
+        .await
+        .unwrap();
+        new.wait_generation().await.unwrap();
+        let mut b = [0; 1];
+        new.read_at(&mut b, 0).await.unwrap();
+        assert_eq!(b[0], 0);
+        new.write_at(&vec![2; CHUNK_SIZE], 0).await.unwrap();
+        new.flush().await.unwrap();
+        new.close().await;
+
+        assert_eq!(first_byte(&ports, &host(&ports, "/c").await, "foo").await, 2);
     }
 
     #[tokio::test(start_paused = true)]

@@ -18,8 +18,9 @@ pub struct StoreFormat {
 impl StoreFormat {
     /// The format this build writes.
     pub const CURRENT: StoreFormat = StoreFormat { major: 1, minor: 0 };
-    /// The format of a store with no marker: one written before markers existed.
-    pub const UNMARKED: StoreFormat = StoreFormat { major: 1, minor: 0 };
+    /// The format of a store with no marker: one no build has written to, since every build
+    /// that writes a store marks it first.
+    pub const UNMARKED: StoreFormat = StoreFormat::CURRENT;
 
     /// `pando-format <major>.<minor>\n`.
     pub fn encode(self) -> Vec<u8> {

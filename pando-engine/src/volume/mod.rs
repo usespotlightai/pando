@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use pando_format::{
-    BLOCK_SIZE, BlockKeys, CHUNK_SIZE, Entry, Hash, Ref, Writer, WriterId, depth_for, is_zero, u64_from,
-    usize_from,
+    BLOCK_SIZE, BlockKeys, BranchId, CHUNK_SIZE, Entry, Hash, Ref, Writer, WriterId, depth_for, is_zero,
+    u64_from, usize_from,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, watch};
 use tokio::task::JoinHandle;
@@ -223,6 +223,7 @@ struct Inner {
     /// new size.
     size: AtomicU64,
     generation: u64,
+    id: BranchId,
     from: Option<String>,
     remote: Remote,
     cache: Arc<Cache>,
@@ -276,11 +277,12 @@ pub struct Volume {
 }
 
 impl VolState {
-    /// Whether a writer may resume this state over ref `r`: the ref holds the root this state
-    /// published or was publishing, and the last writer to take the branch is the one this
-    /// state names.
+    /// Whether a writer may resume this state over ref `r`: the ref is of the life of the
+    /// branch this state wrote, holds the root this state published or was publishing, and the
+    /// last writer to take the branch is the one this state names.
     fn resumes(&self, r: &Ref) -> bool {
-        (self.published.hash == r.root.hash || self.publishing.hash == r.root.hash)
+        self.id == Some(r.id)
+            && (self.published.hash == r.root.hash || self.publishing.hash == r.root.hash)
             && self.generation.is_none_or(|g| g == r.generation)
     }
 }
@@ -322,15 +324,13 @@ impl Roots for Inner {
 impl Volume {
     /// Creates branch `name` of `size` bytes, all zero.
     pub async fn create(ports: &Ports, name: &str, size: u64) -> Result<()> {
-        let r = Ref {
-            size,
-            root: Entry::EMPTY,
-            generation: 0,
-            from: None,
-            log: None,
-        };
         Remote::new(Arc::clone(&ports.store))
-            .create_ref(name, &r)
+            .create_ref(ports.rng.as_ref(), name, |id| Ref {
+                size,
+                id,
+                root: Entry::EMPTY,
+                ..Ref::default()
+            })
             .await
             .map(drop)
     }
@@ -383,6 +383,7 @@ impl Volume {
             name: name.to_owned(),
             size: AtomicU64::new(size),
             generation,
+            id: r.id,
             from: r.from.clone(),
             remote,
             opened_tree: tree,
@@ -1181,6 +1182,7 @@ impl Inner {
             jfloor,
             size: Some(size),
             generation: Some(self.state_generation.load(Ordering::Acquire)),
+            id: Some(self.id),
         };
         write_durable(self.fs.as_ref(), &self.state_path, st.encode()).await?;
         self.mem.lock().persisted.retain(|p| p.0.hash == root.hash);
@@ -1762,6 +1764,7 @@ impl Inner {
         let pos = self.log_pos(seq);
         let r = Ref {
             size,
+            id: self.id,
             root: packed,
             generation: self.generation,
             from: self.from.clone(),
@@ -2525,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_state_without_a_size_or_generation_still_reads() {
+    fn a_state_without_a_size_generation_or_id_still_reads() {
         let s = VolState {
             root: Entry::EMPTY,
             published: Entry::EMPTY,
@@ -2533,16 +2536,21 @@ mod tests {
             jfloor: 7,
             size: Some(8 << 30),
             generation: Some(4),
+            id: Some(BranchId::from_parts(3, 4)),
         };
         assert_eq!(VolState::decode(&s.encode()), Some(s));
+        let no_id = VolState { id: None, ..s };
+        assert_eq!(VolState::decode(&no_id.encode()), Some(no_id));
         let sized = VolState {
             generation: None,
+            id: None,
             ..s
         };
         assert_eq!(VolState::decode(&sized.encode()), Some(sized));
         let old = VolState {
             size: None,
             generation: None,
+            id: None,
             ..s
         };
         let four = String::from_utf8(old.encode().to_vec()).unwrap();

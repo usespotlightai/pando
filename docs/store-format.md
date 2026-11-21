@@ -24,7 +24,7 @@ others (`init`, `refs`, `branch`, `checkpoint`, `checkpoints`, `delete-checkpoin
 - `detach` and `resize` talk only to the daemon of an attached device and skip the check.
 - The host daemon (`pando serve`) checks the marker for the first command it runs that reads
   and for the first that writes, and not again: the commands after them pay no extra GET.
-- A store without a marker was written before markers existed and is in format 1.0.
+- A store without a marker is one no build has written to, and is in this build's format.
 - A marker with a major version this build does not read stops the command before it touches
   anything else in the store: `the store is in format 2.0; this pando reads format 1.x`.
 
@@ -52,6 +52,14 @@ A major change needs:
 1. new golden fixtures, checked in both directions (`tools/golden/run.sh write`, then `read`);
 2. a migration, or a new store, for the data in existing stores;
 3. a new marker, written last, once the store holds only objects of the new format.
+
+## Format 1.0
+
+Each ref has an `id` line after its first line: the branch id, 32 hex digits, drawn at random
+when the ref is created. A branch made again under a deleted branch's name gets another, so its
+ref's bytes, and so its ETag, differ from the deleted one's. The write log of a branch is at
+`log/<hash of the branch name>/<branch id>/<writer generation>/<n>`, so each life of a branch has
+a log of its own.
 
 Each kind of object does not carry its own version yet. Add one when a change has to let objects
 of two formats live in the same store.
