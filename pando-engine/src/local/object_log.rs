@@ -82,6 +82,9 @@ pub(crate) struct ObjectLog {
     /// Where appends that could write neither their record nor their padding start, with
     /// the length of the padding they need.
     unpadded: Arc<Mutex<BTreeMap<u64, u32>>>,
+    /// Where appends started whose records are not indexed yet. [`ObjectLog::compact`] keeps
+    /// their segments.
+    unindexed: Mutex<BTreeSet<u64>>,
     _lock: Box<dyn FileLock>,
     files: Mutex<BTreeMap<PathBuf, Arc<ExtFile>>>,
     unwritten: AtomicU64,
@@ -306,6 +309,19 @@ impl Drop for WritebackHold<'_> {
     }
 }
 
+/// An append whose record is not indexed yet; drop it once the record is indexed or given up.
+#[derive(Debug)]
+struct Unindexed<'a> {
+    log: &'a ObjectLog,
+    at: u64,
+}
+
+impl Drop for Unindexed<'_> {
+    fn drop(&mut self) {
+        self.log.unindexed.lock().remove(&self.at);
+    }
+}
+
 /// How much of the log a scan reads at once.
 const SCAN_WINDOW: usize = 4 << 20;
 
@@ -464,6 +480,7 @@ impl ObjectLog {
             in_flight: Arc::default(),
             landed: Arc::default(),
             unpadded: Arc::default(),
+            unindexed: Mutex::default(),
             _lock: lock,
             files: Mutex::default(),
             unwritten: AtomicU64::new(0),
@@ -754,8 +771,9 @@ impl ObjectLog {
 
     /// Writes a record at the end of the log, in a new segment when it would end past
     /// [`SEG_ROLL`] of the last. The write runs on its own task, so a caller that stops waiting
-    /// leaves no hole: a failed write leaves padding instead.
-    async fn append(&self, h: Hash, hdr: Bytes, body: Bytes) -> Result<u64> {
+    /// leaves no hole: a failed write leaves padding instead. Returns the record's offset and
+    /// an [`Unindexed`] that keeps its segment from [`Self::compact`]; drop it after indexing.
+    async fn append(&self, h: Hash, hdr: Bytes, body: Bytes) -> Result<(u64, Unindexed<'_>)> {
         let pad_len = u32::try_from(body.len())
             .map_err(|_| Error::Corrupt(format!("object {h} has a record of {} bytes", body.len())))?;
         let n = u64_from(hdr.len() + body.len());
@@ -767,8 +785,10 @@ impl ObjectLog {
             }
             self.end.store(at + n, Ordering::Release);
             f.insert(at);
+            self.unindexed.lock().insert(at);
             at
         };
+        let pending = Unindexed { log: self, at };
         let (segs, in_flight, landed, unpadded) = (
             Arc::clone(&self.segs),
             Arc::clone(&self.in_flight),
@@ -801,7 +821,7 @@ impl ObjectLog {
         });
         let r = task.await.map_err(io::Error::other)?;
         r.map_err(|e| Error::Io(io::Error::new(e.kind(), format!("write object {h}: {e}"))))?;
-        Ok(at)
+        Ok((at, pending))
     }
 
     /// Appends object `h`. Readers see it only once it is written. Durable after [`Self::sync`].
@@ -811,8 +831,9 @@ impl ObjectLog {
         }
         let len =
             u32::try_from(b.len()).map_err(|_| Error::Corrupt(format!("object {h} of {} bytes", b.len())))?;
-        let at = self.append(h, header(h, len), b).await?;
+        let (at, pending) = self.append(h, header(h, len), b).await?;
         self.index(h, Loc::new(at, len, None, self.tick()));
+        drop(pending);
         self.live.fetch_add(u64::from(len) + HEADER_LEN, Ordering::AcqRel);
         self.appended(u64::from(len) + HEADER_LEN);
         let n = self
@@ -839,9 +860,10 @@ impl ObjectLog {
         }
         ext.needs_sync.store(true, Ordering::Release);
         let (plen, payload) = ref_payload(h, path, offset, len)?;
-        let at = self.append(h, header(h, REF_FLAG | plen), payload).await?;
+        let (at, pending) = self.append(h, header(h, REF_FLAG | plen), payload).await?;
         let n = u64::from(plen) + HEADER_LEN;
         self.index(h, Loc::new(at, len, Some((ext, offset)), self.tick()));
+        drop(pending);
         self.appended(n);
         Ok(())
     }
@@ -1116,16 +1138,21 @@ impl ObjectLog {
 
     /// Removes each segment before the last whose records take at most a quarter of
     /// [`SEG_ROLL`], once it moved them to the end of the log and a sync made them durable
-    /// there. A segment with a record from below `floor`, or with an append not settled yet,
-    /// stays. A crash before the removal leaves both copies, and the next sweep drops the
+    /// there. A segment with a record from below `floor`, with an append not settled yet, or
+    /// with a record not indexed yet, stays. Callers must not run it beside [`Self::sweep`] or
+    /// another compaction. A crash before the removal leaves both copies, and the next sweep drops the
     /// later one.
     #[expect(
         clippy::iter_over_hash_type,
         reason = "the records of each segment are moved in any order"
     )]
     pub(crate) async fn compact(&self, floor: u64) -> Result<()> {
-        let last = seg_of(self.end());
-        let mut busy: HashSet<u64> = self.in_flight.lock().iter().map(|&a| seg_of(a)).collect();
+        let (last, mut busy) = {
+            let f = self.in_flight.lock();
+            let mut busy: HashSet<u64> = f.iter().map(|&a| seg_of(a)).collect();
+            busy.extend(self.unindexed.lock().iter().map(|&a| seg_of(a)));
+            (seg_of(self.end()), busy)
+        };
         busy.extend(self.unpadded.lock().keys().map(|&a| seg_of(a)));
         let ids: Vec<u64> = self
             .segs
@@ -1215,7 +1242,7 @@ impl ObjectLog {
                     (header(h, REF_FLAG | plen), p)
                 }
             };
-            let at = self.append(h, hdr, body).await?;
+            let (at, pending) = self.append(h, hdr, body).await?;
             let new = Arc::new(Loc {
                 off: at,
                 born: old.born,
@@ -1236,6 +1263,7 @@ impl ObjectLog {
                 drop(m);
                 self.orphans.lock().push((at, new.end()));
             }
+            drop(pending);
         }
         Ok(out)
     }
@@ -1853,6 +1881,36 @@ mod tests {
         log.compact(0).await.unwrap();
         assert_ne!(segments(&fs, path).await[0].0, 0);
         assert_eq!(log.get(&rec(0).0).await.unwrap(), Some(rec(0).1));
+    }
+
+    #[tokio::test]
+    async fn a_record_that_landed_but_is_not_indexed_keeps_its_segment() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        for i in 0..14 {
+            let (h, b) = rec(i);
+            log.put(h, b).await.unwrap();
+        }
+        let (h, b) = rec(100);
+        let len = u32::try_from(b.len()).unwrap();
+        let (at, pending) = log.append(h, header(h, len), b.clone()).await.unwrap();
+        assert_eq!(seg_of(at), 0);
+        for i in 14..20 {
+            let (h, b) = rec(i);
+            log.put(h, b).await.unwrap();
+        }
+        assert!(seg_of(log.end()) > 0);
+        let epoch = log.next_epoch();
+        log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+        log.compact(0).await.unwrap();
+        assert_eq!(segments(&fs, path).await[0].0, 0);
+        log.index(h, Loc::new(at, len, None, log.tick()));
+        drop(pending);
+        assert_eq!(log.get(&h).await.unwrap(), Some(b.clone()));
+        log.compact(0).await.unwrap();
+        assert_ne!(segments(&fs, path).await[0].0, 0);
+        assert_eq!(log.get(&h).await.unwrap(), Some(b));
     }
 
     #[tokio::test]
