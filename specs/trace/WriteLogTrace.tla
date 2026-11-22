@@ -22,9 +22,11 @@ VARIABLES ref, store, disk, proc, nextId, opens, advances, acked, histories, del
 
 vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, deleted, i>>
 
+Deletes == 1..TraceDeletes
+
 WL == INSTANCE WriteLog WITH Hosts <- TraceHosts, Modes <- {"behind", "strict"},
                              MaxWrites <- TraceWrites, MaxOpens <- TraceOpens,
-                             MaxAdvances <- TraceAdvances, MaxDeletes <- TraceDeletes, Depth <- 0
+                             MaxAdvances <- TraceAdvances, Deletes <- Deletes, Depth <- 0
 
 Init == WL!Init /\ i = 0
 
@@ -52,7 +54,7 @@ Moved(e) == e.ok <=> ref' /= ref
 
 \* The deletes are alike and the trace does not name them, so a delete that
 \* starts takes the first that has not started.
-First(d) == \A c \in WL!Deletes : c < d => deleted.by[c].pc /= "ready"
+First(d) == \A c \in Deletes : c < d => deleted.by[c].pc /= "ready"
 
 \* The calls of branch::advance: the read of the ref, the seal of the writer's
 \* log, and the update of the ref to the root the trace names. Those of
@@ -70,18 +72,18 @@ Advancing(e) ==
             /\ advances.n = e.n /\ e.kind = "seal" /\ Free(e)
             /\ WL!AdvanceSeal
       [] e.op = "delete_get" ->
-            \E d \in WL!Deletes :
+            \E d \in Deletes :
                 /\ e.found = ref.exists
                 /\ \/ First(d) /\ WL!DeleteRead(d)
                    \/ WL!DeleteReread(d)
       [] e.op = "delete_ref" ->
-            \E d \in WL!Deletes :
+            \E d \in Deletes :
                 /\ e.found = ref.exists
                 /\ WL!DeleteRef(d)
                 /\ e.ok = (deleted'.by[d].pc = "list")
-      [] e.op = "list_log" -> \E d \in WL!Deletes : WL!DeleteList(d)
+      [] e.op = "list_log" -> \E d \in Deletes : WL!DeleteList(d)
       [] e.op = "delete_log" ->
-            \E d \in WL!Deletes :
+            \E d \in Deletes :
                 /\ deleted.by[d].life = e.l
                 /\ WL!DeleteRecord(d, <<e.g, e.n>>)
       [] e.op = "create_ref" -> WL!Create

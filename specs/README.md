@@ -62,17 +62,21 @@ That checks every model in `specs/*.cfg`, the ones a pull request runs. `WriteLo
 hosts, two writes, three opens and strict mode, and checks every behaviour of up to 24 steps:
 about 3.1 million distinct states. `WriteLog-advance.cfg` adds one advance with two opens, to 16
 steps: about 1.1 million states. `WriteLog-delete.cfg` has two hosts, two writes, two opens and
-one delete followed by a create, to 20 steps: about 2.5 million states. `WriteLog-deletes.cfg`
+one delete followed by a create, to 20 steps: about 4.7 million states. `WriteLog-deletes.cfg`
 has two hosts, one write, two opens and two deletes that may overlap, each followed by a create,
-to 16 steps: about 1.1 million states.
+to 16 steps: about 0.6 million states.
 
 ```bash
 tools/tlc.sh nightly
 ```
 
 That checks `specs/nightly/*.cfg`: every behaviour of the first model with no bound on its
-length, both log modes, three hosts, an advance with three opens, and two deletes with three
-opens. `deep.yml` runs them each night.
+length, both log modes, three hosts, an advance with three opens, and two deletes that may
+overlap with three opens, to 22 steps. `deep.yml` runs them each night, and they must finish
+within its 300 minutes on a free runner.
+
+TLC treats hosts and deletes as interchangeable (`Symmetry`), so it checks one state of each set
+that differs only in which host or delete is which.
 
 A single model takes TLC's arguments after it, such as `-depth` or `-simulate`:
 
