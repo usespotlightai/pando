@@ -115,10 +115,22 @@ check_asan() {
 		run cargo "+$nightly" test --locked --target "$host_triple" -p pando-host -p pando-linux --lib
 }
 
+fuzz_failed=
+fuzz_cleanup() {
+	local status=$? pids p
+	pids=$(jobs -rp) || true
+	for p in ${pids}; do
+		kill "${p}" 2>/dev/null || true
+	done
+	rm -rf "${fuzz_failed}"
+	exit "${status}"
+}
+
 check_fuzz() { # seconds
-	local secs=${1:-60} cpus logs t targets running failed=()
+	local secs=${1:-60} cpus t targets running failed=()
 	cpus=$(nproc)
-	logs=$(mktemp -d)
+	fuzz_failed=$(mktemp -d)
+	trap fuzz_cleanup EXIT
 	targets=$(cd fuzz && cargo "+$nightly" fuzz list)
 	run cargo "+$nightly" fuzz build --fuzz-dir fuzz
 	for t in ${targets}; do
@@ -128,17 +140,19 @@ check_fuzz() { # seconds
 			running=$(jobs -rp | wc -l)
 		done
 		mkdir -p "fuzz/corpus/$t" "fuzz/seeds/$t"
-		(cargo "+$nightly" fuzz run --fuzz-dir fuzz "$t" "fuzz/corpus/$t" "fuzz/seeds/$t" -- \
-			-max_total_time="$secs" >"${logs}/$t" 2>&1 || touch "${logs}/$t.failed") &
+		(
+			if ! cargo "+$nightly" fuzz run --fuzz-dir fuzz "$t" "fuzz/corpus/$t" "fuzz/seeds/$t" -- \
+				-max_total_time="$secs" 2>&1 | sed -u "s/^/[$t] /" >&2; then
+				touch "${fuzz_failed}/$t"
+			fi
+		) &
 	done
 	wait
 	for t in ${targets}; do
-		echo "::group::fuzz $t" >&2
-		cat "${logs}/$t" >&2
-		echo "::endgroup::" >&2
-		[[ -e ${logs}/$t.failed ]] && failed+=("$t")
+		if [[ -e ${fuzz_failed}/$t ]]; then
+			failed+=("$t")
+		fi
 	done
-	rm -rf "${logs}"
 	if [[ ${#failed[@]} -gt 0 ]]; then
 		echo "fuzz targets that failed: ${failed[*]}" >&2
 		return 1
