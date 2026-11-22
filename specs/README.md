@@ -71,8 +71,12 @@ tools/tlc.sh nightly
 ```
 
 That checks `specs/nightly/*.cfg`: every behaviour of the first model with no bound on its
-length, both log modes, three hosts, an advance with three opens, and two deletes with three
-opens. `deep.yml` runs them each night.
+length, both log modes, three hosts, an advance with three opens, and two deletes that may
+overlap with three opens, to 22 steps. `deep.yml` runs them each night, and they must finish
+within its 300 minutes on a free runner.
+
+TLC treats hosts and deletes as interchangeable (`Symmetry`), so it checks one state of each set
+that differs only in which host or delete is which.
 
 A single model takes TLC's arguments after it, such as `-depth` or `-simulate`:
 

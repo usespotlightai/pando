@@ -21,8 +21,8 @@ CONSTANTS
     MaxWrites,      \* writes the writers make in all, each a flush once committed
     MaxOpens,       \* opens in all
     MaxAdvances,    \* `pando advance` runs onto the branch
-    MaxDeletes,     \* `pando delete` runs, each its own process, so they may overlap; each
-                    \* ref they delete may be followed by a create under the same name
+    Deletes,        \* the `pando delete` runs, each its own process, so they may overlap;
+                    \* each ref they delete may be followed by a create under the same name
     Depth           \* the longest behaviour checked, in steps; 0 for every behaviour
 
 VARIABLES
@@ -104,8 +104,6 @@ Covering(p, s) == Len(SelectSeq(p.records, LAMBDA t : t <= s))
 NoAdvance ==
     [count |-> 0, pc |-> "idle", ver |-> <<>>, life |-> 0, gen |-> 0, n |-> 0, floor |-> 0,
      root |-> <<>>]
-
-Deletes == 1..MaxDeletes
 
 \* A delete's process: "ready" until it runs, "done" once it ended. It names the
 \* life and the version of the ref it read.
@@ -667,7 +665,7 @@ DeleteTakesOnlyWhatItRead ==
 \* The ref only ever holds a state some writer committed.
 RefHoldsAWriterState == ref.root \in histories
 
-Symmetry == Permutations(Hosts)
+Symmetry == Permutations(Hosts) \cup Permutations(Deletes)
 
 WithinDepth == Depth = 0 \/ TLCGet("level") <= Depth
 =============================================================================

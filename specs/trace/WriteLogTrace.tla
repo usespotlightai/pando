@@ -24,7 +24,7 @@ vars == <<ref, store, disk, proc, nextId, opens, advances, acked, histories, del
 
 WL == INSTANCE WriteLog WITH Hosts <- TraceHosts, Modes <- {"behind", "strict"},
                              MaxWrites <- TraceWrites, MaxOpens <- TraceOpens,
-                             MaxAdvances <- TraceAdvances, MaxDeletes <- TraceDeletes, Depth <- 0
+                             MaxAdvances <- TraceAdvances, Deletes <- 1..TraceDeletes, Depth <- 0
 
 Init == WL!Init /\ i = 0
 
