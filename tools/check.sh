@@ -8,7 +8,8 @@
 #   tools/check.sh supply      cargo-deny and cargo-vet
 #   tools/check.sh test        the workspace tests under nextest, then the doctests
 #   tools/check.sh asan        the pando-host and pando-linux tests under AddressSanitizer
-#   tools/check.sh fuzz [S]    every fuzz target for S seconds (default 60)
+#   tools/check.sh fuzz [S]    every fuzz target for S seconds (default 60), as many at once as
+#                              there are CPUs
 #   tools/check.sh coverage    line coverage of the workspace tests, in target/coverage
 #   tools/check.sh mutants [ARGS]  cargo-mutants, with ARGS passed through
 #   tools/check.sh release     a release build of pando with its dependency list embedded
@@ -114,13 +115,48 @@ check_asan() {
 		run cargo "+$nightly" test --locked --target "$host_triple" -p pando-host -p pando-linux --lib
 }
 
-check_fuzz() { # seconds
-	local secs=${1:-60} t
-	for t in $(cd fuzz && cargo "+$nightly" fuzz list); do
-		mkdir -p "fuzz/corpus/$t" "fuzz/seeds/$t"
-		run cargo "+$nightly" fuzz run --fuzz-dir fuzz "$t" "fuzz/corpus/$t" "fuzz/seeds/$t" -- \
-			-max_total_time="$secs"
+fuzz_failed=
+fuzz_cleanup() {
+	local status=$? pids p
+	pids=$(jobs -rp) || true
+	for p in ${pids}; do
+		kill "${p}" 2>/dev/null || true
 	done
+	rm -rf "${fuzz_failed}"
+	exit "${status}"
+}
+
+check_fuzz() { # seconds
+	local secs=${1:-60} cpus t targets running failed=()
+	cpus=$(nproc)
+	fuzz_failed=$(mktemp -d)
+	trap fuzz_cleanup EXIT
+	targets=$(cd fuzz && cargo "+$nightly" fuzz list)
+	run cargo "+$nightly" fuzz build --fuzz-dir fuzz
+	for t in ${targets}; do
+		running=$(jobs -rp | wc -l)
+		while [[ ${running} -ge ${cpus} ]]; do
+			wait -n || true
+			running=$(jobs -rp | wc -l)
+		done
+		mkdir -p "fuzz/corpus/$t" "fuzz/seeds/$t"
+		(
+			if ! cargo "+$nightly" fuzz run --fuzz-dir fuzz "$t" "fuzz/corpus/$t" "fuzz/seeds/$t" -- \
+				-max_total_time="$secs" 2>&1 | sed -u "s/^/[$t] /" >&2; then
+				touch "${fuzz_failed}/$t"
+			fi
+		) &
+	done
+	wait
+	for t in ${targets}; do
+		if [[ -e ${fuzz_failed}/$t ]]; then
+			failed+=("$t")
+		fi
+	done
+	if [[ ${#failed[@]} -gt 0 ]]; then
+		echo "fuzz targets that failed: ${failed[*]}" >&2
+		return 1
+	fi
 }
 
 check_coverage() {
