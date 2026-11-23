@@ -87,6 +87,51 @@ impl Cache {
         r.map(drop)
     }
 
+    /// The error of a read that fetched the frame of `e` and still did not find it, with what
+    /// the cache knows of it then. `epoch` is the log's epoch when the read began; each sweep
+    /// starts two.
+    pub(super) async fn not_in_frame(&self, e: &Entry, epoch: u64) -> Error {
+        let now = match self.local(&e.hash).await {
+            Ok(Some(_)) => "finds it".to_owned(),
+            Ok(None) => "does not find it".to_owned(),
+            Err(x) => format!("fails: {x}"),
+        };
+        let frame = match self.seg_index(e.loc.seg).await {
+            Ok(idx) => match idx.frames.get(e.loc.frame as usize).copied() {
+                Some((off, n)) => match self.remote.get_range(e.loc.seg, off, n).await {
+                    Ok(z) => match decode_frame(&z, None) {
+                        Ok(d) => format!(
+                            "the frame at {off}+{n} holds {} objects and {} recipes, {}",
+                            d.objects.len(),
+                            d.recipes.len(),
+                            if d.objects.contains_key(&e.hash) {
+                                "it among the objects"
+                            } else if d.recipes.contains_key(&e.hash) {
+                                "it among the recipes"
+                            } else {
+                                "not it"
+                            }
+                        ),
+                        Err(x) => format!("the frame at {off}+{n} does not decode: {x}"),
+                    },
+                    Err(x) => format!("the frame at {off}+{n} does not arrive: {x}"),
+                },
+                None => format!("the index has {} frames", idx.frames.len()),
+            },
+            Err(x) => format!("the index does not arrive: {x}"),
+        };
+        Error::Corrupt(format!(
+            "object {} is not in frame {} of {}: {}; {}; held {}, base {}, a read now {now}; epoch {epoch} at the start",
+            e.hash,
+            e.loc.frame,
+            e.loc.seg,
+            self.log.describe(&e.hash),
+            frame,
+            self.held_encoding(e).is_some(),
+            self.base_has(&e.hash),
+        ))
+    }
+
     pub(super) fn has_index(&self, seg: &SegId) -> bool {
         self.indexes.lock().contains_key(seg)
     }

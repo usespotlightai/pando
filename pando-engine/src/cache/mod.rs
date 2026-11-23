@@ -84,6 +84,26 @@ pub struct Cache {
     recorder: Mutex<recorder::Recorder>,
     stats: CacheStats,
     sweeper: sweep::Sweeper,
+    /// The objects reads wait for, with how many wait; sweeps keep them.
+    awaited: Mutex<HashMap<Hash, usize>>,
+}
+
+/// A read waiting for object `hash`; drop it once the read has the object or gives up.
+struct Awaited<'a> {
+    cache: &'a Cache,
+    hash: Hash,
+}
+
+impl Drop for Awaited<'_> {
+    fn drop(&mut self) {
+        let mut m = self.cache.awaited.lock();
+        if let Some(n) = m.get_mut(&self.hash) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.hash);
+            }
+        }
+    }
 }
 
 fn shared(e: Error) -> Arc<Error> {
@@ -111,13 +131,6 @@ fn class(background: bool) -> CpuClass {
     } else {
         CpuClass::Foreground
     }
-}
-
-fn not_in_frame(e: &Entry) -> Error {
-    Error::Corrupt(format!(
-        "object {} is not in frame {} of {}",
-        e.hash, e.loc.frame, e.loc.seg
-    ))
 }
 
 impl Cache {
@@ -157,7 +170,19 @@ impl Cache {
             recorder: Mutex::default(),
             stats: CacheStats::default(),
             sweeper,
+            awaited: Mutex::default(),
         })
+    }
+
+    /// Keeps object `h` from sweeps until the returned [`Awaited`] is dropped.
+    fn await_object(&self, h: Hash) -> Awaited<'_> {
+        *self.awaited.lock().entry(h).or_default() += 1;
+        Awaited { cache: self, hash: h }
+    }
+
+    /// The objects reads wait for now.
+    fn awaited(&self) -> Vec<Hash> {
+        self.awaited.lock().keys().copied().collect()
     }
 
     /// The counters of this cache.
@@ -242,6 +267,7 @@ impl Cache {
     }
 
     async fn get_as(&self, e: &Entry, background: bool) -> Result<Bytes> {
+        let epoch = self.log.epoch();
         if let Some(b) = self.local(&e.hash).await? {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(b);
@@ -249,6 +275,7 @@ impl Cache {
         if let Some(b) = self.rebuild_if_held(e, background).await? {
             return Ok(b);
         }
+        let _awaited = self.await_object(e.hash);
         // A miss that waited for a background fetch may find the object left out (it decodes
         // only what it was asked for); the second miss fetches the frame itself.
         for _ in 0..2 {
@@ -260,7 +287,7 @@ impl Cache {
                 return Ok(b);
             }
         }
-        Err(not_in_frame(e))
+        Err(self.not_in_frame(e, epoch).await)
     }
 
     /// Bytes `[inner, inner + len)` of object `e`, fetching its frame when needed.
@@ -303,6 +330,7 @@ impl Cache {
     }
 
     async fn read_counted(&self, e: &Entry, inner: usize, len: usize, count: bool) -> Result<Bytes> {
+        let epoch = self.log.epoch();
         if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
             if count {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -315,6 +343,7 @@ impl Cache {
         if let Some(b) = self.rebuild_if_held(e, false).await? {
             return Ok(b.slice(inner..inner + len));
         }
+        let _awaited = self.await_object(e.hash);
         for _ in 0..2 {
             self.miss(e, false).await?;
             if let Some(b) = self.log.read_at(&e.hash, inner, len).await? {
@@ -324,6 +353,6 @@ impl Cache {
                 return Ok(b.slice(inner..inner + len));
             }
         }
-        Err(not_in_frame(e))
+        Err(self.not_in_frame(e, epoch).await)
     }
 }

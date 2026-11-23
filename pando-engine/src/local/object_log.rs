@@ -760,6 +760,28 @@ impl ObjectLog {
         self.shard(h).read().get(h).filter(|l| !l.dead()).cloned()
     }
 
+    /// What the log knows of object `h`, for an error report.
+    pub(crate) fn describe(&self, h: &Hash) -> String {
+        let epoch = self.epoch();
+        let Some(l) = self.shard(h).read().get(h).cloned() else {
+            return format!("the log has no record of it (epoch {epoch})");
+        };
+        let file = match &l.ext {
+            None if self.segs.get(seg_of(l.off)).is_some() => "present",
+            None => "absent",
+            Some((e, _)) if e.gone.load(Ordering::Acquire) => "gone",
+            Some(_) => "a reference",
+        };
+        format!(
+            "the log has it at {} (segment {}, file {file}), {} bytes, born {}, marked {}, epoch {epoch}",
+            l.off,
+            seg_of(l.off),
+            l.len,
+            l.born,
+            l.mark.load(Ordering::Acquire),
+        )
+    }
+
     pub(crate) fn has(&self, h: &Hash) -> bool {
         self.lookup(h).is_some()
     }
