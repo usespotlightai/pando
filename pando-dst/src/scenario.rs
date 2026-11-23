@@ -1,5 +1,6 @@
 //! Seeded scenarios: random writes, flushes, checkpoints, daemon restarts, host crashes, lost
-//! hosts and store faults on one branch, checked against a model of what the volume must hold.
+//! hosts, store faults and a cache over its budget on one branch, checked against a model of
+//! what the volume must hold.
 
 use std::ops::RangeInclusive;
 use std::path::Path;
@@ -620,4 +621,152 @@ impl World {
             Err(e) => Err(format!("{at}: {what}: {e}")),
         }
     }
+}
+
+/// The size of the branch [`a_cache_over_its_budget`] reads, eight times its cache budget.
+const BUDGETED_SIZE: usize = 32 << 20;
+const BUDGET: u64 = 4 << 20;
+/// The end of the branch that [`a_cache_over_its_budget`] rewrites: half the budget.
+const REWRITTEN: usize = 2 << 20;
+/// The most reads [`a_cache_over_its_budget`] sends at once.
+const READS_AT_ONCE: usize = 8;
+
+async fn open_budgeted(ports: &Ports, dir: &str) -> Result<Volume, String> {
+    let cache = Cache::open(ports, Path::new(dir))
+        .await
+        .map_err(|e| format!("open cache: {e}"))?;
+    cache.set_budget(BUDGET);
+    Volume::open(ports, Arc::new(cache), Path::new(dir), BRANCH)
+        .await
+        .map_err(|e| format!("open volume: {e}"))
+}
+
+impl World {
+    /// A range of up to two chunks anywhere in the branch of [`a_cache_over_its_budget`].
+    fn budgeted_range(&self) -> (usize, usize) {
+        let off = if self.below(2) == 0 {
+            self.below(BUDGETED_SIZE / CHUNK) * CHUNK
+        } else {
+            self.below(BUDGETED_SIZE)
+        };
+        (off, 1 + self.below(2 * CHUNK).min(BUDGETED_SIZE - off - 1))
+    }
+
+    /// Up to [`READS_AT_ONCE`] reads at once, each checked against the model.
+    async fn check_at_once(&mut self, v: &Volume, at: &str) -> Result<(), String> {
+        let ranges: Vec<(usize, usize)> = (0..=self.below(READS_AT_ONCE))
+            .map(|_| self.budgeted_range())
+            .collect();
+        let reads = ranges.iter().map(|&(off, len)| async move {
+            let mut got = vec![0; len];
+            v.read_at(&mut got, u64_from(off)).await.map(|()| got)
+        });
+        for (got, &(off, len)) in futures::future::join_all(reads).await.into_iter().zip(&ranges) {
+            let got = got.map_err(|e| format!("{at}: read {len} at {off}: {e}"))?;
+            self.report.reads += 1;
+            if got != self.model[off..off + len] {
+                return Err(format!("{at}: read {len} at {off} differs from the model"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A host writes and publishes a branch eight times its cache budget, then runs `steps`
+/// random steps on it as the soak does: reads at once from anywhere in the branch, checked
+/// rewrites of its end, checkpoints that let sweeps drop what was rewritten, restarts and host
+/// crashes. A fresh host then reads the branch whole.
+pub async fn a_cache_over_its_budget(seed: u64, steps: usize) -> Result<Report, String> {
+    let (ports, store, fs) = sim::ports(seed);
+    Volume::create(&ports, BRANCH, u64_from(BUDGETED_SIZE))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut w = World {
+        ports,
+        store,
+        fs,
+        rng: SimRng::new(seed ^ 0xb0d6),
+        model: Vec::new(),
+        flushed: Vec::new(),
+        report: Report::default(),
+    };
+    w.model = w.bytes(BUDGETED_SIZE);
+    let writer = open(&w.ports, "/host").await?;
+    writer
+        .write_at(&w.model, 0)
+        .await
+        .map_err(|e| format!("seed {seed}: write the branch: {e}"))?;
+    writer
+        .checkpoint()
+        .await
+        .map_err(|e| format!("seed {seed}: publish the branch: {e}"))?;
+    writer.close().await;
+    drop(writer);
+    w.flushed.clone_from(&w.model);
+    let mut v = open_budgeted(&w.ports, "/host").await?;
+    for step in 0..steps {
+        let at = format!("seed {seed} step {step}");
+        match w.below(100) {
+            0..50 => w.check_at_once(&v, &at).await?,
+            50..70 => {
+                let off = BUDGETED_SIZE - REWRITTEN + w.below(REWRITTEN - 1);
+                let len = 1 + w.below(2 * CHUNK).min(BUDGETED_SIZE - off - 1);
+                let b = w.bytes(len);
+                v.write_at(&b, u64_from(off))
+                    .await
+                    .map_err(|e| format!("{at}: write: {e}"))?;
+                w.model[off..off + len].copy_from_slice(&b);
+                w.report.writes += 1;
+            }
+            70..80 => {
+                v.checkpoint()
+                    .await
+                    .map_err(|e| format!("{at}: checkpoint: {e}"))?;
+                w.flushed.clone_from(&w.model);
+                w.report.checkpoints += 1;
+            }
+            80..85 => {
+                v.flush().await.map_err(|e| format!("{at}: flush: {e}"))?;
+                w.flushed.clone_from(&w.model);
+                w.report.flushes += 1;
+            }
+            85..95 => {
+                v.close().await;
+                drop(v);
+                v = open_budgeted(&w.ports, "/host")
+                    .await
+                    .map_err(|e| format!("{at}: restart: {e}"))?;
+                w.report.restarts += 1;
+            }
+            _ => {
+                v.close().await;
+                drop(v);
+                w.fs.crash();
+                w.model.clone_from(&w.flushed);
+                v = open_budgeted(&w.ports, "/host")
+                    .await
+                    .map_err(|e| format!("{at}: after crash: {e}"))?;
+                w.report.crashes += 1;
+            }
+        }
+    }
+    v.checkpoint()
+        .await
+        .map_err(|e| format!("seed {seed} final checkpoint: {e}"))?;
+    v.close().await;
+    let fresh = open(&w.ports, "/fresh").await?;
+    for off in (0..BUDGETED_SIZE).step_by(16 * CHUNK) {
+        let mut got = vec![0; 16 * CHUNK];
+        fresh
+            .read_at(&mut got, u64_from(off))
+            .await
+            .map_err(|e| format!("seed {seed} fresh host: read at {off}: {e}"))?;
+        if got != w.model[off..off + 16 * CHUNK] {
+            return Err(format!(
+                "seed {seed} fresh host: read at {off} differs from the model"
+            ));
+        }
+    }
+    fresh.close().await;
+    Ok(w.report)
 }
