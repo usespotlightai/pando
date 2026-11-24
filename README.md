@@ -7,9 +7,9 @@ Writable branches of a large workspace for AI agents, stored in S3.
 
 Each agent run needs its own copy of a repository and everything installed in it, often on a
 machine where neither is present. It also needs to preserve its changes when the run ends.
-Pando gives each run a block device backed by a branch of a shared base. Creating a branch takes
-about 100 ms and adds one small ref object. The host fetches only what the run reads and uploads only what
-it changed when the run ends. Any host with access to the bucket can open any branch.
+Pando gives each run a block device backed by a branch of a shared base. Creating a branch adds
+one small ref object ([Benchmarks](#benchmarks) has the times). The host fetches only what the
+run reads and uploads only what it changed when the run ends. Any host with access to the bucket can open any branch.
 
 Pando takes its name from a grove of aspens in Utah: a single organism with thousands of trunks
 sharing one root system.
@@ -28,15 +28,15 @@ sharing one root system.
 - **Segment storage.** Chunks and tree nodes are packed into ~8 MiB segments containing zstd
   frames of up to 1 MiB. A single range GET fetches neighbouring chunks, and uploads take a few
   PUTs rather than one per write. Where possible, changed chunks are stored as 4 KiB block
-  references to the base, reducing the data uploaded by `npm ci` by about 13x.
+  references to the base, which reduces the data that `npm ci` uploads.
 - **Write-back with fencing.** A flush is immediately durable locally, reaches a write log in
   the store moments later, and uploads in the background. A conditional PUT updates the ref.
   Opening a branch takes a new writer generation that fences any older writer, and applies what
   the log has beyond the ref, so a lost host loses at most the last moments of writes. With
   `attach --log strict`, a flush returns only once the log in the store has it.
 - **Fast starts.** Each host keeps a base image per root and clones it with reflink. A later
-  branch of the same root therefore starts in about 250 ms. The first run records the frames it
-  touched, and the next run on another host prefetches them. Once the branch is local, Pando
+  branch of the same root therefore starts without fetching the base again. The first run
+  records the frames it touched, and the next run on another host prefetches them. Once the branch is local, Pando
   hands the device to the kernel through device-mapper over a loop device and leaves the I/O path.
 - **Crash safety.** ublk user recovery and a local journal preserve acknowledged writes through
   a daemon crash. After restarting, the daemon resumes serving the device where it left off. On
@@ -295,11 +295,10 @@ Morph Cloud, Freestyle and Runloop have not published how they store disks.
 
 ## Benchmarks
 
-> **The results come from four runs** on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see
-> [bench/README.md](bench/README.md)): Pando's fork, fio and kill -9 crash rows from main at
-> `a871f16`, Pando's other rows from main at `d57f1de`, SOCI, Nydus, ZeroFS and Amazon S3 Files
-> from the run before those, and the other systems from the first run.
-> Run `python3 bench/plot.py` to redraw the charts from `bench/results/`.
+> All systems run on the same bench VM (AWS `m8id.4xlarge`, eu-north-1; see
+> [bench/README.md](bench/README.md)). The rows of different systems can come from different
+> runs; each chart's numbers are in `bench/results/`. Run `python3 bench/plot.py` to redraw the
+> charts and tables from them.
 
 The workspace is [Spotlight](https://github.com/usespotlightai/spotlight) after its setup command:
 1.4 GB and 129k files. All systems use the same VM and bucket. Results show medians of 5 runs,
@@ -310,13 +309,11 @@ adds `--dm` and `--images`, so the device switches to a local image once the bra
 
 Time to create a writable branch, and the storage each branch and each edit adds. Docker and
 XFS reflink branches exist only on the host's disk. Pando, JuiceFS, EBS, ZeroFS and S3 Files
-branches are durable and open on any host, so each fork waits on the network. These rows are from
-one run so far, not five. JuiceFS made 100 branches, EBS and ZeroFS 10, and S3 Files 3; the others
-made 1,000. ZeroFS has only read-only checkpoints, so a writable branch is a copy of the device
-file. S3 Files has no branches, so a branch is a copy of every file through the mount. On Pando a
-5 MiB edit adds 5.08 MiB to the store: 5.05 MiB of segments and the rest change records and hints.
-At `d57f1de` it added 7.58 MiB, because a write-log record still in upload when the log closed was
-never deleted; that is fixed.
+branches are durable and open on any host, so each fork waits on the network. JuiceFS made 100
+branches, EBS and ZeroFS 10, and S3 Files 3; the others made 1,000. ZeroFS has only read-only
+checkpoints, so a writable branch is a copy of the device file. S3 Files has no branches, so a
+branch is a copy of every file through the mount. On Pando an edit adds its segments, change
+records and hints to the store.
 
 <!-- bench:fork -->
 <picture>
@@ -363,10 +360,10 @@ never deleted; that is fixed.
 ### Cold start
 
 Time to fork, mount and finish the first `git status` on a host that has never seen the workspace.
-Pando's slowest repetition, 2.6 s, is the first mount of the base; later mounts prefetch the
-reads it recorded in the bucket. SOCI and Nydus open in seconds because they fetch file contents
-only on first read, so their `git status` is the slower part. ZeroFS copies its device file and
-S3 Files copies every file for each branch; S3 Files ran 3 times, not 5.
+Pando's first repetition is its slowest: it is the first mount of the base, and later mounts
+prefetch the reads it recorded in the bucket. SOCI and Nydus open quickly because they fetch file
+contents only on first read, so their `git status` is the slower part. ZeroFS copies its device
+file and S3 Files copies every file for each branch; S3 Files ran 3 times, not 5.
 
 <!-- bench:cold -->
 <picture>
@@ -401,9 +398,9 @@ Time to start on a host that has already run a branch of the same base. Each sys
 base on the host: Docker's image is pulled, tar and the image download have their file cached,
 and Pando (handoff) has the host's base image of the root. The page cache is dropped before each
 run. Pando (handoff) switches to the image as soon as the branch opens, so `git status` reads
-through device-mapper and a loop device over a reflink clone and takes about 1 s, against 0.47 s
-over ublk. SOCI and Nydus keep the contents they fetched in their snapshotter's cache. S3 Files
-copies every file again for each branch, so its warm start is as slow as its cold start.
+through device-mapper and a loop device over a reflink clone, which is slower than over ublk.
+SOCI and Nydus keep the contents they fetched in their snapshotter's cache. S3 Files copies every
+file again for each branch, so its warm start is as slow as its cold start.
 
 <!-- bench:warm -->
 <picture>
@@ -437,11 +434,9 @@ copies every file again for each branch, so its warm start is as slow as its col
 Time to run the 14 command types agents use most often in Spotlight sandboxes (`git status`, `tsc`,
 `oxlint`, `vitest`, `npm ci`, ...), expressed as a ratio to native ext4 on local NVMe. Each system
 ran the replay 3 times on a fresh branch of a warm host, page cache dropped, against native in the
-same run: 71.5 s in Pando's run, 70.3 s in the run of SOCI, Nydus, ZeroFS and S3 Files, and 70.5 s
-in the first run. Most of JuiceFS's time is `npm ci`, about 9.5 min against 7.6 s; in its first
-repetition one `vitest` run failed, and it passed in the other two. On S3 Files, where every file
-operation is an NFS round trip, `npm ci` takes about 9.7 min, the first `git status` 44 s and the
-control-plane `tsc` and `vitest` 74 s and 83 s.
+same run. Most of JuiceFS's time is `npm ci`. On S3 Files every file operation is an NFS round
+trip, so `npm ci`, the first `git status` and the control-plane `tsc` and `vitest` are the slow
+commands.
 
 <!-- bench:replay -->
 <picture>
@@ -475,13 +470,13 @@ After `npm ci`, time from the last write until another host can open the branch,
 `npm ci`'s changes added to the store. Pando's time is unmount and `pando detach`, which uploads
 what changed since its last background snapshot and publishes the branch. JuiceFS uploads each
 file as it closes, so its save is a `sync` that finds nothing left, and the upload cost lands in
-`npm ci` itself: about 15 min on JuiceFS against 8 s on the others. tar uploads the whole
+`npm ci` itself, which is much slower on JuiceFS than on the others. tar uploads the whole
 workspace every time. EBS's bytes are the 512 KiB blocks the snapshot holds beyond the workspace
 snapshot. ZeroFS's save is unmount and `nbd-client -d`, which flush the device to ZeroFS and the
-bucket. On S3 Files, `npm ci` takes about 10 min over NFS; another host's mount reads each file as
-soon as it is closed, so its save is a `sync -f` that finds nothing left. Its bytes are every
-object version written, as S3 Files stores each file as a whole object, about a minute after its
-last write. Three runs each, five for Pando.
+bucket. On S3 Files, `npm ci` runs over NFS; another host's mount reads each file as soon as it is
+closed, so its save is a `sync -f` that finds nothing left. Its bytes are every object version
+written, as S3 Files stores each file as a whole object, about a minute after its last write.
+Three runs each, five for Pando.
 
 <!-- bench:save -->
 <picture>
@@ -520,19 +515,11 @@ last write. Three runs each, five for Pando.
 Direct I/O with fio on a 1 GiB file in a fresh branch's file system, three runs each, five for
 Pando. Pando (ublk) reads come out ahead of the local NVMe because its daemon keeps the branch in
 cache files read through the host's page cache: direct I/O skips the page cache of the device, not
-of the daemon, so those rows mostly measure memory. Its writes do not: sequential writes match the
-NVMe, and 4 KiB random writes reach about 123k IOPS, near the NVMe's 134k. At `d57f1de` they reached
-only 14k: each dirty 4 KiB write held a whole 64 KiB chunk in memory, so the dirty-memory limit held
-random writes to the speed of full-chunk flushes. Dirty writes now stay in the journal. During these
-runs at `a871f16`, the daemon's memory grew with each run, to a peak of 1,060 MiB: the object log
-index and the uploader's map of uploaded objects kept every chunk version. Since then, sweeps drop
-old chunk versions from the object log, and the uploader's map is gone. In a local run of 10 rounds
-of 4 KiB random writes over a 1 GiB file, the object log stayed between 2.6 and 5.2 GB on disk over
-21.6 GB written; the bench rows have not been rerun since. The after-handoff rows are from
-`d57f1de`. After handoff, I/O goes through device-mapper and a loop device to the image on the NVMe
-and runs at the NVMe's speed. EBS gp3 runs at its baseline of 3,000 IOPS and 125 MiB/s. On ZeroFS
-every request goes over NBD to its server and on S3 Files over NFS to the file system, so a single 4
-KiB read waits on a round trip: about 240 IOPS on S3 Files.
+of the daemon, so those rows mostly measure memory. Its writes do not, and dirty writes stay in the
+journal rather than in whole chunks in memory. After handoff, I/O goes through device-mapper and a
+loop device to the image on the NVMe and runs at the NVMe's speed. EBS gp3 runs at its baseline
+IOPS and throughput. On ZeroFS every request goes over NBD to its server and on S3 Files over NFS
+to the file system, so a single 4 KiB read waits on a round trip.
 
 <!-- bench:fio -->
 <picture>
@@ -613,12 +600,8 @@ the device after 120 s. What it acknowledged before the kill was intact.
 | ZeroFS | 1 | did not recover | clean | all acknowledged (20 per run) |
 | Amazon S3 Files | 0 | 3.16 s | no checker | all acknowledged (348 to 352 per run) |
 
-At `d57f1de`, one of Pando's five runs failed 4 writes and left file system errors (`e2fsck` exit
-4): the restarted daemon reused a temporary file name that the killed one had left behind. That is
-fixed, and at `a871f16` all five runs were clean.
-
-At `d57f1de` Pando also ran a reboot case five times: the same writer, and five seconds in the host
-reboots through `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would.
-After the boot, `pando attach --recover=auto` served the branch in 3.2 s (2.8 s to 3.9 s), `e2fsck
--fn` found the file system clean there and again on a fresh host, and every acknowledged file (804
-to 836 per run) read back correctly on both.
+Pando also runs a reboot case five times: the same writer, and five seconds in the host reboots
+through `/proc/sysrq-trigger`, which neither syncs nor unmounts, as a power loss would. After the
+boot, `pando attach --recover=auto` serves the branch, `e2fsck -fn` checks the file system there
+and again on a fresh host, and every acknowledged file is read back on both. The `crash.reboot.*`
+rows in `bench/results/crash.csv` have the results.
