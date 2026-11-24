@@ -29,7 +29,7 @@ async fn crash_and_restart_holds_for_many_seeds() {
 
 #[tokio::test(start_paused = true)]
 async fn a_cache_over_its_budget_reads_right_across_restarts() {
-    let seeds: u64 = std::env::var("PANDO_DST_SEEDS")
+    let seeds: u64 = std::env::var("PANDO_DST_BUDGET_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
