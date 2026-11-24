@@ -138,7 +138,8 @@ struct Segments {
     dir: PathBuf,
     files: RwLock<BTreeMap<u64, Arc<dyn LocalFile>>>,
     creating: tokio::sync::Mutex<()>,
-    /// The segments written since a sync, each with the count of writes at its last write.
+    /// The segments written since a sync, each with the count of writes at its last write. An
+    /// open lists every segment it finds, since the process before it may not have synced them.
     dirty: Mutex<BTreeMap<u64, u64>>,
     writes: AtomicU64,
 }
@@ -470,6 +471,7 @@ impl ObjectLog {
                 })?;
             let f = fs.open(&segs.path(id), Open::ReadWrite).await?;
             segs.files.write().insert(id, f);
+            segs.written(id);
         }
         let log = ObjectLog {
             fs: Arc::clone(&fs),
@@ -1541,6 +1543,24 @@ mod tests {
         let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         assert_eq!(after.get(&h1).await.unwrap(), Some(b1));
         assert!(!after.has(&h2));
+    }
+
+    #[tokio::test]
+    async fn a_sync_after_a_restart_makes_the_records_before_it_durable() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let (h, b) = obj(1);
+        log.put(h, b.clone()).await.unwrap();
+        drop(log);
+
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        again.sync().await.unwrap();
+        drop(again);
+
+        fs.crash();
+        let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(after.get(&h).await.unwrap(), Some(b));
     }
 
     #[tokio::test]
