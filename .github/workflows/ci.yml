@@ -285,6 +285,7 @@ jobs:
       - name: Crash and restart, and GC races, over 400 seeds, from a seed that changes with each run
         env:
           PANDO_DST_SEEDS: "400"
+          PANDO_DST_BUDGET_SEEDS: "40"
           RUN_NUMBER: ${{ github.run_number }}
         run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test -p pando-dst --test scenarios --test gc
 

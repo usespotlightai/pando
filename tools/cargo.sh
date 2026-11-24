@@ -11,6 +11,6 @@ args=(--rm)
 [[ -t 1 ]] && args+=(-t)
 [[ -n ${PANDO_ENV_FILE:-} ]] && args+=(--env-file "${PANDO_ENV_FILE}")
 docker run "${args[@]}" -e CARGO_TARGET_DIR=/target -e PANDO_RUST_OUT -e RUST_BACKTRACE \
-	-e PANDO_DST_TRACE -e PANDO_DST_SEEDS -e PANDO_DST_FIRST -e PANDO_TLA_TRACES \
+	-e PANDO_DST_TRACE -e PANDO_DST_SEEDS -e PANDO_DST_BUDGET_SEEDS -e PANDO_DST_FIRST -e PANDO_TLA_TRACES \
 	-v pando-cargo:/usr/local/cargo/registry -v pando-target:/target \
 	-v "${root}":/w -w /w "${image}" cargo "$@"

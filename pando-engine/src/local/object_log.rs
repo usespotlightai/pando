@@ -138,7 +138,9 @@ struct Segments {
     dir: PathBuf,
     files: RwLock<BTreeMap<u64, Arc<dyn LocalFile>>>,
     creating: tokio::sync::Mutex<()>,
-    /// The segments written since a sync, each with the count of writes at its last write.
+    /// The segments written since a sync, each with the count of writes at its last write. An
+    /// open lists the segments that reach past the synced marker, since the process before it
+    /// may not have synced them.
     dirty: Mutex<BTreeMap<u64, u64>>,
     writes: AtomicU64,
 }
@@ -508,6 +510,16 @@ impl ObjectLog {
         };
         log.redo_pads().await?;
         let end = log.scan(synced).await?;
+        let unsynced: Vec<u64> = log
+            .segs
+            .files
+            .read()
+            .range(seg_of(synced)..)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in unsynced {
+            log.segs.written(id);
+        }
         log.end.store(end, Ordering::Release);
         log.fresh_from.store(end, Ordering::Release);
         Ok(log)
@@ -702,6 +714,7 @@ impl ObjectLog {
                         if Hash::of(&data) != h {
                             break;
                         }
+                        ext.needs_sync.store(true, Ordering::Release);
                     }
                     self.index(h, Loc::new(off, len, Some((ext, ext_off)), 0));
                 }
@@ -1541,6 +1554,67 @@ mod tests {
         let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         assert_eq!(after.get(&h1).await.unwrap(), Some(b1));
         assert!(!after.has(&h2));
+    }
+
+    #[tokio::test]
+    async fn a_sync_after_a_restart_makes_the_records_before_it_durable() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let (h, b) = obj(1);
+        log.put(h, b.clone()).await.unwrap();
+        drop(log);
+
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        again.sync().await.unwrap();
+        drop(again);
+
+        fs.crash();
+        let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(after.get(&h).await.unwrap(), Some(b));
+    }
+
+    #[tokio::test]
+    async fn a_sync_after_a_restart_makes_the_referenced_bytes_before_it_durable() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let img = fs.open(Path::new("/c/img"), Open::CreateNew).await.unwrap();
+        fs.sync_dir(Path::new("/c")).await.unwrap();
+        let (h, b) = obj(3);
+        img.write_at(vec![b.clone()], 0).await.unwrap();
+        log.put_ref(h, Path::new("/c/img"), 0, u32::try_from(b.len()).unwrap())
+            .await
+            .unwrap();
+        drop(log);
+
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        again.sync().await.unwrap();
+        drop(again);
+
+        fs.crash();
+        let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(after.get(&h).await.unwrap(), Some(b));
+    }
+
+    #[tokio::test]
+    async fn an_open_syncs_again_only_the_segments_past_the_synced_marker() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        for i in 0..5u8 {
+            let b = Bytes::from(vec![i; 300 << 10]);
+            log.put(Hash::of(&b), b).await.unwrap();
+        }
+        log.sync().await.unwrap();
+        assert_eq!(seg_of(log.end()), 1);
+        drop(log);
+
+        let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(
+            again.segs.dirty.lock().keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[tokio::test]
