@@ -281,7 +281,7 @@ jobs:
           git commit -q -m "docs(bench): ${MEASURE//,/, } results from main at $short" \
             -m "From $RUN_URL, systems: ${SYSTEMS:-all}."
           git push -q origin "$branch"
-          printf 'Results of %s at %s, measure `%s`, systems `%s`.\n\nFiles and the systems they replace:\n\n```\n%s\n```\n\nThe README prose is not updated: check that its numbers still hold.\n' \
+          printf 'Results of %s at %s, measure `%s`, systems `%s`.\n\nFiles and the systems they replace:\n\n```\n%s\n```\n\nThe crash table in the README is written by hand: check it against bench/results/crash.csv.\n' \
             "$RUN_URL" "$GITHUB_SHA" "$MEASURE" "${SYSTEMS:-all}" "$merged" > "$RUNNER_TEMP/body.md"
           gh pr create --base "${GITHUB_REF#refs/heads/}" --head "$branch" \
             --title "docs(bench): ${MEASURE//,/, } results from main at $short" --body-file "$RUNNER_TEMP/body.md"

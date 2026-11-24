@@ -276,7 +276,8 @@ With `results_pr` on, a run on `main` that succeeds also opens a pull request wi
 `bench/merge.py` replaces the rows of each system the run measured in `bench/results/*.csv` and
 keeps the other systems' rows, then `bench/plot.py` redraws the charts and the README tables.
 The pull request comes from the infrastructure app, so the checks run on it. The README's prose
-is not updated, so check that its numbers still hold before you merge.
+holds no results, so only the charts and tables change. The crash table is written by hand: check
+it against `bench/results/crash.csv` before you merge.
 
 `bench/run.sh smoke` checks that the host is ready: kernel modules, XFS with reflink on `/data`,
 the bucket through the host role, the registry, Docker, fio, the EBS volume, `pando`,
