@@ -273,14 +273,15 @@ jobs:
           short=${GITHUB_SHA::7}
           branch="bench/results-$GITHUB_RUN_ID"
           id=$(gh api "/users/$APP_SLUG%5Bbot%5D" --jq .id)
-          git config user.name "$APP_SLUG[bot]"
-          git config user.email "$id+$APP_SLUG[bot]@users.noreply.github.com"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "$id+${APP_SLUG}[bot]@users.noreply.github.com"
           gh auth setup-git
           git switch -c "$branch"
           git add bench/results docs/bench README.md
           git commit -q -m "docs(bench): ${MEASURE//,/, } results from main at $short" \
             -m "From $RUN_URL, systems: ${SYSTEMS:-all}."
           git push -q origin "$branch"
+          # shellcheck disable=SC2016 # the backticks are Markdown
           printf 'Results of %s at %s, measure `%s`, systems `%s`.\n\nFiles and the systems they replace:\n\n```\n%s\n```\n\nThe crash table in the README is written by hand: check it against bench/results/crash.csv.\n' \
             "$RUN_URL" "$GITHUB_SHA" "$MEASURE" "${SYSTEMS:-all}" "$merged" > "$RUNNER_TEMP/body.md"
           gh pr create --base "${GITHUB_REF#refs/heads/}" --head "$branch" \
