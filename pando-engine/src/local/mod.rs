@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 pub(crate) use journal::{Extent, Journal, Record};
+#[cfg(all(test, feature = "sim"))]
+pub(crate) use object_log::allocated as log_allocated;
 pub(crate) use object_log::{ObjectLog, Swept, WritebackHold};
 use pando_format::usize_from;
 pub(crate) use space::{Space, no_room};

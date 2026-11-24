@@ -60,7 +60,12 @@ check() {
 	ok*) say "segment $SEG: $what: $got" ;;
 	skipped*) say "segment $SEG: $what: SKIPPED: ${got#skipped, }" ;;
 	*)
-		say "segment $SEG: $what: FAILED: $got"
+		# The daemon's last error goes in the line, and its log in the results, which a
+		# cancelled run uploads too.
+		local why=
+		[[ -n ${log:-} && -s $log ]] && why=$(grep -E 'error|is not in|failed' "$log" | tail -1 || true)
+		say "segment $SEG: $what: FAILED: $got${why:+ (pando: $why)}"
+		[[ -n ${log:-} && -s $log ]] && cp "$log" "$R/$TEST.$(basename "$log")"
 		fails=$((fails + 1))
 		;;
 	esac
