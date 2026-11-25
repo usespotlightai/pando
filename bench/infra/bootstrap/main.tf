@@ -204,6 +204,14 @@ resource "aws_iam_role_policy" "github" {
         Resource = "*"
       },
       {
+        # Deleting a mount target removes its network interface with the caller's permissions.
+        Sid       = "S3FilesNetworkInterfaces"
+        Effect    = "Allow"
+        Action    = "ec2:DeleteNetworkInterface"
+        Resource  = "*"
+        Condition = { Bool = { "aws:ViaAWSService" = "true" } }
+      },
+      {
         # Creating a file system sets up its EventBridge rules with the caller's permissions.
         Sid    = "S3FilesEvents"
         Effect = "Allow"
