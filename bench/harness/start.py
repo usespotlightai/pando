@@ -1377,6 +1377,9 @@ def measure(kind: str, names: list[str], reps: int) -> None:
 
     Raises SystemExit when any system failed.
     """
+    if kind == "replay" and names and "native" not in names:
+        log("replay: adding native ext4, which replay.total is a ratio to")
+        names = ["native", *names]
     workspace.prepare()
     out = Results(kind)
     failed = []
