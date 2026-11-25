@@ -37,6 +37,8 @@ pub struct Report {
     pub reads: usize,
     /// Reads, writes and zeroings that failed because the store did not answer in time.
     pub unanswered: usize,
+    /// Writes and zeroings during which a commit that bounds memory moved the root.
+    pub commits: usize,
 }
 
 struct World {
@@ -51,12 +53,16 @@ struct World {
 }
 
 async fn open(ports: &Ports, dir: &str) -> Result<Volume, String> {
-    let cache = Arc::new(
-        Cache::open(ports, Path::new(dir))
-            .await
-            .map_err(|e| format!("open cache: {e}"))?,
-    );
-    Volume::open(ports, cache, Path::new(dir), BRANCH)
+    open_with(ports, dir, 0).await
+}
+
+/// [`open`] with a cache whose volumes keep their uncommitted writes within `dirty_memory`.
+async fn open_with(ports: &Ports, dir: &str, dirty_memory: u64) -> Result<Volume, String> {
+    let cache = Cache::open(ports, Path::new(dir))
+        .await
+        .map_err(|e| format!("open cache: {e}"))?;
+    cache.set_dirty_memory(dirty_memory);
+    Volume::open(ports, Arc::new(cache), Path::new(dir), BRANCH)
         .await
         .map_err(|e| format!("open volume: {e}"))
 }
@@ -125,9 +131,56 @@ impl World {
         }
         Ok(())
     }
+
+    /// Checks the volume after a host crash and makes the model what it holds. It holds what
+    /// the last flush made durable, then the writes `since` in order, up to the one a commit
+    /// that bounded memory took last, and of the write after it the chunks that commit took.
+    /// Without such commits, `strict`, it holds what the last flush made durable.
+    async fn after_crash(
+        &mut self,
+        v: &Volume,
+        since: &[(usize, Vec<u8>)],
+        strict: bool,
+        at: &str,
+    ) -> Result<(), String> {
+        let mut got = vec![0; SIZE];
+        v.read_at(&mut got, 0)
+            .await
+            .map_err(|e| format!("{at}: read after the crash: {e}"))?;
+        self.report.reads += 1;
+        let chunk = |b: &[u8], c: usize| b[c * CHUNK..(c + 1) * CHUNK].to_vec();
+        let mut m = self.flushed.clone();
+        let upto = if strict { 0 } else { since.len() };
+        for k in 0..=upto {
+            let differs: Vec<usize> = (0..SIZE / CHUNK)
+                .filter(|&c| chunk(&got, c) != chunk(&m, c))
+                .collect();
+            if differs.is_empty() {
+                break;
+            }
+            let Some((off, b)) = since.get(k).filter(|_| k < upto) else {
+                return Err(format!(
+                    "{at}: after the crash chunk {} holds neither the last flush nor a later commit",
+                    differs[0]
+                ));
+            };
+            let mut next = m.clone();
+            next[*off..off + b.len()].copy_from_slice(b);
+            if differs.iter().all(|&c| chunk(&got, c) == chunk(&next, c)) {
+                m.clone_from(&got);
+                break;
+            }
+            m = next;
+        }
+        self.model.clone_from(&m);
+        self.flushed = m;
+        Ok(())
+    }
 }
 
 /// Runs `steps` random steps with `seed`, then checks the whole volume from a fresh host.
+/// Seeds that are not a multiple of 3 keep each volume's uncommitted writes within 1 or 2 MiB,
+/// so commits that bound memory come between flushes, and a crash keeps what they took.
 pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String> {
     let (ports, store, fs) = sim::ports(seed);
     Volume::create(&ports, BRANCH, u64_from(SIZE))
@@ -142,9 +195,12 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
         flushed: vec![0; SIZE],
         report: Report::default(),
     };
-    let mut v = open(&w.ports, "/host").await?;
+    let dirty = u64::from(u8::try_from(seed % 3).unwrap_or(0)) << 20;
+    let mut since: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut v = open_with(&w.ports, "/host", dirty).await?;
     let trace = std::env::var_os("PANDO_DST_TRACE").is_some();
     for step in 0..steps {
+        let root = v.root();
         let at = format!("seed {seed} step {step}");
         let op = w.below(100);
         if trace {
@@ -159,7 +215,9 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
                     .await
                     .map_err(|e| format!("{at}: write: {e}"))?;
                 w.model[off..off + len].copy_from_slice(&b);
+                since.push((off, b));
                 w.report.writes += 1;
+                w.report.commits += usize::from(v.root() != root);
             }
             50..55 => {
                 let (off, len) = w.range();
@@ -168,11 +226,14 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
                     .await
                     .map_err(|e| format!("{at}: zero: {e}"))?;
                 w.model[off..off + len].fill(0);
+                since.push((off, vec![0; len]));
                 w.report.writes += 1;
+                w.report.commits += usize::from(v.root() != root);
             }
             55..67 => {
                 v.flush().await.map_err(|e| format!("{at}: flush: {e}"))?;
                 w.flushed.clone_from(&w.model);
+                since.clear();
                 w.report.flushes += 1;
             }
             67..72 => {
@@ -180,12 +241,13 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
                     .await
                     .map_err(|e| format!("{at}: checkpoint: {e}"))?;
                 w.flushed.clone_from(&w.model);
+                since.clear();
                 w.report.checkpoints += 1;
             }
             72..77 => {
                 v.close().await;
                 drop(v);
-                v = open(&w.ports, "/host")
+                v = open_with(&w.ports, "/host", dirty)
                     .await
                     .map_err(|e| format!("{at}: restart: {e}"))?;
                 w.report.restarts += 1;
@@ -194,10 +256,11 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
                 v.close().await;
                 drop(v);
                 w.fs.crash();
-                w.model.clone_from(&w.flushed);
-                v = open(&w.ports, "/host")
+                v = open_with(&w.ports, "/host", dirty)
                     .await
                     .map_err(|e| format!("{at}: after crash: {e}"))?;
+                w.after_crash(&v, &since, dirty == 0, &at).await?;
+                since.clear();
                 w.report.crashes += 1;
             }
             82..87 => w.fault(),

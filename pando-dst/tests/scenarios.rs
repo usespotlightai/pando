@@ -20,9 +20,10 @@ async fn crash_and_restart_holds_for_many_seeds() {
         total.crashes += r.crashes;
         total.faults += r.faults;
         total.reads += r.reads;
+        total.commits += r.commits;
     }
     assert!(
-        total.crashes > 0 && total.faults > 0 && total.reads > 0,
+        total.crashes > 0 && total.faults > 0 && total.reads > 0 && total.commits > 0,
         "{total:?}"
     );
 }

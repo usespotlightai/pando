@@ -72,13 +72,6 @@ const HEADER: usize = 16;
 const SHARDS: usize = 16;
 /// The bytes a replay reads at once.
 const WINDOW: usize = 4 << 20;
-/// The bytes a shard writes before it starts their writeback. Commits drop the journal only
-/// after much more than this, so without it the dirty pages would fill a small memory cgroup.
-const WRITEBACK_BYTES: u64 = 2 << 20;
-/// The most bytes at a shard's end that may wait for the disk. Past it a shard waits for
-/// the disk before its next write: the daemon serves the device, so the kernel does not slow
-/// its writes when the dirty pages fill its memory cgroup.
-const BEHIND_BYTES: u64 = 4 << 20;
 /// Set in a record's length field: the record zeroes a whole chunk and carries no data.
 const ZERO_CHUNK: u32 = 1 << 31;
 
@@ -86,8 +79,10 @@ const ZERO_CHUNK: u32 = 1 << 31;
 ///
 /// Records go to a local file without a sync before the write is acknowledged: a daemon crash
 /// keeps them in the page cache, so the next daemon replays them. A host crash loses them, as
-/// it would lose a disk's volatile write cache. Each flush starts a new generation; a committed
-/// flush removes the generations below it. A generation has one file per shard of chunk
+/// it would lose a disk's volatile write cache. Nothing starts their writeback: a commit
+/// removes them while they are still in the page cache, so they never reach the disk, and
+/// the volume bounds their memory by committing (see `Cache::set_dirty_memory`). Each flush
+/// starts a new generation; a committed flush removes the generations below it. A generation has one file per shard of chunk
 /// indexes, so writes to different chunks append in parallel and one chunk's records stay in
 /// order. A record is `[chunk index u64][offset in chunk u32][length u32][data]`, or a length of
 /// [`ZERO_CHUNK`] and no data for a chunk that became zeros. Appends to one
@@ -124,8 +119,6 @@ struct Queue {
     waiters: Vec<oneshot::Sender<Result<u64, Arc<Error>>>>,
     writing: bool,
     torn: bool,
-    /// The bytes written since the last writeback started.
-    unwritten: u64,
 }
 
 impl Shard {
@@ -150,17 +143,11 @@ impl Shard {
                 )
             };
             let cut = if torn { self.file.set_len(at).await } else { Ok(()) };
-            let mut write_back = None;
             let done = match cut.and_then(|()| self.file.write_at_now(&batch, at)) {
                 Ok(()) => {
                     let mut q = self.queue.lock();
                     q.end += u64_from(batch.len());
                     q.torn = false;
-                    q.unwritten += u64_from(batch.len());
-                    if q.unwritten >= WRITEBACK_BYTES {
-                        q.unwritten = 0;
-                        write_back = Some(q.end);
-                    }
                     Ok(at)
                 }
                 Err(e) => {
@@ -171,10 +158,6 @@ impl Shard {
             };
             for w in waiters {
                 let _ = w.send(done.clone());
-            }
-            if let Some(end) = write_back {
-                self.file.start_writeback().await;
-                self.file.write_behind(end.saturating_sub(BEHIND_BYTES)).await;
             }
         }
     }

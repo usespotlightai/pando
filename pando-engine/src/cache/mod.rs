@@ -86,6 +86,8 @@ pub struct Cache {
     sweeper: sweep::Sweeper,
     /// The objects reads wait for, with how many wait; sweeps keep them.
     awaited: Mutex<HashMap<Hash, usize>>,
+    /// See [`Cache::set_dirty_memory`].
+    dirty_memory: AtomicU64,
 }
 
 /// A read waiting for object `hash`; drop it once the read has the object or gives up.
@@ -172,6 +174,7 @@ impl Cache {
             stats: CacheStats::default(),
             sweeper,
             awaited: Mutex::default(),
+            dirty_memory: AtomicU64::new(0),
         })
     }
 
@@ -189,6 +192,19 @@ impl Cache {
     /// The counters of this cache.
     pub fn stats(&self) -> &CacheStats {
         &self.stats
+    }
+
+    /// Limits the page cache that the uncommitted writes of each volume on this cache may take
+    /// to about `bytes`, or lifts the limit with zero. The volume commits sooner to keep its
+    /// journal within it: the kernel does not slow the writes of a daemon that serves a
+    /// device, so without the limit its journal could fill a small memory cgroup.
+    pub fn set_dirty_memory(&self, bytes: u64) {
+        self.dirty_memory.store(bytes, Ordering::Release);
+    }
+
+    /// See [`Self::set_dirty_memory`].
+    pub(crate) fn dirty_memory(&self) -> u64 {
+        self.dirty_memory.load(Ordering::Acquire)
     }
 
     /// The headroom of the cache directory's disk.

@@ -443,6 +443,9 @@ impl Host {
                 scope::bind(&self.cache_dir, &self.identity)?;
                 let c = Cache::open(&self.ports, &self.cache_dir).await?;
                 c.set_budget(self.cache_budget);
+                // A quarter of the memory this process may use, for the page cache of the
+                // writes it has not committed yet.
+                c.set_dirty_memory(pando_host::memory_limit().map_or(0, |m| m / 4));
                 Ok::<_, anyhow::Error>(Arc::new(c))
             })
             .await?;

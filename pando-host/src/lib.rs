@@ -7,12 +7,14 @@ mod cpu;
 mod fs;
 #[cfg(target_os = "linux")]
 mod linux;
+mod memory;
 
 use std::sync::Arc;
 
 use clock::{SystemClock, SystemRng};
 use cpu::PoolCpu;
 pub use fs::HostFs;
+pub use memory::memory_limit;
 use pando_engine::Ports;
 use pando_engine::ports::Store;
 
