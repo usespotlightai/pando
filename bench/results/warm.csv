@@ -143,33 +143,33 @@ Amazon S3 Files,small,warm.status,2,36.4298,s,rep 2
 Amazon S3 Files,small,warm.git_status,3,221.649,s,rep 3
 Amazon S3 Files,small,warm.open,3,185.318,s,rep 3
 Amazon S3 Files,small,warm.status,3,36.3312,s,rep 3
-Pando,small,warm.git_status,1,1.30008,s,rep 1
-Pando,small,warm.open,1,0.834328,s,rep 1
-Pando,small,warm.status,1,0.465751,s,rep 1
-Pando,small,warm.git_status,2,1.28859,s,rep 2
-Pando,small,warm.open,2,0.822597,s,rep 2
-Pando,small,warm.status,2,0.465989,s,rep 2
-Pando,small,warm.git_status,3,1.30597,s,rep 3
-Pando,small,warm.open,3,0.840299,s,rep 3
-Pando,small,warm.status,3,0.46567,s,rep 3
-Pando,small,warm.git_status,4,1.31584,s,rep 4
-Pando,small,warm.open,4,0.849924,s,rep 4
-Pando,small,warm.status,4,0.465914,s,rep 4
-Pando,small,warm.git_status,5,1.31473,s,rep 5
-Pando,small,warm.open,5,0.848621,s,rep 5
-Pando,small,warm.status,5,0.466112,s,rep 5
-Pando (handoff),small,warm.git_status,1,1.80623,s,rep 1
-Pando (handoff),small,warm.open,1,0.839445,s,rep 1
-Pando (handoff),small,warm.status,1,0.966781,s,rep 1
-Pando (handoff),small,warm.git_status,2,1.77612,s,rep 2
-Pando (handoff),small,warm.open,2,0.859535,s,rep 2
-Pando (handoff),small,warm.status,2,0.916582,s,rep 2
-Pando (handoff),small,warm.git_status,3,1.70199,s,rep 3
-Pando (handoff),small,warm.open,3,0.835958,s,rep 3
-Pando (handoff),small,warm.status,3,0.866028,s,rep 3
-Pando (handoff),small,warm.git_status,4,1.7522,s,rep 4
-Pando (handoff),small,warm.open,4,0.835709,s,rep 4
-Pando (handoff),small,warm.status,4,0.916487,s,rep 4
-Pando (handoff),small,warm.git_status,5,1.68474,s,rep 5
-Pando (handoff),small,warm.open,5,0.817998,s,rep 5
-Pando (handoff),small,warm.status,5,0.866742,s,rep 5
+Pando,small,warm.git_status,1,1.29125,s,rep 1
+Pando,small,warm.open,1,0.826201,s,rep 1
+Pando,small,warm.status,1,0.465052,s,rep 1
+Pando,small,warm.git_status,2,1.27836,s,rep 2
+Pando,small,warm.open,2,0.813539,s,rep 2
+Pando,small,warm.status,2,0.464824,s,rep 2
+Pando,small,warm.git_status,3,1.29056,s,rep 3
+Pando,small,warm.open,3,0.825568,s,rep 3
+Pando,small,warm.status,3,0.464991,s,rep 3
+Pando,small,warm.git_status,4,1.32984,s,rep 4
+Pando,small,warm.open,4,0.86483,s,rep 4
+Pando,small,warm.status,4,0.46501,s,rep 4
+Pando,small,warm.git_status,5,1.30162,s,rep 5
+Pando,small,warm.open,5,0.836579,s,rep 5
+Pando,small,warm.status,5,0.465045,s,rep 5
+Pando (handoff),small,warm.git_status,1,1.74875,s,rep 1
+Pando (handoff),small,warm.open,1,0.832631,s,rep 1
+Pando (handoff),small,warm.status,1,0.916121,s,rep 1
+Pando (handoff),small,warm.git_status,2,1.80829,s,rep 2
+Pando (handoff),small,warm.open,2,0.841967,s,rep 2
+Pando (handoff),small,warm.status,2,0.966323,s,rep 2
+Pando (handoff),small,warm.git_status,3,1.71986,s,rep 3
+Pando (handoff),small,warm.open,3,0.804053,s,rep 3
+Pando (handoff),small,warm.status,3,0.915808,s,rep 3
+Pando (handoff),small,warm.git_status,4,1.75595,s,rep 4
+Pando (handoff),small,warm.open,4,0.840032,s,rep 4
+Pando (handoff),small,warm.status,4,0.915913,s,rep 4
+Pando (handoff),small,warm.git_status,5,1.70126,s,rep 5
+Pando (handoff),small,warm.open,5,0.885547,s,rep 5
+Pando (handoff),small,warm.status,5,0.815711,s,rep 5

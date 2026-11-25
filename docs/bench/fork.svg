@@ -25,8 +25,8 @@
   <path d="M212,94.0 h76.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-76.9 z" fill="#818b98"><title>Docker (overlayfs, local): 11.1 ms (range 11.1 ms to 11.1 ms)</title></path>
   <text x="298.9" y="105.0" font-size="12" fill="#59636e">11.1 ms</text>
   <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,120.0 h159.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-159.1 z" fill="#0969da"><title>Pando: 129 ms (range 129 ms to 129 ms)</title></path>
-  <text x="381.1" y="131.0" font-size="12" fill="#59636e">129 ms</text>
+  <path d="M212,120.0 h158.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-158.7 z" fill="#0969da"><title>Pando: 127 ms (range 127 ms to 127 ms)</title></path>
+  <text x="380.7" y="131.0" font-size="12" fill="#59636e">127 ms</text>
   <text x="202" y="157.0" font-size="12" fill="#1f2328" text-anchor="end">EBS snapshot to volume</text>
   <path d="M212,146.0 h260.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-260.1 z" fill="#818b98"><title>EBS snapshot to volume: 2.6 s (range 2.6 s to 2.6 s)</title></path>
   <text x="482.1" y="157.0" font-size="12" fill="#59636e">2.6 s</text>
@@ -56,8 +56,8 @@
   <text x="676.0" y="494" font-size="11" fill="#59636e" text-anchor="middle">32 GiB</text>
   <line x1="212" y1="298" x2="212" y2="480" stroke="#d1d9e0" stroke-width="1"/>
   <text x="202" y="315.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,304.0 h28.3 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-28.3 z" fill="#0969da"><title>Pando: 136 B (range 136 B to 136 B)</title></path>
-  <text x="250.3" y="315.0" font-size="12" fill="#59636e">136 B</text>
+  <path d="M212,304.0 h33.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-33.4 z" fill="#0969da"><title>Pando: 171 B (range 171 B to 171 B)</title></path>
+  <text x="255.4" y="315.0" font-size="12" fill="#59636e">171 B</text>
   <text x="202" y="341.0" font-size="12" fill="#1f2328" text-anchor="end">XFS reflink (local)</text>
   <path d="M212,330.0 h107.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-107.4 z" fill="#818b98"><title>XFS reflink (local): 4.61 KiB (range 4.61 KiB to 4.61 KiB)</title></path>
   <text x="329.4" y="341.0" font-size="12" fill="#59636e">4.61 KiB</text>

@@ -12,12 +12,12 @@
   <line x1="676.0" y1="62" x2="676.0" y2="374" stroke="#eaeef2" stroke-width="1"/>
   <text x="676.0" y="388" font-size="11" fill="#59636e" text-anchor="middle">16.7 min</text>
   <line x1="212" y1="62" x2="212" y2="374" stroke="#d1d9e0" stroke-width="1"/>
-  <text x="202" y="79.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (handoff)</text>
-  <path d="M212,68.0 h8.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-8.9 z" fill="#0969da"><title>Pando (handoff): 1.21 s (range 1.19 s to 2.32 s)</title></path>
-  <text x="230.9" y="79.0" font-size="12" fill="#59636e">1.21 s</text>
-  <text x="202" y="105.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,94.0 h9.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-9.6 z" fill="#0969da"><title>Pando: 1.22 s (range 1.16 s to 2.83 s)</title></path>
-  <text x="231.6" y="105.0" font-size="12" fill="#59636e">1.22 s</text>
+  <text x="202" y="79.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
+  <path d="M212,68.0 h5.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-5.8 z" fill="#0969da"><title>Pando: 1.16 s (range 984 ms to 2.61 s)</title></path>
+  <text x="227.8" y="79.0" font-size="12" fill="#59636e">1.16 s</text>
+  <text x="202" y="105.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (handoff)</text>
+  <path d="M212,94.0 h7.3 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-7.3 z" fill="#0969da"><title>Pando (handoff): 1.18 s (range 953 ms to 2.32 s)</title></path>
+  <text x="229.3" y="105.0" font-size="12" fill="#59636e">1.18 s</text>
   <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end">Nydus lazy pull</text>
   <path d="M212,120.0 h83.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-83.1 z" fill="#818b98"><title>Nydus lazy pull: 3.66 s (range 3.5 s to 3.77 s)</title></path>
   <text x="305.1" y="131.0" font-size="12" fill="#59636e">3.66 s</text>

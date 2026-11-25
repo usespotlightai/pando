@@ -22,32 +22,30 @@
   <text x="202" y="105.0" font-size="12" fill="#1f2328" text-anchor="end">Docker (overlayfs)</text>
   <path d="M212,94.0 h34.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-34.0 z" fill="#818b98"><title>Docker (overlayfs): 1.02x (range 1.02x to 1.03x)</title></path>
   <text x="256.0" y="105.0" font-size="12" fill="#59636e">1.02x</text>
-  <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (handoff)</text>
-  <path d="M212,120.0 h34.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-34.0 z" fill="#0969da"><title>Pando (handoff): 1.02x (range 1.02x to 1.06x)</title></path>
-  <text x="256.0" y="131.0" font-size="12" fill="#59636e">1.02x</text>
-  <text x="202" y="157.0" font-size="12" fill="#1f2328" text-anchor="end">image download from S3</text>
-  <path d="M212,146.0 h34.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-34.2 z" fill="#818b98"><title>image download from S3: 1.03x (range 1.03x to 1.04x)</title></path>
-  <text x="256.2" y="157.0" font-size="12" fill="#59636e">1.03x</text>
-  <text x="202" y="183.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
-  <path d="M212,172.0 h34.3 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-34.3 z" fill="#0969da"><title>Pando: 1.03x (range 1.03x to 1.16x)</title></path>
-  <text x="256.3" y="183.0" font-size="12" fill="#59636e">1.03x</text>
-  <text x="202" y="209.0" font-size="12" fill="#1f2328" text-anchor="end">Nydus lazy pull</text>
-  <path d="M212,198.0 h36.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-36.7 z" fill="#818b98"><title>Nydus lazy pull: 1.10x (range 1.08x to 1.12x)</title></path>
-  <text x="258.7" y="209.0" font-size="12" fill="#59636e">1.10x</text>
-  <text x="202" y="235.0" font-size="12" fill="#1f2328" text-anchor="end">ZeroFS (NBD)</text>
-  <path d="M212,224.0 h39.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-39.1 z" fill="#818b98"><title>ZeroFS (NBD): 1.16x (range 1.12x to 1.17x)</title></path>
-  <text x="261.1" y="235.0" font-size="12" fill="#59636e">1.16x</text>
-  <text x="202" y="261.0" font-size="12" fill="#1f2328" text-anchor="end">EBS snapshot to volume</text>
-  <path d="M212,250.0 h39.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-39.5 z" fill="#818b98"><title>EBS snapshot to volume: 1.17x (range 1.16x to 1.23x)</title></path>
-  <text x="261.5" y="261.0" font-size="12" fill="#59636e">1.17x</text>
-  <text x="202" y="287.0" font-size="12" fill="#1f2328" text-anchor="end">SOCI lazy pull</text>
-  <path d="M212,276.0 h40.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-40.8 z" fill="#818b98"><title>SOCI lazy pull: 1.21x (range 1.20x to 1.34x)</title></path>
-  <text x="262.8" y="287.0" font-size="12" fill="#59636e">1.21x</text>
-  <text x="202" y="313.0" font-size="12" fill="#1f2328" text-anchor="end">JuiceFS</text>
-  <path d="M212,302.0 h365.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-365.8 z" fill="#818b98"><title>JuiceFS: 9.96x (range 9.90x to 12.07x)</title></path>
-  <text x="587.8" y="313.0" font-size="12" fill="#59636e">9.96x</text>
-  <text x="202" y="339.0" font-size="12" fill="#1f2328" text-anchor="end">Amazon S3 Files</text>
-  <path d="M212,328.0 h434.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-434.8 z" fill="#818b98"><title>Amazon S3 Files: 11.82x (range 11.75x to 11.84x)</title></path>
-  <text x="656.8" y="339.0" font-size="12" fill="#59636e">11.82x</text>
+  <text x="202" y="131.0" font-size="12" fill="#1f2328" text-anchor="end">image download from S3</text>
+  <path d="M212,120.0 h34.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-34.2 z" fill="#818b98"><title>image download from S3: 1.03x (range 1.03x to 1.04x)</title></path>
+  <text x="256.2" y="131.0" font-size="12" fill="#59636e">1.03x</text>
+  <text x="202" y="157.0" font-size="12" fill="#1f2328" text-anchor="end">Nydus lazy pull</text>
+  <path d="M212,146.0 h36.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-36.7 z" fill="#818b98"><title>Nydus lazy pull: 1.10x (range 1.08x to 1.12x)</title></path>
+  <text x="258.7" y="157.0" font-size="12" fill="#59636e">1.10x</text>
+  <text x="202" y="183.0" font-size="12" fill="#1f2328" text-anchor="end">ZeroFS (NBD)</text>
+  <path d="M212,172.0 h39.1 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-39.1 z" fill="#818b98"><title>ZeroFS (NBD): 1.16x (range 1.12x to 1.17x)</title></path>
+  <text x="261.1" y="183.0" font-size="12" fill="#59636e">1.16x</text>
+  <text x="202" y="209.0" font-size="12" fill="#1f2328" text-anchor="end">EBS snapshot to volume</text>
+  <path d="M212,198.0 h39.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-39.5 z" fill="#818b98"><title>EBS snapshot to volume: 1.17x (range 1.16x to 1.23x)</title></path>
+  <text x="261.5" y="209.0" font-size="12" fill="#59636e">1.17x</text>
+  <text x="202" y="235.0" font-size="12" fill="#1f2328" text-anchor="end">SOCI lazy pull</text>
+  <path d="M212,224.0 h40.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-40.8 z" fill="#818b98"><title>SOCI lazy pull: 1.21x (range 1.20x to 1.34x)</title></path>
+  <text x="262.8" y="235.0" font-size="12" fill="#59636e">1.21x</text>
+  <text x="202" y="261.0" font-size="12" fill="#1f2328" text-anchor="end">JuiceFS</text>
+  <path d="M212,250.0 h365.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-365.8 z" fill="#818b98"><title>JuiceFS: 9.96x (range 9.90x to 12.07x)</title></path>
+  <text x="587.8" y="261.0" font-size="12" fill="#59636e">9.96x</text>
+  <text x="202" y="287.0" font-size="12" fill="#1f2328" text-anchor="end">Amazon S3 Files</text>
+  <path d="M212,276.0 h434.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-434.8 z" fill="#818b98"><title>Amazon S3 Files: 11.82x (range 11.75x to 11.84x)</title></path>
+  <text x="656.8" y="287.0" font-size="12" fill="#59636e">11.82x</text>
+  <text x="202" y="313.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando</text>
+  <text x="220" y="313.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
+  <text x="202" y="339.0" font-size="12" fill="#1f2328" text-anchor="end" font-weight="600">Pando (handoff)</text>
+  <text x="220" y="339.0" font-size="12" font-style="italic" fill="#59636e">not measured yet</text>
   <line x1="249.1" y1="58" x2="249.1" y2="348" stroke="#59636e" stroke-width="1.5"/>
 </svg>
