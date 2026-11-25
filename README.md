@@ -449,9 +449,9 @@ commands.
 
 | total time as a ratio to native (1.00x) | median | range |
 |---|---|---|
-| native ext4 (NVMe) | 1.00x | 1.00x to 1.00x |
-| Pando | — | |
-| Pando (handoff) | — | |
+| native ext4 (NVMe) | 1.00x | 0.99x to 1.01x |
+| Pando | 1.03x | 1.03x to 1.18x |
+| Pando (handoff) | 1.04x | 1.03x to 1.05x |
 | image download from S3 | 1.03x | 1.03x to 1.04x |
 | Docker (overlayfs) | 1.02x | 1.02x to 1.03x |
 | SOCI lazy pull | 1.21x | 1.20x to 1.34x |
