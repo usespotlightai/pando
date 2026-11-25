@@ -108,7 +108,8 @@ which drops the labels a remote snapshotter needs, so the image would be pulled 
   (handoff) also builds the host's base image of the root, as `pando follow` would.
 - **replay** opens a fresh branch on a warm host, drops the page cache and runs the 14 commands
   of the agent workload, each timed. `replay.total` is the sum as a ratio to native ext4 in the
-  same run, on a 64 GiB ext4 file system of its own on the local NVMe (`/native`). Commands run
+  same run, on a 64 GiB ext4 file system of its own on the local NVMe (`/native`), so a replay of
+  other systems runs native ext4 too, even when `--systems` leaves it out. Commands run
   in their own process group, killed when the command ends, so nothing they leave behind holds
   the mount when the branch closes.
 - **save** runs `npm ci` in a fresh branch on a warm host, then times the step that makes the
