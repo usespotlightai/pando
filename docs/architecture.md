@@ -115,11 +115,13 @@ Under constant random writes, the log stays near the live data plus the trees th
 flight still need.
 
 Hole punches free the disk of dropped records, but not their place in a file, so after each
-sweep the log compacts: each segment before the last whose records take at most a quarter of it
-has them appended again at the end, and once a sync makes the copies durable, its file is
-removed. A moved record counts as old as where it was first appended. A segment with appends not
-yet settled stays for a later sweep. The log's files thus stay near four times what it keeps,
-plus the last segment, well within the largest file a file system takes.
+sweep the log compacts: each segment before the last two whose records take at most a quarter of
+it has them appended again at the end, and once a sync makes the copies durable, its file is
+removed. The segment just before the last waits a whole segment of appends, so that under churn
+most of its records are written again before a compaction would copy them. A moved record counts
+as old as where it was first appended. A segment with appends not yet settled stays for a later
+sweep. The log's files thus stay near four times what it keeps, plus the last two segments, well
+within the largest file a file system takes.
 
 With `--cache-budget`, the chunks an open branch reaches that are already in the store stay only
 while they fit. A sweep keeps what it must, the chunks appended since the last sweep began, and

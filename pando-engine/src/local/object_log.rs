@@ -1171,12 +1171,14 @@ impl ObjectLog {
         Ok(freed)
     }
 
-    /// Removes each segment before the last whose records take at most a quarter of
+    /// Removes each segment before the last two whose records take at most a quarter of
     /// [`SEG_ROLL`], once it moved them to the end of the log and a sync made them durable
-    /// there. A segment with a record from below `floor`, with an append not settled yet, or
-    /// with a record not indexed yet, stays. Callers must not run it beside [`Self::sweep`] or
-    /// another compaction. A crash before the removal leaves both copies, and the next sweep drops the
-    /// later one.
+    /// there. The segment just before the last stays, so its records have a whole segment of
+    /// appends to be written again first: under churn few are left to move, and a compaction
+    /// right after a roll would copy what the next writes replace. A segment with a record
+    /// from below `floor`, with an append not settled yet, or with a record not indexed yet,
+    /// stays. Callers must not run it beside [`Self::sweep`] or another compaction. A crash
+    /// before the removal leaves both copies, and the next sweep drops the later one.
     #[expect(
         clippy::iter_over_hash_type,
         reason = "the records of each segment are moved in any order"
@@ -1195,7 +1197,7 @@ impl ObjectLog {
             .read()
             .keys()
             .copied()
-            .filter(|id| *id < last && !busy.contains(id))
+            .filter(|id| *id + 1 < last && !busy.contains(id))
             .collect();
         if ids.is_empty() {
             return Ok(());
@@ -1910,11 +1912,11 @@ mod tests {
             .await
             .unwrap();
         let before = log.end();
-        for i in 0..20 {
+        for i in 0..36 {
             let (h, b) = rec(i);
             log.put(h, b).await.unwrap();
         }
-        assert!(seg_of(log.end()) > 0);
+        assert!(seg_of(log.end()) > 1);
         let epoch = log.next_epoch();
         for h in [kh, rh, oh] {
             assert!(log.mark(&h, epoch));
@@ -1946,14 +1948,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_segment_before_the_last_waits_a_segment_before_its_compaction() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        let (kh, kb) = obj(1);
+        log.put(kh, kb.clone()).await.unwrap();
+        let mut i = 0;
+        let sweep = async |log: &ObjectLog, until: u64, i: &mut u32| {
+            while seg_of(log.end()) < until {
+                let (h, b) = rec(*i);
+                log.put(h, b).await.unwrap();
+                *i += 1;
+            }
+            let epoch = log.next_epoch();
+            assert!(log.mark(&kh, epoch));
+            log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
+            log.compact(0).await.unwrap();
+        };
+        sweep(&log, 1, &mut i).await;
+        assert_eq!(
+            segments(&fs, path).await[0].0,
+            0,
+            "the segment just rolled from stays"
+        );
+        assert_eq!(seg_of(log.lookup(&kh).unwrap().off), 0);
+        sweep(&log, 2, &mut i).await;
+        assert_ne!(segments(&fs, path).await[0].0, 0, "a segment later it goes");
+        assert_eq!(seg_of(log.lookup(&kh).unwrap().off), 2);
+        assert_eq!(log.get(&kh).await.unwrap(), Some(kb));
+    }
+
+    #[tokio::test]
     async fn a_segment_that_holds_more_than_a_quarter_stays() {
         let fs = SimFs::default();
         let path = Path::new("/c/objects");
         let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
-        for i in 0..20 {
+        for i in 0..36 {
             let (h, b) = rec(i);
             log.put(h, b).await.unwrap();
         }
+        assert!(seg_of(log.end()) > 1);
         let epoch = log.next_epoch();
         for i in 0..6 {
             assert!(log.mark(&rec(i).0, epoch));
@@ -1992,11 +2027,11 @@ mod tests {
         let len = u32::try_from(b.len()).unwrap();
         let (at, pending) = log.append(h, header(h, len), b.clone()).await.unwrap();
         assert_eq!(seg_of(at), 0);
-        for i in 14..20 {
+        for i in 14..36 {
             let (h, b) = rec(i);
             log.put(h, b).await.unwrap();
         }
-        assert!(seg_of(log.end()) > 0);
+        assert!(seg_of(log.end()) > 1);
         let epoch = log.next_epoch();
         log.sweep(0, log.end(), epoch, &[], &[]).await.unwrap();
         log.compact(0).await.unwrap();
