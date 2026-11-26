@@ -76,6 +76,26 @@ const DIRTY_COMMIT: usize = 2 << 20;
 const DIRTY_MAX: usize = 1 << 30;
 #[cfg(test)]
 const DIRTY_MAX: usize = 4 << 20;
+/// The fewest dirty bytes a commit waits for under a limit of [`Cache::set_dirty_memory`].
+const DIRTY_COMMIT_MIN: usize = 256 << 10;
+
+/// The dirty bytes past which a commit starts, and past which a write commits first, for a
+/// volume whose uncommitted writes may take `memory` bytes of page cache, or zero for no limit.
+/// The journal holds the dirty set and, while a commit stores it, the one before, so the
+/// limits are a quarter and a half of `memory`, and never above [`DIRTY_COMMIT`] and
+/// [`DIRTY_MAX`].
+fn dirty_limits(memory: u64) -> (usize, usize) {
+    if memory == 0 {
+        return (DIRTY_COMMIT, DIRTY_MAX);
+    }
+    let quarter = usize::try_from(memory / 4)
+        .unwrap_or(usize::MAX)
+        .max(DIRTY_COMMIT_MIN);
+    (
+        quarter.min(DIRTY_COMMIT),
+        quarter.saturating_mul(2).min(DIRTY_MAX),
+    )
+}
 static ZEROS: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
 static UPLOADS: AtomicU64 = AtomicU64::new(1);
 
@@ -245,7 +265,7 @@ struct Inner {
     up: Mutex<Up>,
     changed: watch::Sender<u64>,
     kick: Notify,
-    /// Wakes the committer: the dirty set passed [`DIRTY_COMMIT`].
+    /// Wakes the committer: the dirty set passed the first of [`dirty_limits`].
     full: Notify,
     stop: watch::Sender<bool>,
     dedup: Mutex<Option<Arc<Dedup>>>,
@@ -1426,25 +1446,27 @@ impl Inner {
         Ok(())
     }
 
-    /// Keeps the dirty set near [`DIRTY_MAX`]: past [`DIRTY_COMMIT`] it wakes the committer,
-    /// and past [`DIRTY_MAX`] it commits before the write. Call it holding no stripe lock.
+    /// Keeps the dirty set near its most, the second of [`dirty_limits`]: past the first it
+    /// wakes the committer, and past the most it commits before the write. Call it holding no
+    /// stripe lock.
     async fn make_room(&self) -> Result<()> {
+        let (commit, most) = dirty_limits(self.cache.dirty_memory());
         loop {
             let bytes = self.mem.lock().dirty.bytes;
-            if bytes < DIRTY_COMMIT {
+            if bytes < commit {
                 return Ok(());
             }
             self.full.notify_one();
-            if bytes < DIRTY_MAX {
+            if bytes < most {
                 return Ok(());
             }
-            self.commit_at(DIRTY_MAX).await?;
+            self.commit_at(most).await?;
         }
     }
 
-    /// Commits the dirty set whenever it passes [`DIRTY_COMMIT`], until the volume stops. A
-    /// commit that fails leaves its writes dirty, or its state unwritten, for the next flush to
-    /// repeat and report.
+    /// Commits the dirty set whenever it passes the first of [`dirty_limits`], until the
+    /// volume stops. A commit that fails leaves its writes dirty, or its state unwritten, for
+    /// the next flush to repeat and report.
     async fn committer(self: Arc<Self>) {
         let mut stop = self.stop.subscribe();
         loop {
@@ -1452,7 +1474,7 @@ impl Inner {
                 _ = stop.wait_for(|s| *s) => return,
                 () = self.full.notified() => {}
             }
-            let _ = self.commit_at(DIRTY_COMMIT).await;
+            let _ = self.commit_at(dirty_limits(self.cache.dirty_memory()).0).await;
         }
     }
 
@@ -2274,6 +2296,74 @@ mod tests {
             .unwrap();
         assert_eq!(read(&other, 0, w.len()).await, w, "the upload has every write");
         other.close().await;
+    }
+
+    #[test]
+    fn dirty_limits_follow_the_memory_up_to_the_defaults() {
+        assert_eq!(dirty_limits(0), (DIRTY_COMMIT, DIRTY_MAX));
+        assert_eq!(dirty_limits(u64::MAX), (DIRTY_COMMIT, DIRTY_MAX));
+        assert_eq!(
+            dirty_limits(u64_from(4 * DIRTY_COMMIT_MIN)),
+            (DIRTY_COMMIT_MIN, 2 * DIRTY_COMMIT_MIN)
+        );
+        assert_eq!(dirty_limits(1), (DIRTY_COMMIT_MIN, 2 * DIRTY_COMMIT_MIN));
+    }
+
+    /// The bytes of the journal files of branch `name` in `dir`.
+    async fn journal_bytes(fs: &SimFs, dir: &str, name: &str) -> u64 {
+        let jdir = Path::new(dir).join("journal").join(name);
+        let mut n = 0;
+        for e in fs.list(&jdir).await.unwrap() {
+            n += fs
+                .open(&jdir.join(&e.name), Open::Read)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap();
+        }
+        n
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dirty_memory_limit_keeps_the_journal_within_it() {
+        let (ports, _, fs) = sim::ports(8);
+        branch(&ports, "main").await;
+        let memory = 2 << 20;
+        let cache = host(&ports, "/a").await;
+        cache.set_dirty_memory(u64_from(memory));
+        let v = Volume::open(&ports, cache, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        let (_, most) = dirty_limits(u64_from(memory));
+        assert_eq!(most, memory / 2);
+        let step = 128 << 10;
+        let w = data(9, 4 * DIRTY_MAX);
+        let mut journal = 0;
+        for (i, part) in w.chunks(step).enumerate() {
+            v.write_at(part, u64_from(i * step)).await.unwrap();
+            let bytes = v.inner.mem.lock().dirty.bytes;
+            assert!(bytes <= most + 2 * step, "{bytes} dirty bytes after write {i}");
+            journal = journal.max(journal_bytes(&fs, "/a", "main").await);
+        }
+        assert!(
+            journal <= u64_from(2 * (most + 2 * step)),
+            "the journal reached {journal} bytes under a limit of {memory}"
+        );
+        assert!(v.inner.mem.lock().flush_seq > 4, "commits kept the journal small");
+        assert_eq!(read(&v, 0, w.len()).await, w);
+        v.close().await;
+        drop(v);
+
+        let again = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&again, 0, w.len()).await,
+            w,
+            "a restart replays what no commit took"
+        );
+        again.close().await;
     }
 
     #[tokio::test(start_paused = true)]

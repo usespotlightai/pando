@@ -54,10 +54,13 @@ A write goes to the journal, one local file per shard of chunks, and is acknowle
 has it, without a sync; memory keeps where in the journal each write is. A commit also starts
 without a flush once 256 MiB of written chunks wait, and past 1 GiB a write commits first. Such a
 commit is local only: it leaves the log to the uploader, as a flush does when 32 MiB of flushes
-already wait for the shipper. The daemon serves the device, so the kernel does not slow its own
-writes when its dirty pages fill its memory: a journal shard waits for the disk once it is more than
-4 MiB behind, and the cache log once it is more than 16 MiB behind. A daemon's memory for writes
-therefore stays bounded however much is written between flushes.
+already wait for the shipper. A commit removes the journal it took while its pages are still in
+the page cache, so journal writes never reach the disk; only the cache log does. The daemon serves
+the device, so the kernel does not slow its own writes when its dirty pages fill its memory: the
+journal may take a quarter of the memory the daemon may use (its memory cgroup's limit, or the
+host's memory), and under a smaller limit the two thresholds shrink to a quarter and a half of
+that, and the cache log waits for the disk once it is more than 16 MiB behind. A daemon's memory
+for writes therefore stays bounded however much is written between flushes.
 
 An open that does not resume this host's own state reads the records the ref does not cover, from
 the ref's log position through the last writer's log, and applies them as writes. It seals each
@@ -112,11 +115,13 @@ Under constant random writes, the log stays near the live data plus the trees th
 flight still need.
 
 Hole punches free the disk of dropped records, but not their place in a file, so after each
-sweep the log compacts: each segment before the last whose records take at most a quarter of it
-has them appended again at the end, and once a sync makes the copies durable, its file is
-removed. A moved record counts as old as where it was first appended. A segment with appends not
-yet settled stays for a later sweep. The log's files thus stay near four times what it keeps,
-plus the last segment, well within the largest file a file system takes.
+sweep the log compacts: each segment before the last two whose records take at most a quarter of
+it has them appended again at the end, and once a sync makes the copies durable, its file is
+removed. The segment just before the last waits a whole segment of appends, so that under churn
+most of its records are written again before a compaction would copy them. A moved record counts
+as old as where it was first appended. A segment with appends not yet settled stays for a later
+sweep. The log's files thus stay near four times what it keeps, plus the last two segments, well
+within the largest file a file system takes.
 
 With `--cache-budget`, the chunks an open branch reaches that are already in the store stay only
 while they fit. A sweep keeps what it must, the chunks appended since the last sweep began, and
