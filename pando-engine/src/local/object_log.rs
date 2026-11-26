@@ -26,7 +26,7 @@ const WRITEBACK_BYTES: u64 = 8 << 20;
 /// pages fill its memory cgroup.
 const BEHIND_BYTES: u64 = 16 << 20;
 /// The fewest appended bytes between two sweeps.
-const SWEEP_MIN: u64 = if cfg!(test) { 1 << 20 } else { 1 << 30 };
+const SWEEP_MIN: u64 = if cfg!(test) { 1 << 20 } else { 1 << 50 };
 /// The most bytes `<log>.pads` lists before a sweep syncs the log itself to empty it.
 const PADS_MAX: usize = 1 << 20;
 /// The longest padding a sweep writes over the records it drops.
