@@ -9,6 +9,7 @@
 )]
 
 pub mod gc_race;
+pub mod host_crash;
 pub mod race;
 pub mod scenario;
 pub mod store_conformance;

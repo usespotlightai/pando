@@ -65,6 +65,7 @@ struct State {
     capacity: Option<u64>,
     /// How many more changes to the files succeed before every change fails.
     stop_after: Option<u64>,
+    changes: u64,
 }
 
 impl State {
@@ -74,9 +75,13 @@ impl State {
             Some(0) => Err(io::Error::other("the simulated host stopped")),
             Some(n) => {
                 *n -= 1;
+                self.changes += 1;
                 Ok(())
             }
-            None => Ok(()),
+            None => {
+                self.changes += 1;
+                Ok(())
+            }
         }
     }
 
@@ -133,6 +138,19 @@ impl SimFs {
     /// Whether the changes [`Self::stop_after`] let through ran out.
     pub fn stopped(&self) -> bool {
         self.lock_state().stop_after == Some(0)
+    }
+
+    /// How many changes to the files succeeded so far.
+    pub fn changes(&self) -> u64 {
+        self.lock_state().changes
+    }
+
+    /// Lifts [`Self::stop_after`] and drops every lock, as when the process that held them dies
+    /// and the host goes on: what it wrote stays, durable or not.
+    pub fn end_process(&self) {
+        let mut s = self.lock_state();
+        s.stop_after = None;
+        s.locks.clear();
     }
 
     /// Loses everything not yet durable, as a power cut would, and drops every lock.
@@ -316,6 +334,7 @@ impl LocalImage for SimFs {
         let mut s = self.lock_state();
         let src = Self::inode(&s, from)?;
         Self::parent_exists(&s, to)?;
+        s.change()?;
         let (bytes, blocks) = (s.data[&src].current.clone(), s.data[&src].blocks.clone());
         Self::new_file(&mut s, to, bytes, blocks);
         Ok(())
@@ -325,6 +344,7 @@ impl LocalImage for SimFs {
         let mut s = self.lock_state();
         let src = Self::inode(&s, from)?;
         Self::parent_exists(&s, to)?;
+        s.change()?;
         let d = &s.data[&src];
         let len = u64_from(d.current.len());
         let (mut parts, mut spans) = (Vec::new(), Vec::new());

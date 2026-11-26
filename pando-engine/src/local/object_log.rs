@@ -1456,8 +1456,8 @@ impl ObjectLog {
         }
     }
 
-    /// Waits for every put that started before it, makes them durable, then records that the
-    /// log is durable up to them.
+    /// Waits for every put that started before it, makes them durable, with the names of the
+    /// files that reference records point to, then records that the log is durable up to them.
     pub(crate) async fn sync(&self) -> Result<()> {
         let end = {
             let _f = self.in_flight.lock();
@@ -1481,11 +1481,21 @@ impl ObjectLog {
             .filter(|e| e.needs_sync.swap(false, Ordering::AcqRel))
             .cloned()
             .collect();
-        for e in ext {
+        let mut dirs = BTreeSet::new();
+        for e in &ext {
             if let Some(f) = e.open(self.fs.as_ref()).await
                 && let Err(err) = f.sync_data().await
             {
                 e.needs_sync.store(true, Ordering::Release);
+                return Err(err.into());
+            }
+            dirs.extend(e.path.parent().map(Path::to_path_buf));
+        }
+        for d in dirs {
+            if let Err(err) = self.fs.sync_dir(&d).await {
+                for e in &ext {
+                    e.needs_sync.store(true, Ordering::Release);
+                }
                 return Err(err.into());
             }
         }
@@ -1593,6 +1603,27 @@ mod tests {
         let again = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
         again.sync().await.unwrap();
         drop(again);
+
+        fs.crash();
+        let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        assert_eq!(after.get(&h).await.unwrap(), Some(b));
+    }
+
+    #[tokio::test]
+    async fn a_sync_makes_the_name_of_a_new_file_a_record_points_to_durable() {
+        let fs = SimFs::default();
+        let path = Path::new("/c/objects");
+        let log = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();
+        fs.create_dir_all(Path::new("/img")).await.unwrap();
+        fs.sync_dir(Path::new("/")).await.unwrap();
+        let clone = fs.open(Path::new("/img/clone"), Open::CreateNew).await.unwrap();
+        let (h, b) = obj(4);
+        clone.write_at(vec![b.clone()], 0).await.unwrap();
+        log.put_ref(h, Path::new("/img/clone"), 0, u32::try_from(b.len()).unwrap())
+            .await
+            .unwrap();
+        log.sync().await.unwrap();
+        drop(log);
 
         fs.crash();
         let after = ObjectLog::open(Arc::new(fs.clone()), path).await.unwrap();

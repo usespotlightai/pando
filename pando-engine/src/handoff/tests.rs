@@ -10,7 +10,7 @@ use pando_format::{CHUNK_SIZE, u64_from, usize_from};
 use super::adopt::{adopt_leftovers, rejoin};
 use super::*;
 use crate::cache::Cache;
-use crate::sim::{self, SimBlock, SimDevices};
+use crate::sim::{self, SimBlock, SimDevices, SimFs};
 use crate::{Ports, Volume};
 
 const SIZE: u64 = 2 << 20;
@@ -28,10 +28,15 @@ impl SimBlock for VolBlock {
     async fn write(&self, b: &[u8], off: u64) -> io::Result<()> {
         self.0.write_at(b, off).await.map_err(io::Error::other)
     }
+
+    async fn flush(&self) -> io::Result<()> {
+        self.0.flush().await.map_err(io::Error::other)
+    }
 }
 
 struct Host {
     ports: Ports,
+    fs: SimFs,
     devices: SimDevices,
     cache: Arc<Cache>,
 }
@@ -45,10 +50,11 @@ impl Host {
         let fs = (*fs).clone();
         Host {
             devices: if eras {
-                SimDevices::new(fs)
+                SimDevices::new(fs.clone())
             } else {
-                SimDevices::without_eras(fs)
+                SimDevices::without_eras(fs.clone())
             },
+            fs,
             ports,
             cache,
         }
@@ -111,7 +117,8 @@ impl Host {
             .collect();
         out.sort_by_key(|p| {
             let s = p.to_string_lossy();
-            s.rsplit_once(".snap").unwrap().1.parse::<u32>().unwrap()
+            let (g, n) = s.rsplit_once(".snap").unwrap().1.split_once('-').unwrap();
+            (g.parse::<u64>().unwrap(), n.parse::<u32>().unwrap())
         });
         out
     }
@@ -174,7 +181,7 @@ async fn moves_the_device_and_publishes_at_detach(seed: u64, eras: bool) {
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 4);
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert!(host.ports.fs.open(&image, Open::Read).await.is_err());
     assert_eq!(host.devices.era(&era_name(DM)).await.unwrap(), None);
@@ -225,7 +232,7 @@ async fn snapshots_a_shared_base_run(seed: u64, eras: bool) {
     host.devices.remove(DM).await.unwrap();
     h.absorb_final(&v).await.unwrap();
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     let left = host.ports.fs.list(Path::new("/img")).await.unwrap();
     assert!(left.is_empty(), "{left:?}");
@@ -285,7 +292,7 @@ async fn an_era_snapshot_clones_only_the_chunks_written_since_the_last() {
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 2, "only chunks 30 and 31");
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     let mut want = vec![0x5a; usize_from(SIZE)];
     for (at, fill) in [(12usize, 0x12u8), (20, 0x20), (30, 0x30)] {
@@ -327,7 +334,7 @@ async fn a_copy_snapshot_reads_the_written_chunks_without_a_clone() {
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 2, "only chunks 30 and 31");
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(
         host.published().await,
@@ -370,7 +377,7 @@ async fn a_copy_snapshot_reads_again_what_was_written_while_it_read() {
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 0);
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(
         host.published().await,
@@ -400,7 +407,7 @@ async fn a_clone_snapshot_clones_again_what_was_written_while_it_cloned() {
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 0);
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(
         host.published().await,
@@ -429,7 +436,7 @@ async fn a_copy_snapshot_freezes_once_few_were_written_while_it_read() {
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 0);
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(
         host.published().await,
@@ -459,7 +466,7 @@ async fn a_snapshot_asked_for_clones_rather_than_give_up() {
     v.checkpoint().await.unwrap();
     host.devices.remove(DM).await.unwrap();
     assert_eq!(h.absorb_final(&v).await.unwrap(), 0);
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(
         host.published().await,
@@ -486,7 +493,7 @@ async fn writes_that_do_not_let_up_postpone_copy_snapshots_until_one_clones() {
     host.devices.remove(DM).await.unwrap();
     h.absorb_final(&v).await.unwrap();
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     let last = 2 * u8::try_from(POSTPONE_MAX).unwrap();
     assert_eq!(host.published().await, chunks_filled(&[(20, 10, last)]));
@@ -510,7 +517,7 @@ async fn a_snapshot_of_more_than_it_may_read_clones_the_chunks() {
     host.devices.remove(DM).await.unwrap();
     h.absorb_final(&v).await.unwrap();
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(host.published().await, expect(&[(12, 0x12)]));
 }
@@ -539,7 +546,7 @@ async fn a_chunk_read_again_as_it_was_drops_the_write_read_before() {
     host.devices.remove(DM).await.unwrap();
     h.absorb_final(&v).await.unwrap();
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(host.published().await, expect(&[]));
 }
@@ -568,8 +575,29 @@ async fn a_snapshot_comes_once_the_writes_stop() {
     assert_eq!(h.stats.taken.load(Ordering::Relaxed), 1, "nothing written since");
     host.devices.remove(DM).await.unwrap();
     h.absorb_final(&v).await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_detach_right_after_the_handoff_stops_the_snapshots_before_they_start() {
+    let host = Host::new(15, true).await;
+    let v = host.open().await;
+    host.serve(&v).await;
+    host.write(3, 0x33).await;
+    let env = host.env(false);
+    let image = image_path(&host.ports, Path::new("/img"), "main");
+    let (h, _) = hand_off(&env, &v, DM, image, every(2)).await.unwrap();
+    host.devices.remove(DM).await.unwrap();
+    let absorbed = tokio::time::timeout(Duration::from_secs(60), h.absorb_final(&v)).await;
+    assert!(
+        absorbed.is_ok_and(|r| r.is_ok()),
+        "the detach waits on no snapshot"
+    );
+    v.checkpoint().await.unwrap();
+    h.remove(&v).await.unwrap();
+    v.close().await;
+    assert_eq!(host.published().await, expect(&[(3, 0x33)]));
 }
 
 #[tokio::test(start_paused = true)]
@@ -594,7 +622,7 @@ async fn a_detach_without_the_era_device_takes_every_chunk_that_differs() {
     host.devices.remove(&era_name(DM)).await.unwrap();
     h.absorb_final(&v).await.unwrap();
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(host.published().await, expect(&[(2, 0x22), (7, 0x77)]));
 }
@@ -632,7 +660,7 @@ async fn a_handoff_replaces_an_era_device_an_earlier_run_left() {
     host.devices.remove(DM).await.unwrap();
     h.absorb_final(&v).await.unwrap();
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(host.published().await, expect(&[(4, 0x44), (9, 0x99)]));
 }
@@ -688,7 +716,7 @@ async fn rejoin_after_handoff(host: &Host, v: Arc<Volume>, shared: bool, before:
     host.devices.remove(DM).await.unwrap();
     h.absorb_final(&v).await.unwrap();
     v.checkpoint().await.unwrap();
-    h.remove(&v).await;
+    h.remove(&v).await.unwrap();
     v.close().await;
     assert_eq!(host.devices.era(&era_name(DM)).await.unwrap(), None);
     let mut want: Vec<(u64, u8)> = before.to_vec();
@@ -714,6 +742,56 @@ async fn without_eras_a_new_writer_rejoins_a_run() {
 #[tokio::test(start_paused = true)]
 async fn without_eras_a_new_writer_rejoins_a_shared_base_run() {
     rejoins_a_run_the_old_writer_left(33, false, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejoin_names_its_clones_apart_from_those_an_earlier_writer_removed() {
+    let host = Host::new(43, true).await;
+    let v = host.open().await;
+    host.serve(&v).await;
+    host.write(2, 0x22).await;
+    let env = host.env(false);
+    let (h, _) = hand_off(
+        &env,
+        &v,
+        DM,
+        image_path(&host.ports, Path::new("/img"), "main"),
+        every(5),
+    )
+    .await
+    .unwrap();
+    host.write(4, 0x44).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    h.stop.send_replace(true);
+    let task = h.task.lock().take();
+    if let Some(t) = task {
+        t.await.unwrap();
+    }
+    v.flush().await.unwrap();
+    v.checkpoint().await.unwrap();
+    let removed = host.clones().await;
+    assert_ne!(removed.len(), 0, "the snapshots made clones");
+    for p in &removed {
+        v.tree().cache().drop_file(p);
+        host.ports.fs.remove(p).await.unwrap();
+    }
+    drop(h);
+    v.close().await;
+    drop(v);
+
+    let v = host.open().await;
+    let h = rejoin(&env, &v, DM, Path::new("/img"), every(5))
+        .await
+        .unwrap()
+        .expect("the device serves the image");
+    assert!(host.clones().await.iter().all(|p| !removed.contains(p)));
+    host.write(6, 0x66).await;
+    host.devices.remove(DM).await.unwrap();
+    h.absorb_final(&v).await.unwrap();
+    v.checkpoint().await.unwrap();
+    h.remove(&v).await.unwrap();
+    v.close().await;
+    assert_eq!(host.published().await, expect(&[(2, 0x22), (4, 0x44), (6, 0x66)]));
 }
 
 #[tokio::test(start_paused = true)]
@@ -745,6 +823,106 @@ async fn after_a_restart_the_next_attach_adopts_the_image() {
     let left = host.ports.fs.list(Path::new("/img")).await.unwrap();
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(host.published().await, expect(&[(7, 0x77), (8, 0x88)]));
+}
+
+/// A host whose writer handed off, wrote 8 to the image and died with the host, so the image
+/// it left holds writes the store lacks.
+async fn left_an_image() -> (Host, HostEnv, PathBuf) {
+    let host = Host::new(5, true).await;
+    let v = host.open().await;
+    host.serve(&v).await;
+    host.write(7, 0x77).await;
+    let env = host.env(false);
+    let image = image_path(&host.ports, Path::new("/img"), "main");
+    let (h, _) = hand_off(&env, &v, DM, image.clone(), none()).await.unwrap();
+    host.write(8, 0x88).await;
+    host.devices.remove(DM).await.unwrap();
+    host.devices.remove(&era_name(DM)).await.unwrap();
+    drop(h);
+    v.close().await;
+    (host, env, image)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_image_outlives_attaches_on_its_host_that_died_before_they_adopted_it() {
+    let (host, env, image) = left_an_image().await;
+    for _ in 0..2 {
+        host.open().await.close().await;
+    }
+
+    let v = host.open().await;
+    assert!(adopt_leftovers(&env, &v, Path::new("/img")).await.unwrap() >= 1);
+    v.close().await;
+    assert!(host.ports.fs.open(&image, Open::Read).await.is_err());
+    assert_eq!(host.published().await, expect(&[(7, 0x77), (8, 0x88)]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_adopted_image_is_not_adopted_again_after_a_power_cut() {
+    let (host, env, image) = left_an_image().await;
+    let v = host.open().await;
+    assert!(adopt_leftovers(&env, &v, Path::new("/img")).await.unwrap() >= 1);
+    v.close().await;
+    host.fs.crash();
+    let owner = Owner::read(&host.fs, &image).await.unwrap();
+    assert_eq!(
+        owner, None,
+        "the owner record of the adopted image is gone for good"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_image_goes_once_another_host_took_the_branch() {
+    let (host, env, image) = left_an_image().await;
+    let cache = Arc::new(Cache::open(&host.ports, Path::new("/other")).await.unwrap());
+    let other = Volume::open(&host.ports, cache, Path::new("/other-state"), "main")
+        .await
+        .unwrap();
+    other
+        .write_at(&vec![0x99; CHUNK_SIZE], u64_from(9 * CHUNK_SIZE))
+        .await
+        .unwrap();
+    other.checkpoint().await.unwrap();
+    other.close().await;
+
+    let v = host.open().await;
+    assert_eq!(adopt_leftovers(&env, &v, Path::new("/img")).await.unwrap(), 0);
+    v.close().await;
+    assert!(host.ports.fs.open(&image, Open::Read).await.is_err());
+    let published = host.published().await;
+    assert!(
+        published[9 * CHUNK_SIZE..][..CHUNK_SIZE]
+            .iter()
+            .all(|&b| b == 0x99)
+    );
+    assert!(
+        published[8 * CHUNK_SIZE + 100..][..CHUNK_SIZE - 100]
+            .iter()
+            .all(|&b| b == 0),
+        "the image's write stays out"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_image_with_no_owner_record_goes_at_the_next_attach() {
+    let host = Host::new(6, true).await;
+    let env = host.env(false);
+    let image = image_path(&host.ports, Path::new("/img"), "main");
+    host.ports.fs.create_dir_all(Path::new("/img")).await.unwrap();
+    host.ports
+        .fs
+        .open(&image, Open::Create)
+        .await
+        .unwrap()
+        .set_len(SIZE)
+        .await
+        .unwrap();
+
+    let v = host.open().await;
+    assert_eq!(adopt_leftovers(&env, &v, Path::new("/img")).await.unwrap(), 0);
+    v.close().await;
+    let left = host.ports.fs.list(Path::new("/img")).await.unwrap();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 #[test]

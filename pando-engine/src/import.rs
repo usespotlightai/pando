@@ -140,6 +140,7 @@ pub async fn import(ports: &Ports, cache: &Arc<Cache>, name: &str, image: &Path)
                 closed: true,
                 ..pando_format::LogPos::default()
             }),
+            writer: None,
         })
         .await?;
     Ok(ImportReport {

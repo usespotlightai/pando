@@ -243,6 +243,7 @@ impl Attachment {
                 self.warmed.send_replace(true);
                 return Ok(());
             }
+            handoff::adopt::remove_stale_era(env.devices.as_ref(), &dm).await?;
             handoff::adopt::adopt_leftovers(&env, &v, &images).await?;
         }
         if self.base_ready
@@ -477,7 +478,7 @@ impl Attachment {
         if let Some(h) = &h
             && done.is_ok()
         {
-            h.remove(v).await;
+            done = h.remove(v).await;
         }
         if done.is_ok() && self.opts.record {
             report.recorded = recording::save(&self.cache, &v.opened(), &v.root())
@@ -573,6 +574,9 @@ mod tests {
         }
         async fn write(&self, b: &[u8], off: u64) -> io::Result<()> {
             self.0.write_at(b, off).await.map_err(io::Error::other)
+        }
+        async fn flush(&self) -> io::Result<()> {
+            self.0.flush().await.map_err(io::Error::other)
         }
     }
 

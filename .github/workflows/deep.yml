@@ -2,8 +2,9 @@ name: deep
 
 # The slow checks. Each night: every fuzz target for ten minutes, growing a corpus kept in the
 # Actions cache, and the nightly TLA+ models of the write log with 400 traces of the engine
-# checked against them. Each Sunday: mutation testing of the workspace in four shards. Start
-# either by hand from the Actions tab.
+# checked against them, and 400 seeds each of a host that hands off and of the follower crashing
+# anywhere. Each Sunday: mutation testing of the workspace in four shards. Start either by hand
+# from the Actions tab.
 
 on:
   schedule:
@@ -98,6 +99,30 @@ jobs:
           name: tla-traces-${{ github.run_id }}
           path: ${{ runner.temp }}/tla-traces
           if-no-files-found: ignore
+
+  host-crashes:
+    name: Host crashes
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '41 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: host-crashes
+
+      - name: Crashes of a host that hands off, and of the follower, over 400 seeds each, from a seed that changes with each run
+        env:
+          PANDO_DST_HOST_SEEDS: "400"
+          PANDO_DST_FOLLOW_SEEDS: "400"
+          RUN_NUMBER: ${{ github.run_number }}
+        run: PANDO_DST_FIRST=$((RUN_NUMBER * 400)) cargo test --release -p pando-dst --test scenarios -- a_host_that_hands_off base_images_stay_whole
 
   mutants:
     name: Mutation testing

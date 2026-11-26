@@ -184,3 +184,23 @@ async fn a_follower_builds_the_new_root_of_a_followed_branch_and_evicts_old_base
     write(&ports, &a, &[4; 100], 0).await;
     assert_eq!(f.once().await.unwrap(), 0, "the note aged out");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_follower_keeps_the_base_it_just_built_when_the_clock_did_not_move() {
+    let (ports, _, _) = sim::ports(5);
+    Volume::create(&ports, "main", SIZE).await.unwrap();
+    let a = host(&ports, "/a").await;
+    let b = host(&ports, "/b").await;
+    let bases = Bases::new(&ports, Path::new("/b/bases"));
+    bases.note_follow("main").await.unwrap();
+    let mut f = Follower::new(&ports, Arc::clone(&b), Path::new("/b/bases"), 8, 1, 0);
+    let mut last = None;
+    for i in 1..5 {
+        let r = write(&ports, &a, &[i; 100], 0).await;
+        assert_eq!(f.once().await.unwrap(), 1);
+        assert!(bases.has(&r.root.hash).await, "the base of root {i} stays");
+        if let Some(old) = last.replace(r.root.hash) {
+            assert!(!bases.has(&old).await, "only one base stays");
+        }
+    }
+}

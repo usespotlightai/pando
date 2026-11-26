@@ -61,5 +61,9 @@ ref's bytes, and so its ETag, differ from the deleted one's. The write log of a 
 `log/<hash of the branch name>/<branch id>/<writer generation>/<n>`, so each life of a branch has
 a log of its own.
 
+A ref that a writer took has a `writer` line last: 16 hex digits the writer drew at random when
+it took the branch. A host that died as it put the ref reads it back and knows whether the
+writer of that generation is its own, or a rival's that took the same generation first.
+
 Each kind of object does not carry its own version yet. Add one when a change has to let objects
 of two formats live in the same store.
