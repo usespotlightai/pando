@@ -217,7 +217,6 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
                 w.model[off..off + len].copy_from_slice(&b);
                 since.push((off, b));
                 w.report.writes += 1;
-                w.report.commits += usize::from(v.root() != root);
             }
             50..55 => {
                 let (off, len) = w.range();
@@ -228,7 +227,6 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
                 w.model[off..off + len].fill(0);
                 since.push((off, vec![0; len]));
                 w.report.writes += 1;
-                w.report.commits += usize::from(v.root() != root);
             }
             55..67 => {
                 v.flush().await.map_err(|e| format!("{at}: flush: {e}"))?;
@@ -269,6 +267,7 @@ pub async fn crash_and_restart(seed: u64, steps: usize) -> Result<Report, String
                 w.check(&v, off, len, &at).await?;
             }
         }
+        w.report.commits += usize::from(op < 55 && v.root() != root);
     }
     v.checkpoint()
         .await
