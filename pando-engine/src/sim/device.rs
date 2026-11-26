@@ -19,6 +19,8 @@ pub trait SimBlock: Send + Sync {
     async fn read(&self, buf: &mut [u8], off: u64) -> io::Result<()>;
     /// Writes `b` at `off`; reads see it once this returns.
     async fn write(&self, b: &[u8], off: u64) -> io::Result<()>;
+    /// Makes every write that returned before this was called durable.
+    async fn flush(&self) -> io::Result<()>;
 }
 
 #[derive(Debug)]
@@ -58,7 +60,9 @@ struct State {
 
 /// Device-mapper devices over block devices, era devices and loop devices over [`SimFs`]
 /// files. Reads and writes through a device go to its live table's target and wait while it
-/// is suspended; past the size of the table or of the loop device they fail.
+/// is suspended; past the size of the table or of the loop device they fail. Once the host's
+/// files stopped ([`SimFs::stop_after`]), no [`DeviceSwitch`] call returns, as none does from a
+/// process that died.
 #[derive(Clone)]
 pub struct SimDevices {
     fs: SimFs,
@@ -109,6 +113,31 @@ impl SimDevices {
 
     fn lock(&self) -> parking_lot::MutexGuard<'_, State> {
         self.state.lock()
+    }
+
+    async fn alive(&self) {
+        if self.fs.stopped() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Loses every device, loop device, era device and block device, as a host that lost
+    /// power does.
+    pub fn power_cut(&self) {
+        let mut s = self.lock();
+        s.devs.clear();
+        s.loops.clear();
+        s.eras.clear();
+        s.written.clear();
+        s.blocks.clear();
+    }
+
+    /// The device-mapper and era devices there are, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let s = self.lock();
+        let mut out: Vec<String> = s.devs.keys().chain(s.eras.keys()).cloned().collect();
+        out.sort();
+        out
     }
 
     /// Makes `block` a device at `path` that tables can map onto.
@@ -216,6 +245,17 @@ impl SimDevices {
         }
     }
 
+    /// Flushes device `name`: every write through it that returned is durable once this
+    /// returns.
+    pub async fn flush(&self, name: &str) -> io::Result<()> {
+        let (io, _, _) = self.route(name)?;
+        let _g = io.read().await;
+        match self.target(name, 0)?.1 {
+            Target::Block(b) => b.flush().await,
+            Target::Image { image, .. } => self.fs.open(&image, Open::ReadWrite).await?.sync_data().await,
+        }
+    }
+
     /// Whether device `name` holds its I/O after [`DeviceSwitch::suspend`].
     pub fn is_suspended(&self, name: &str) -> bool {
         self.lock().devs.get(name).is_some_and(|d| d.held.is_some())
@@ -230,6 +270,7 @@ impl SimDevices {
 #[async_trait]
 impl DeviceSwitch for SimDevices {
     async fn create(&self, name: &str, target: &Path, size: u64) -> io::Result<()> {
+        self.alive().await;
         let mut s = self.lock();
         if s.devs.contains_key(name) || s.eras.contains_key(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, name.to_owned()));
@@ -246,6 +287,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn remove(&self, name: &str) -> io::Result<()> {
+        self.alive().await;
         let mut s = self.lock();
         if s.devs.remove(name).is_some() {
             return Ok(());
@@ -262,10 +304,12 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn live_target(&self, name: &str) -> io::Result<Option<PathBuf>> {
+        self.alive().await;
         Ok(self.lock().devs.get(name).map(|d| d.live.clone()))
     }
 
     async fn load(&self, name: &str, target: &Path, size: u64) -> io::Result<()> {
+        self.alive().await;
         let mut s = self.lock();
         let d = s.devs.get_mut(name).ok_or_else(|| no_device(name))?;
         d.inactive = Some((target.to_owned(), size));
@@ -273,6 +317,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn clear_inactive(&self, name: &str) -> io::Result<()> {
+        self.alive().await;
         let mut s = self.lock();
         let d = s.devs.get_mut(name).ok_or_else(|| no_device(name))?;
         d.inactive = None;
@@ -280,6 +325,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn suspend(&self, name: &str) -> io::Result<()> {
+        self.alive().await;
         let (io, _, _) = self.route(name)?;
         if self.is_suspended(name) {
             return Ok(());
@@ -292,6 +338,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn resume(&self, name: &str) -> io::Result<()> {
+        self.alive().await;
         let mut s = self.lock();
         let d = s.devs.get_mut(name).ok_or_else(|| no_device(name))?;
         if let Some((t, size)) = d.inactive.take() {
@@ -303,6 +350,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn attach_loop(&self, image: &Path) -> io::Result<PathBuf> {
+        self.alive().await;
         let cap = self.fs.open(image, Open::Read).await?.size().await?;
         let mut s = self.lock();
         s.next_loop += 1;
@@ -312,6 +360,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn refresh_loop(&self, device: &Path) -> io::Result<()> {
+        self.alive().await;
         let image = self
             .lock()
             .loops
@@ -326,10 +375,12 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn loop_image(&self, device: &Path) -> io::Result<Option<PathBuf>> {
+        self.alive().await;
         Ok(self.lock().loops.get(device).map(|(p, _)| p.clone()))
     }
 
     async fn bytes_written(&self, device: &Path) -> io::Result<u64> {
+        self.alive().await;
         Ok(self.lock().written.get(device).copied().unwrap_or(0))
     }
 
@@ -341,6 +392,7 @@ impl DeviceSwitch for SimDevices {
         size: u64,
         block: u64,
     ) -> io::Result<PathBuf> {
+        self.alive().await;
         let mut s = self.lock();
         if s.no_eras {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "no era target"));
@@ -381,10 +433,12 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn era(&self, name: &str) -> io::Result<Option<EraDevice>> {
+        self.alive().await;
         Ok(self.lock().eras.get(name).map(|e| e.dev.clone()))
     }
 
     async fn resize_era(&self, name: &str, size: u64) -> io::Result<()> {
+        self.alive().await;
         let mut s = self.lock();
         let origin = s
             .eras
@@ -404,6 +458,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn era_begin(&self, name: &str) -> io::Result<u32> {
+        self.alive().await;
         let (batch, origin) = {
             let mut s = self.lock();
             let e = s.eras.get_mut(name).ok_or_else(|| no_device(name))?;
@@ -435,6 +490,7 @@ impl DeviceSwitch for SimDevices {
     }
 
     async fn era_listed(&self, name: &str, since: u32) -> io::Result<Vec<Range<u64>>> {
+        self.alive().await;
         let mut s = self.lock();
         let e = s.eras.get_mut(name).ok_or_else(|| no_device(name))?;
         let held = e

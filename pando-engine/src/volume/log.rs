@@ -407,6 +407,7 @@ impl Inner {
                     generation: self.generation,
                     from: self.from.clone(),
                     log: Some(pos),
+                    writer: Some(self.token),
                 },
                 up.version.clone(),
             )

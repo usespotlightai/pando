@@ -2,22 +2,26 @@
 //! while the kernel goes on serving the branch from the image, or the host can restart.
 //!
 //! The next attach of the branch publishes what such an image holds beyond the store, before it
-//! serves the branch, unless another writer took the branch since: then the image is older than
-//! the branch and goes. An image whose owner record does not say "switched" is a partial copy,
-//! older than the cache and the journal, and goes too. When the device still serves the image,
-//! a new writer rejoins the run instead: its first snapshot publishes what the dead one did not.
+//! serves the branch, unless a writer on another host took the branch since: then the image is
+//! older than the branch and goes. Writers on this host that died before they adopted the image
+//! do not count, as their local state carries the image's writer on. An image with no owner
+//! record, or one that does not say "switched", is a partial copy, older than the cache and the
+//! journal, and goes too. When the device still serves the image, a new writer rejoins the run
+//! instead: its first snapshot publishes what the dead one did not.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::extents::changed_chunks;
 use super::owner::{self, Owner};
-use super::{Handoff, HostEnv, SnapshotOptions, era_name, era_records, use_dedup};
+use super::{Handoff, HostEnv, SnapshotOptions, era_name, use_dedup};
 use crate::ports::{DeviceSwitch, LocalFs, Open};
 use crate::{Error, Result, Volume};
 
-/// The images an earlier attach of branch `name` left in `dir`.
+/// The images an earlier attach of branch `name` left in `dir`: each image, and each image
+/// that is gone while a file named after it stays.
 async fn leftover_images(fs: &dyn LocalFs, dir: &Path, name: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs.list(dir).await else {
         return Vec::new();
@@ -25,47 +29,54 @@ async fn leftover_images(fs: &dyn LocalFs, dir: &Path, name: &str) -> Vec<PathBu
     let prefix = format!("{name}.");
     let mut out: Vec<PathBuf> = entries
         .into_iter()
-        .filter(|de| {
-            de.name
-                .strip_prefix(&prefix)
-                .and_then(|r| r.strip_suffix(".img"))
-                .is_some_and(|mid| !mid.is_empty() && !mid.contains('.'))
+        .filter_map(|de| {
+            let (mid, rest) = de.name.strip_prefix(&prefix)?.split_once(".img")?;
+            let named = !mid.is_empty() && !mid.contains('.') && (rest.is_empty() || rest.starts_with('.'));
+            named.then(|| dir.join(format!("{name}.{mid}.img")))
         })
-        .map(|de| dir.join(de.name))
         .collect();
     out.sort();
+    out.dedup();
     out
 }
 
-/// The clones of `image` and the first clone number after them.
-async fn leftover_clones(fs: &dyn LocalFs, image: &Path) -> (Vec<PathBuf>, u32) {
+/// The clones of `image`.
+async fn leftover_clones(fs: &dyn LocalFs, image: &Path) -> Vec<PathBuf> {
     let (Some(dir), Some(base)) = (image.parent(), image.file_name().and_then(|n| n.to_str())) else {
-        return (Vec::new(), 0);
+        return Vec::new();
     };
     let Ok(entries) = fs.list(dir).await else {
-        return (Vec::new(), 0);
+        return Vec::new();
     };
     let prefix = format!("{base}.snap");
-    let mut out = Vec::new();
-    let mut next = 0;
-    for de in entries {
-        if let Some(n) = de.name.strip_prefix(&prefix).and_then(|n| n.parse::<u32>().ok()) {
-            next = next.max(n + 1);
-            out.push(dir.join(de.name));
-        }
-    }
-    (out, next)
+    entries
+        .into_iter()
+        .filter(|de| de.name.starts_with(&prefix))
+        .map(|de| dir.join(de.name))
+        .collect()
 }
 
-async fn remove_image(fs: &dyn LocalFs, v: &Volume, image: &Path) {
-    let (clones, _) = leftover_clones(fs, image).await;
-    for p in clones
-        .iter()
-        .chain([&image.to_owned(), &era_records(image), &owner::path(image)])
-    {
-        v.tree().cache().drop_file(p);
-        let _ = fs.remove(p).await;
+/// Removes `image` and every file named after it: its clones, its era records and the
+/// temporary files a killed writer left. Its owner record goes first and durably, so no later
+/// attach adopts the image again after a crash, which would put its old chunks over newer
+/// writes; the files a crash leaves without it go at the next attach.
+pub(crate) async fn remove_image(fs: &dyn LocalFs, v: &Volume, image: &Path) -> Result<()> {
+    let (Some(dir), Some(base)) = (image.parent(), image.file_name().and_then(|n| n.to_str())) else {
+        return Ok(());
+    };
+    match fs.remove(&owner::path(image)).await {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        _ => fs.sync_dir(dir).await?,
     }
+    let prefix = format!("{base}.");
+    for de in fs.list(dir).await.unwrap_or_default() {
+        if de.name == base || de.name.starts_with(&prefix) {
+            let p = dir.join(de.name);
+            v.tree().cache().drop_file(&p);
+            let _ = fs.remove(&p).await;
+        }
+    }
+    Ok(())
 }
 
 /// Undoes what a writer that died during a switch or a snapshot left on device `dm`: an
@@ -76,6 +87,20 @@ pub(crate) async fn recover_device(devices: &dyn DeviceSwitch, dm: &str) -> Resu
     }
     devices.clear_inactive(dm).await?;
     devices.resume(dm).await?;
+    Ok(())
+}
+
+/// Removes the era device of `dm` that a writer which died as it detached left, unless the
+/// live table of `dm` maps it.
+pub(crate) async fn remove_stale_era(devices: &dyn DeviceSwitch, dm: &str) -> Result<()> {
+    let name = era_name(dm);
+    let Some(e) = devices.era(&name).await? else {
+        return Ok(());
+    };
+    if devices.live_target(dm).await? == Some(e.path) {
+        return Ok(());
+    }
+    devices.remove(&name).await?;
     Ok(())
 }
 
@@ -107,14 +132,19 @@ pub(crate) async fn adopt_leftovers(env: &HostEnv, v: &Volume, dir: &Path) -> Re
     let fs = env.ports.fs.as_ref();
     let mut adopted = 0;
     for image in leftover_images(fs, dir, v.name()).await {
-        let Some(o) = Owner::read(fs, &image).await? else {
+        let f = match fs.open(&image, Open::Read).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                remove_image(fs, v, &image).await?;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let o = Owner::read(fs, &image).await?;
+        let Some(o) = o.filter(|o| o.switched && (v.since()..=v.generation()).contains(&o.generation)) else {
+            remove_image(fs, v, &image).await?;
             continue;
         };
-        if !o.switched || o.generation + 1 != v.generation() {
-            remove_image(fs, v, &image).await;
-            continue;
-        }
-        let f = fs.open(&image, Open::Read).await?;
         let n = match changed_since_base(env, v, &image, o.base).await {
             Some(idxs) => v.absorb_chunks(&f, &image, &idxs).await?,
             None => v.absorb_image(env.ports.image.as_ref(), &f, &image).await?,
@@ -123,9 +153,25 @@ pub(crate) async fn adopt_leftovers(env: &HostEnv, v: &Volume, dir: &Path) -> Re
         v.set_dedup(None);
         done?;
         adopted += n;
-        remove_image(fs, v, &image).await;
+        remove_image(fs, v, &image).await?;
     }
     Ok(adopted)
+}
+
+/// The owner record of `image`, which `v` may rejoin: no later writer than `v` wrote it.
+async fn rejoinable_owner(fs: &dyn LocalFs, image: &Path, v: &Volume) -> Result<Owner> {
+    let o = Owner::read(fs, image)
+        .await?
+        .ok_or_else(|| Error::Corrupt(format!("{}: no owner record", image.display())))?;
+    if o.generation > v.generation() {
+        return Err(Error::Corrupt(format!(
+            "{} belongs to writer generation {}, past {}",
+            image.display(),
+            o.generation,
+            v.generation()
+        )));
+    }
+    Ok(o)
 }
 
 /// Takes over branch `v` whose writer died after the handoff while the device `dm` still serves
@@ -159,26 +205,23 @@ pub(crate) async fn rejoin(
     if !leftover_images(fs, dir, v.name()).await.contains(&image) {
         return Ok(None);
     }
-    let o = Owner::read(fs, &image)
-        .await?
-        .ok_or_else(|| Error::Corrupt(format!("{}: no owner record", image.display())))?;
-    if o.generation >= v.generation() {
-        return Err(Error::Corrupt(format!(
-            "{} belongs to writer generation {}, not one before {}",
-            image.display(),
-            o.generation,
-            v.generation()
-        )));
-    }
-    let (old, next) = leftover_clones(fs, &image).await;
+    let o = rejoinable_owner(fs, &image, v).await?;
+    let old = leftover_clones(fs, &image).await;
     let file = fs.open(&image, Open::ReadWrite).await?;
-    let h = Arc::new(Handoff::new(env, dm, image.clone(), file, o.base, opts));
+    let h = Arc::new(Handoff::new(
+        env,
+        dm,
+        image.clone(),
+        file,
+        o.base,
+        opts,
+        v.generation(),
+    ));
     h.switched.store(true, Ordering::Release);
     *h.loop_dev.lock() = Some(lp);
     h.owner(v, true).await?;
     {
         let mut s = h.snaps.lock().await;
-        s.next = next;
         if let (Some(bases), Some(base)) = (env.bases.as_ref(), o.base)
             && let Ok(ext) = env.ports.image.extents(&bases.path(&base)).await
         {

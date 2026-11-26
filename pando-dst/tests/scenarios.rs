@@ -1,6 +1,6 @@
 //! The seeded scenarios, over many seeds.
 
-use pando_dst::scenario;
+use pando_dst::{host_crash, scenario};
 
 #[tokio::test(start_paused = true)]
 async fn crash_and_restart_holds_for_many_seeds() {
@@ -153,6 +153,59 @@ async fn racing_hosts_open_prefixes_and_keep_strict_flushes() {
             && total.deleted_records > 0
             && total.moved_deletes > 0
             && total.taken < total.opens,
+        "{total:?}"
+    );
+}
+
+fn seeds(var: &str, default: u64) -> std::ops::Range<u64> {
+    let n: u64 = std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default);
+    let first: u64 = std::env::var("PANDO_DST_FIRST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    first..first + n
+}
+
+#[test]
+fn a_host_that_hands_off_survives_crashes_anywhere_in_a_branch_life() {
+    let mut total = host_crash::Report::default();
+    let run = seeds("PANDO_DST_HOST_SEEDS", 40);
+    let many = run.end - run.start >= 40;
+    for seed in run {
+        let r = host_crash::attach_crashes(seed).unwrap_or_else(|e| panic!("{e}"));
+        total.kills += r.kills;
+        total.power_cuts += r.power_cuts;
+        total.rejoins += r.rejoins;
+        total.handoffs += r.handoffs;
+        total.bases += r.bases;
+    }
+    assert!(
+        !many
+            || total.kills > 0
+                && total.power_cuts > 0
+                && total.rejoins > 0
+                && total.handoffs > 0
+                && total.bases > 0,
+        "{total:?}"
+    );
+}
+
+#[test]
+fn base_images_stay_whole_across_crashes_of_the_follower() {
+    let mut total = host_crash::Report::default();
+    let run = seeds("PANDO_DST_FOLLOW_SEEDS", 20);
+    let many = run.end - run.start >= 40;
+    for seed in run {
+        let r = host_crash::follower_crashes(seed, 4).unwrap_or_else(|e| panic!("{e}"));
+        total.kills += r.kills;
+        total.power_cuts += r.power_cuts;
+        total.bases += r.bases;
+    }
+    assert!(
+        !many || total.kills > 0 && total.power_cuts > 0 && total.bases > 0,
         "{total:?}"
     );
 }

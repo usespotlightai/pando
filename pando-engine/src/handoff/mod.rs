@@ -168,6 +168,9 @@ struct Snaps {
     prev: Option<Vec<Extent>>,
     /// The last clone, which goes once a later one replaces it and its chunks are published.
     prev_path: Option<PathBuf>,
+    /// The writer generation that names this writer's clones, so no clone takes the name of
+    /// one an earlier writer of the image made, which the object log may still point into.
+    writer: u64,
     next: u32,
     /// With an era device: the era that began with the last snapshot, or the first era.
     since: u32,
@@ -177,7 +180,7 @@ struct Snaps {
 
 impl Snaps {
     fn next_path(&mut self, image: &Path) -> PathBuf {
-        let p = with_suffix(image, &format!(".snap{}", self.next));
+        let p = with_suffix(image, &format!(".snap{}-{}", self.writer, self.next));
         self.next += 1;
         p
     }
@@ -283,6 +286,7 @@ impl Handoff {
         file: Arc<dyn LocalFile>,
         base: Option<Hash>,
         opts: SnapshotOptions,
+        writer: u64,
     ) -> Handoff {
         Handoff {
             env: env.clone(),
@@ -296,6 +300,7 @@ impl Handoff {
             era: Mutex::default(),
             snaps: AsyncMutex::new(Snaps {
                 since: 1,
+                writer,
                 ..Snaps::default()
             }),
             retired: Mutex::default(),
@@ -647,12 +652,7 @@ impl Handoff {
         let (mut seen, mut changed) = (base, Instant::now());
         loop {
             tokio::select! {
-                r = stop.changed() => {
-                    if r.is_err() || self.stopped() {
-                        return;
-                    }
-                    continue;
-                }
+                () = async { drop(stop.wait_for(|s| *s).await) } => return,
                 Ok(()) = uploads.changed() => {
                     self.remove_retired(&v).await;
                     continue;
@@ -667,7 +667,10 @@ impl Handoff {
                 (Some(w), Some(b)) if w >= b => Some(w - b),
                 _ => None,
             };
-            if !snapshot_due(last.elapsed(), written, changed.elapsed(), &self.opts).0 || self.stopped() {
+            if self.stopped() {
+                return;
+            }
+            if !snapshot_due(last.elapsed(), written, changed.elapsed(), &self.opts).0 {
                 continue;
             }
             if let Err(e) = self.snapshot(&v, true).await {
@@ -742,18 +745,14 @@ impl Handoff {
         resize_table(devices, &self.dm, &path, size).await
     }
 
-    /// After a checkpoint published everything: removes the era device, the image, its clones,
-    /// its era records and its owner. The device must no longer map the era device.
-    pub(crate) async fn remove(&self, v: &Volume) {
+    /// After a checkpoint published everything: removes the era device, the image and every
+    /// file named after it. The device must no longer map the era device.
+    pub(crate) async fn remove(&self, v: &Volume) -> Result<()> {
         if let Some(era) = self.era() {
             let _ = self.env.devices.remove(&era).await;
         }
         self.remove_retired(v).await;
-        v.tree().cache().drop_file(&self.image);
-        let fs = self.env.ports.fs.as_ref();
-        let _ = fs.remove(&self.image).await;
-        let _ = fs.remove(&era_records(&self.image)).await;
-        let _ = fs.remove(&owner::path(&self.image)).await;
+        adopt::remove_image(self.env.ports.fs.as_ref(), v, &self.image).await
     }
 
     /// Puts era device `era_name(dm)` over loop device `lp` of the image, on a new records file,
@@ -880,6 +879,7 @@ pub(crate) async fn hand_off(
         file,
         shared.map(|_| opened.hash),
         opts,
+        v.generation(),
     ));
     v.start_tracking();
     let r = copy_and_switch(&h, v, shared).await;

@@ -48,27 +48,23 @@ impl Bases {
         Ok(write_atomic(self.fs.as_ref(), &dir.join(escape(name)), Bytes::from(now)).await?)
     }
 
-    /// Keeps the `keep` most recently used base images, and fewer while they take more than
-    /// `budget` bytes of disk (zero: no budget); the most recent one always stays. A branch
-    /// that runs on a base keeps its own clone, so removing the base never touches it. Returns
-    /// how many it removed and the bytes they took.
-    pub(crate) async fn evict(&self, keep: usize, budget: u64) -> (usize, u64) {
+    /// Keeps `keep` base images, and fewer while they take more than `budget` bytes of disk
+    /// (zero: no budget): those of the roots in `current` first, then the most recently used;
+    /// the first one always stays. A branch that runs on a base keeps its own clone, so
+    /// removing the base never touches it. Returns how many it removed and the bytes they took.
+    pub(crate) async fn evict(&self, keep: usize, budget: u64, current: &[Hash]) -> (usize, u64) {
         let Ok(entries) = self.fs.list(&self.dir).await else {
             return (0, 0);
         };
         let mut found = Vec::new();
         for de in entries {
-            if de
-                .name
-                .strip_suffix(".img")
-                .and_then(|n| n.parse::<Hash>().ok())
-                .is_none()
-            {
+            let Some(root) = de.name.strip_suffix(".img").and_then(|n| n.parse::<Hash>().ok()) else {
                 continue;
-            }
+            };
             let p = self.dir.join(&de.name);
             let size = self.image.allocated(&p).await.unwrap_or(de.len);
-            found.push((self.used(&p).await, p, size));
+            let rank = (current.contains(&root), self.used(&p).await);
+            found.push((rank, p, size));
         }
         found.sort_by_key(|b| std::cmp::Reverse(b.0));
         let (mut total, mut freed, mut n) = (0, 0, 0);
@@ -175,7 +171,8 @@ impl Follower {
             }
             self.seen.insert(name, r.root.hash);
         }
-        self.bases.evict(self.keep, self.budget).await;
+        let current: Vec<Hash> = self.seen.values().copied().collect();
+        self.bases.evict(self.keep, self.budget, &current).await;
         Ok(built)
     }
 }

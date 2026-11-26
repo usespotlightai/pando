@@ -27,6 +27,7 @@ pub async fn copy(ports: &Ports, src: &str, dst: &str, max_age: Option<Duration>
             generation: 0,
             from: Some(src.to_owned()),
             log: None,
+            writer: None,
         })
         .await?;
     if let Some(max) = max_age
@@ -172,6 +173,7 @@ fn copy_of(c: &Checkpoint, id: BranchId) -> Ref {
         generation: 0,
         from: Some(c.branch.clone()),
         log: None,
+        writer: None,
     }
 }
 
@@ -204,6 +206,7 @@ pub async fn advance(ports: &Ports, dst: &str, src: &str) -> Result<()> {
         next: 0,
         closed: true,
     });
+    to.writer = None;
     remote.put_ref(dst, &to, &version).await.map(drop)
 }
 

@@ -9,7 +9,7 @@
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -281,6 +281,13 @@ struct Inner {
     /// The generation the local state names: the ref's when the branch opened, this writer's
     /// once it took the branch.
     state_generation: AtomicU64,
+    /// The token this writer puts in every ref it writes, from the one that takes the branch.
+    token: u64,
+    /// Whether this writer started to take the branch, so the local state names its take.
+    taking: AtomicBool,
+    /// The first writer of the run of writers on this host that the local state carries on
+    /// from: every writer from it to this one wrote the state this one resumed.
+    since: u64,
     /// How long device I/O waits on the store, in milliseconds; zero waits for good.
     store_wait: AtomicU64,
     rng: Arc<dyn Rng>,
@@ -299,11 +306,15 @@ pub struct Volume {
 impl VolState {
     /// Whether a writer may resume this state over ref `r`: the ref is of the life of the
     /// branch this state wrote, holds the root this state published or was publishing, and the
-    /// last writer to take the branch is the one this state names.
+    /// last writer to take the branch is the one this state names, or the take this state's
+    /// writer made as it died.
     fn resumes(&self, r: &Ref) -> bool {
         self.id == Some(r.id)
             && (self.published.hash == r.root.hash || self.publishing.hash == r.root.hash)
-            && self.generation.is_none_or(|g| g == r.generation)
+            && (self.generation.is_none_or(|g| g == r.generation)
+                || self
+                    .taking
+                    .is_some_and(|(g, t)| g == r.generation && r.writer == Some(t)))
     }
 }
 
@@ -398,6 +409,7 @@ impl Volume {
         let size = resume.and_then(|s| s.size).map_or(r.size, |n| n.max(r.size));
         let tree = Arc::new(Tree::new(Arc::clone(&cache), size.div_ceil(CHUNK)));
         let root = resume.map_or(r.root, |s| s.root);
+        let since = resume.and_then(|s| s.since).unwrap_or(r.generation);
         let mem = Mem::opened(root, Arc::clone(&tree), size, resume.map_or(0, |s| s.jfloor));
         let inner = Arc::new(Inner {
             name: name.to_owned(),
@@ -449,6 +461,9 @@ impl Volume {
             uploaded_seq: watch::Sender::new(0),
             log: log::Log::new(mode, scan.start),
             state_generation: AtomicU64::new(r.generation),
+            token: ports.rng.next_u64(),
+            taking: AtomicBool::new(false),
+            since,
             store_wait: AtomicU64::new(millis(STORE_WAIT)),
             rng: Arc::clone(&ports.rng),
             unuploaded: Mutex::default(),
@@ -457,7 +472,7 @@ impl Volume {
         let roots: Weak<dyn Roots> = weak;
         inner.cache.register(&inner.state_path, roots).await?;
         inner.cache.start_sweeps();
-        inner.start_journal(resume).await?;
+        inner.start_journal(resume.map(|s| s.jfloor)).await?;
         if resume.is_some_and(|s| s.root.hash != r.root.hash) {
             inner.resumed_ahead();
         }
@@ -976,16 +991,17 @@ impl Inner {
         ]
     }
 
-    /// Replays the journal above the floor of `resume`, or starts an empty one without it.
-    async fn start_journal(&self, resume: Option<VolState>) -> Result<()> {
-        let Some(s) = resume else {
+    /// Replays the journal above `jfloor`, the floor of the state this writer resumes, or
+    /// starts an empty one when it resumes none.
+    async fn start_journal(&self, jfloor: Option<u64>) -> Result<()> {
+        let Some(jfloor) = jfloor else {
             self.journal.reset().await?;
             self.journal.start(0).await?;
             return self.persist().await;
         };
         let mut writes = Vec::new();
         self.journal
-            .replay(s.jfloor, |idx, r| {
+            .replay(jfloor, |idx, r| {
                 writes.push((idx, r));
                 Ok(())
             })
@@ -998,7 +1014,7 @@ impl Inner {
                 Record::ZeroChunk => self.zero_chunk(idx, false).await?,
             }
         }
-        let next = self.journal.last().await?.max(s.jfloor) + 1;
+        let next = self.journal.last().await?.max(jfloor) + 1;
         self.journal.start(next).await
     }
 
@@ -1204,6 +1220,11 @@ impl Inner {
             size: Some(size),
             generation: Some(self.state_generation.load(Ordering::Acquire)),
             id: Some(self.id),
+            since: Some(self.since),
+            taking: self
+                .taking
+                .load(Ordering::Acquire)
+                .then_some((self.generation, self.token)),
         };
         write_durable(self.fs.as_ref(), &self.state_path, st.encode()).await?;
         self.mem.lock().persisted.retain(|p| p.0.hash == root.hash);
@@ -1213,6 +1234,9 @@ impl Inner {
     async fn take_generation(self: Arc<Self>, mut r: Ref, version: Version) {
         r.generation = self.generation;
         r.log = Some(self.log.start);
+        r.writer = Some(self.token);
+        self.taking.store(true, Ordering::Release);
+        let _ = self.persist().await;
         let mut res = self.remote.put_ref(&self.name, &r, &version).await;
         for _ in 1..GENERATION_TRIES {
             if !matches!(&res, Err(e) if is_transient(e)) {
@@ -1792,6 +1816,7 @@ impl Inner {
             generation: self.generation,
             from: self.from.clone(),
             log: Some(pos),
+            writer: Some(self.token),
         };
         let new_version = match self.remote.put_ref(&self.name, &r, &version).await {
             Ok(v) => v,
@@ -2151,6 +2176,46 @@ mod tests {
             got, flushed,
             "a crash keeps the flushed writes and loses the journaled ones"
         );
+        after.checkpoint().await.unwrap();
+        after.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_that_dies_as_it_takes_the_branch_keeps_the_flushed_writes() {
+        let (ports, store, fs) = sim::ports(2);
+        branch(&ports, "main").await;
+        store.refuse(StoreOp::Create);
+        let v = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        v.write_at(&data(1, 1000), 0).await.unwrap();
+        v.flush().await.unwrap();
+        v.close().await;
+        crash(&fs);
+
+        let reference = pando_format::keys::reference("main");
+        store.hold(StoreOp::Update, &reference);
+        let dying = Volume::open_then(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fs.stop_after(Some(0));
+        store.release(StoreOp::Update, &reference);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (r, _) = dying.inner.remote.get_ref("main").await.unwrap().unwrap();
+        assert_eq!(
+            r.generation,
+            dying.generation(),
+            "the dying writer took the branch"
+        );
+        dying.close().await;
+        crash(&fs);
+
+        let after = Volume::open(&ports, host(&ports, "/a").await, Path::new("/a"), "main")
+            .await
+            .unwrap();
+        assert_eq!(read(&after, 0, 1000).await, data(1, 1000));
+        store.accept();
         after.checkpoint().await.unwrap();
         after.close().await;
     }
@@ -2624,7 +2689,40 @@ mod tests {
     }
 
     #[test]
-    fn a_state_without_a_size_generation_or_id_still_reads() {
+    fn a_state_resumes_over_its_own_take_and_not_a_rivals() {
+        let id = BranchId::from_parts(3, 4);
+        let root = Entry {
+            hash: Hash::of(b"root"),
+            ..Entry::EMPTY
+        };
+        let s = VolState {
+            root,
+            published: root,
+            publishing: Entry::EMPTY,
+            jfloor: 0,
+            size: Some(8 << 30),
+            generation: Some(4),
+            id: Some(id),
+            since: Some(4),
+            taking: Some((5, 77)),
+        };
+        let r = |generation, writer| Ref {
+            size: 8 << 30,
+            id,
+            root,
+            generation,
+            writer,
+            ..Ref::default()
+        };
+        assert!(s.resumes(&r(4, Some(9))), "nobody took the branch");
+        assert!(s.resumes(&r(5, Some(77))), "its own take put the ref");
+        assert!(!s.resumes(&r(5, Some(78))), "a rival took the generation first");
+        assert!(!s.resumes(&r(5, None)));
+        assert!(!s.resumes(&r(6, Some(77))));
+    }
+
+    #[test]
+    fn a_state_without_a_size_generation_id_run_or_take_still_reads() {
         let s = VolState {
             root: Entry::EMPTY,
             published: Entry::EMPTY,
@@ -2633,13 +2731,30 @@ mod tests {
             size: Some(8 << 30),
             generation: Some(4),
             id: Some(BranchId::from_parts(3, 4)),
+            since: Some(2),
+            taking: Some((5, u64::MAX)),
         };
         assert_eq!(VolState::decode(&s.encode()), Some(s));
-        let no_id = VolState { id: None, ..s };
+        let no_take = VolState { taking: None, ..s };
+        assert_eq!(VolState::decode(&no_take.encode()), Some(no_take));
+        let no_run = VolState {
+            since: None,
+            taking: None,
+            ..s
+        };
+        assert_eq!(VolState::decode(&no_run.encode()), Some(no_run));
+        let no_id = VolState {
+            id: None,
+            since: None,
+            taking: None,
+            ..s
+        };
         assert_eq!(VolState::decode(&no_id.encode()), Some(no_id));
         let sized = VolState {
             generation: None,
             id: None,
+            since: None,
+            taking: None,
             ..s
         };
         assert_eq!(VolState::decode(&sized.encode()), Some(sized));
@@ -2647,6 +2762,8 @@ mod tests {
             size: None,
             generation: None,
             id: None,
+            since: None,
+            taking: None,
             ..s
         };
         let four = String::from_utf8(old.encode().to_vec()).unwrap();

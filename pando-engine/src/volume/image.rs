@@ -25,6 +25,12 @@ impl Volume {
         self.inner.generation
     }
 
+    /// The first writer generation of the run of writers on this host that this one carries
+    /// on from: images those writers left hold writes no other host has seen.
+    pub(crate) fn since(&self) -> u64 {
+        self.inner.since
+    }
+
     /// Lets an absorb prepare the uploads of the chunks it takes.
     pub(crate) fn set_prepared(&self, p: Option<Arc<PreparedChunks>>) {
         *self.inner.prepared.lock() = p;
