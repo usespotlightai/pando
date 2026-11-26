@@ -204,6 +204,25 @@ resource "aws_iam_role_policy" "github" {
         Resource = "*"
       },
       {
+        # Deleting a mount target removes its network interface with the caller's permissions.
+        Sid       = "S3FilesNetworkInterfaces"
+        Effect    = "Allow"
+        Action    = "ec2:DeleteNetworkInterface"
+        Resource  = "*"
+        Condition = { Bool = { "aws:ViaAWSService" = "true" } }
+      },
+      {
+        # Creating a file system sets up its EventBridge rules with the caller's permissions.
+        Sid    = "S3FilesEvents"
+        Effect = "Allow"
+        Action = [
+          "events:DeleteRule", "events:DisableRule", "events:EnableRule", "events:PutRule", "events:PutTargets",
+          "events:RemoveTargets", "events:DescribeRule", "events:ListRuleNamesByTarget", "events:ListRules",
+          "events:ListTargetsByRule",
+        ]
+        Resource = "arn:aws:events:${var.region}:${local.account}:rule/*"
+      },
+      {
         Sid       = "S3FilesServiceRole"
         Effect    = "Allow"
         Action    = "iam:CreateServiceLinkedRole"
@@ -213,11 +232,25 @@ resource "aws_iam_role_policy" "github" {
       {
         # Tags only on what is being created. Tagging an existing resource would make it count
         # as the bench's and open it to the deletes below.
-        Sid       = "Ec2TagOnCreate"
-        Effect    = "Allow"
-        Action    = "ec2:CreateTags"
-        Resource  = "*"
-        Condition = { StringEquals = { "ec2:CreateAction" = ["RunInstances", "CreateSecurityGroup", "ImportKeyPair", "CreateVolume"] } }
+        Sid      = "Ec2TagOnCreate"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "ec2:CreateAction" = [
+              "RunInstances", "CreateSecurityGroup", "ImportKeyPair", "CreateVolume",
+              "AuthorizeSecurityGroupIngress", "AuthorizeSecurityGroupEgress",
+            ]
+          }
+        }
+      },
+      {
+        # A new rule has no tags yet; the group it joins must still carry the bench's tag (below).
+        Sid      = "Ec2NewRules"
+        Effect   = "Allow"
+        Action   = ["ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress"]
+        Resource = "arn:aws:ec2:${var.region}:${local.account}:security-group-rule/*"
       },
       {
         # Changing or deleting anything needs the bench's tag, which the provider adds to all
