@@ -53,113 +53,223 @@ Amazon S3 Files,small,save.uploaded,2,1.52625e+09,B,rep 2
 Amazon S3 Files,small,save.npm_ci,3,606.226,s,"rep 3, exit 0"
 Amazon S3 Files,small,save.time,3,0.00731389,s,rep 3
 Amazon S3 Files,small,save.uploaded,3,1.77156e+09,B,rep 3
-Pando,small,save.npm_ci,1,8.18439,s,"rep 1, exit 0"
-Pando,small,save.time,1,5.97237,s,rep 1
-Pando,small,save.uploaded,1,2.27239e+08,B,rep 1
-Pando,small,save.dirty,1,9.66078e+08,B,rep 1
-Pando,small,save.run_written,1,1.43081e+08,B,rep 1
-Pando,small,save.unmount,1,5.53391,s,rep 1
-Pando,small,save.unmount_written,1,1.00936e+09,B,rep 1
-Pando,small,save.detach,1,0.437976,s,rep 1
+Pando,small,save.npm_ci,1,7.93542,s,"rep 1, exit 0"
+Pando,small,save.time,1,7.46519,s,rep 1
+Pando,small,save.uploaded,1,2.25005e+08,B,rep 1
+Pando,small,save.dirty,1,1.0315e+09,B,rep 1
+Pando,small,save.run_written,1,1.05423e+08,B,rep 1
+Pando,small,save.unmount,1,6.91989,s,rep 1
+Pando,small,save.unmount_written,1,1.0453e+09,B,rep 1
+Pando,small,save.detach,1,0.544784,s,rep 1
 Pando,small,save.absorb,1,0,s,rep 1
 Pando,small,save.flush,1,0,s,rep 1
-Pando,small,save.wait,1,0.1728,s,rep 1
-Pando,small,save.pack,1,0.0865,s,rep 1
-Pando,small,save.ref,1,0.0377,s,rep 1
-Pando,small,save.after,1,0.1444,s,rep 1
+Pando,small,save.wait,1,0.2626,s,rep 1
+Pando,small,save.pack,1,0.0976,s,rep 1
+Pando,small,save.ref,1,0.0494,s,rep 1
+Pando,small,save.after,1,0.1609,s,rep 1
 Pando,small,save.passes_before,1,13,n,rep 1
-Pando,small,save.bytes_before,1,2.04851e+08,B,rep 1
+Pando,small,save.bytes_before,1,2.04185e+08,B,rep 1
 Pando,small,save.passes,1,2,n,rep 1
-Pando,small,save.bytes,1,2.38808e+06,B,rep 1
-Pando,small,save.stalls,1,1776,n,rep 1
-Pando,small,save.stall,1,56.5532,s,rep 1
-Pando,small,save.fetched_bytes,1,8.43598e+07,B,rep 1
-Pando,small,save.exit,1,9.4513e-05,s,rep 1
-Pando,small,save.npm_ci,2,7.9332,s,"rep 2, exit 0"
-Pando,small,save.time,2,2.65308,s,rep 2
-Pando,small,save.uploaded,2,2.17828e+08,B,rep 2
-Pando,small,save.dirty,2,9.7384e+08,B,rep 2
-Pando,small,save.run_written,2,1.63938e+08,B,rep 2
-Pando,small,save.unmount,2,2.01133,s,rep 2
-Pando,small,save.unmount_written,2,9.89073e+08,B,rep 2
-Pando,small,save.detach,2,0.641325,s,rep 2
+Pando,small,save.bytes,1,2.41907e+06,B,rep 1
+Pando,small,save.stalls,1,1829,n,rep 1
+Pando,small,save.stall,1,65.8211,s,rep 1
+Pando,small,save.fetched_bytes,1,9.01123e+07,B,rep 1
+Pando,small,save.exit,1,9.3085e-05,s,rep 1
+Pando,small,save.npm_ci,2,7.83401,s,"rep 2, exit 0"
+Pando,small,save.time,2,3.25681,s,rep 2
+Pando,small,save.uploaded,2,2.21954e+08,B,rep 2
+Pando,small,save.dirty,2,1.0088e+09,B,rep 2
+Pando,small,save.run_written,2,1.82178e+08,B,rep 2
+Pando,small,save.unmount,2,2.91167,s,rep 2
+Pando,small,save.unmount_written,2,9.7022e+08,B,rep 2
+Pando,small,save.detach,2,0.344679,s,rep 2
 Pando,small,save.absorb,2,0,s,rep 2
 Pando,small,save.flush,2,0,s,rep 2
-Pando,small,save.wait,2,0.3471,s,rep 2
-Pando,small,save.pack,2,0.0864,s,rep 2
+Pando,small,save.wait,2,0.1218,s,rep 2
+Pando,small,save.pack,2,0.1179,s,rep 2
 Pando,small,save.ref,2,0.0485,s,rep 2
-Pando,small,save.after,2,0.1776,s,rep 2
-Pando,small,save.passes_before,2,8,n,rep 2
-Pando,small,save.bytes_before,2,1.86961e+08,B,rep 2
-Pando,small,save.passes,2,2,n,rep 2
-Pando,small,save.bytes,2,1.8992e+07,B,rep 2
-Pando,small,save.stalls,2,72,n,rep 2
-Pando,small,save.stall,2,2.59,s,rep 2
-Pando,small,save.fetched_bytes,2,6.06032e+06,B,rep 2
-Pando,small,save.exit,2,6.7158e-05,s,rep 2
-Pando,small,save.npm_ci,3,7.63177,s,"rep 3, exit 0"
-Pando,small,save.time,3,2.20808,s,rep 3
-Pando,small,save.uploaded,3,2.1913e+08,B,rep 3
-Pando,small,save.dirty,3,9.63273e+08,B,rep 3
-Pando,small,save.run_written,3,1.44974e+08,B,rep 3
-Pando,small,save.unmount,3,1.56685,s,rep 3
-Pando,small,save.unmount_written,3,1.0068e+09,B,rep 3
-Pando,small,save.detach,3,0.640804,s,rep 3
+Pando,small,save.after,2,0.1488,s,rep 2
+Pando,small,save.passes_before,2,12,n,rep 2
+Pando,small,save.bytes_before,2,2.03988e+08,B,rep 2
+Pando,small,save.passes,2,1,n,rep 2
+Pando,small,save.bytes,2,2.53205e+06,B,rep 2
+Pando,small,save.stalls,2,914,n,rep 2
+Pando,small,save.stall,2,8.276,s,rep 2
+Pando,small,save.fetched_bytes,2,9.36997e+07,B,rep 2
+Pando,small,save.exit,2,8.4729e-05,s,rep 2
+Pando,small,save.npm_ci,3,7.83325,s,"rep 3, exit 0"
+Pando,small,save.time,3,2.96628,s,rep 3
+Pando,small,save.uploaded,3,2.12735e+08,B,rep 3
+Pando,small,save.dirty,3,1.01077e+09,B,rep 3
+Pando,small,save.run_written,3,1.43208e+08,B,rep 3
+Pando,small,save.unmount,3,2.42293,s,rep 3
+Pando,small,save.unmount_written,3,1.00885e+09,B,rep 3
+Pando,small,save.detach,3,0.542899,s,rep 3
 Pando,small,save.absorb,3,0,s,rep 3
 Pando,small,save.flush,3,0,s,rep 3
-Pando,small,save.wait,3,0.3787,s,rep 3
-Pando,small,save.pack,3,0.0887,s,rep 3
-Pando,small,save.ref,3,0.0529,s,rep 3
-Pando,small,save.after,3,0.1745,s,rep 3
-Pando,small,save.passes_before,3,9,n,rep 3
-Pando,small,save.bytes_before,3,1.88164e+08,B,rep 3
-Pando,small,save.passes,3,2,n,rep 3
-Pando,small,save.bytes,3,1.83705e+07,B,rep 3
-Pando,small,save.stalls,3,14,n,rep 3
-Pando,small,save.stall,3,0.759,s,rep 3
-Pando,small,save.fetched_bytes,3,1.32501e+06,B,rep 3
-Pando,small,save.exit,3,8.4622e-05,s,rep 3
-Pando,small,save.npm_ci,4,7.681,s,"rep 4, exit 0"
-Pando,small,save.time,4,2.61186,s,rep 4
-Pando,small,save.uploaded,4,2.26085e+08,B,rep 4
-Pando,small,save.dirty,4,9.70744e+08,B,rep 4
-Pando,small,save.run_written,4,1.45641e+08,B,rep 4
-Pando,small,save.unmount,4,2.1695,s,rep 4
-Pando,small,save.unmount_written,4,1.00623e+09,B,rep 4
-Pando,small,save.detach,4,0.441922,s,rep 4
+Pando,small,save.wait,3,0.3124,s,rep 3
+Pando,small,save.pack,3,0.2846,s,rep 3
+Pando,small,save.ref,3,0.0588,s,rep 3
+Pando,small,save.after,3,0.1602,s,rep 3
+Pando,small,save.passes_before,3,10,n,rep 3
+Pando,small,save.bytes_before,3,1.83237e+08,B,rep 3
+Pando,small,save.passes,3,1,n,rep 3
+Pando,small,save.bytes,3,2.09225e+07,B,rep 3
+Pando,small,save.stalls,3,962,n,rep 3
+Pando,small,save.stall,3,13.7759,s,rep 3
+Pando,small,save.fetched_bytes,3,1.08967e+08,B,rep 3
+Pando,small,save.exit,3,8.1319e-05,s,rep 3
+Pando,small,save.npm_ci,4,7.73396,s,"rep 4, exit 0"
+Pando,small,save.time,4,2.63164,s,rep 4
+Pando,small,save.uploaded,4,2.18714e+08,B,rep 4
+Pando,small,save.dirty,4,9.68266e+08,B,rep 4
+Pando,small,save.run_written,4,1.64168e+08,B,rep 4
+Pando,small,save.unmount,4,1.98059,s,rep 4
+Pando,small,save.unmount_written,4,9.88664e+08,B,rep 4
+Pando,small,save.detach,4,0.650574,s,rep 4
 Pando,small,save.absorb,4,0,s,rep 4
-Pando,small,save.flush,4,0,s,rep 4
-Pando,small,save.wait,4,0.1773,s,rep 4
-Pando,small,save.pack,4,0.0892,s,rep 4
-Pando,small,save.ref,4,0.0481,s,rep 4
-Pando,small,save.after,4,0.1839,s,rep 4
-Pando,small,save.passes_before,4,11,n,rep 4
-Pando,small,save.bytes_before,4,2.05438e+08,B,rep 4
+Pando,small,save.flush,4,0.0001,s,rep 4
+Pando,small,save.wait,4,0.3675,s,rep 4
+Pando,small,save.pack,4,0.0886,s,rep 4
+Pando,small,save.ref,4,0.0941,s,rep 4
+Pando,small,save.after,4,0.1533,s,rep 4
+Pando,small,save.passes_before,4,10,n,rep 4
+Pando,small,save.bytes_before,4,1.87194e+08,B,rep 4
 Pando,small,save.passes,4,2,n,rep 4
-Pando,small,save.bytes,4,1.54603e+06,B,rep 4
-Pando,small,save.stalls,4,53,n,rep 4
-Pando,small,save.stall,4,1.5885,s,rep 4
-Pando,small,save.fetched_bytes,4,4.07375e+06,B,rep 4
-Pando,small,save.exit,4,8.2481e-05,s,rep 4
-Pando,small,save.npm_ci,5,7.68226,s,"rep 5, exit 0"
-Pando,small,save.time,5,3.84248,s,rep 5
-Pando,small,save.uploaded,5,2.26202e+08,B,rep 5
-Pando,small,save.dirty,5,9.44493e+08,B,rep 5
-Pando,small,save.run_written,5,1.57778e+08,B,rep 5
-Pando,small,save.unmount,5,3.3967,s,rep 5
-Pando,small,save.unmount_written,5,9.94898e+08,B,rep 5
-Pando,small,save.detach,5,0.445309,s,rep 5
+Pando,small,save.bytes,4,1.96039e+07,B,rep 4
+Pando,small,save.stalls,4,681,n,rep 4
+Pando,small,save.stall,4,3.7233,s,rep 4
+Pando,small,save.fetched_bytes,4,9.79964e+07,B,rep 4
+Pando,small,save.exit,4,7.3561e-05,s,rep 4
+Pando,small,save.npm_ci,5,7.88481,s,"rep 5, exit 0"
+Pando,small,save.time,5,2.51655,s,rep 5
+Pando,small,save.uploaded,5,2.1492e+08,B,rep 5
+Pando,small,save.dirty,5,1.0131e+09,B,rep 5
+Pando,small,save.run_written,5,1.42414e+08,B,rep 5
+Pando,small,save.unmount,5,1.86496,s,rep 5
+Pando,small,save.unmount_written,5,1.01036e+09,B,rep 5
+Pando,small,save.detach,5,0.649226,s,rep 5
 Pando,small,save.absorb,5,0,s,rep 5
 Pando,small,save.flush,5,0,s,rep 5
-Pando,small,save.wait,5,0.1762,s,rep 5
-Pando,small,save.pack,5,0.0818,s,rep 5
-Pando,small,save.ref,5,0.046,s,rep 5
-Pando,small,save.after,5,0.1626,s,rep 5
-Pando,small,save.passes_before,5,12,n,rep 5
-Pando,small,save.bytes_before,5,2.06216e+08,B,rep 5
+Pando,small,save.wait,5,0.4315,s,rep 5
+Pando,small,save.pack,5,0.2841,s,rep 5
+Pando,small,save.ref,5,0.0596,s,rep 5
+Pando,small,save.after,5,0.1595,s,rep 5
+Pando,small,save.passes_before,5,9,n,rep 5
+Pando,small,save.bytes_before,5,2.2551e+07,B,rep 5
 Pando,small,save.passes,5,2,n,rep 5
-Pando,small,save.bytes,5,1.1124e+06,B,rep 5
-Pando,small,save.stalls,5,174,n,rep 5
-Pando,small,save.stall,5,6.1512,s,rep 5
-Pando,small,save.fetched_bytes,5,1.64017e+07,B,rep 5
-Pando,small,save.exit,5,7.9123e-05,s,rep 5
+Pando,small,save.bytes,5,1.83833e+08,B,rep 5
+Pando,small,save.stalls,5,723,n,rep 5
+Pando,small,save.stall,5,2.993,s,rep 5
+Pando,small,save.fetched_bytes,5,1.09256e+08,B,rep 5
+Pando,small,save.exit,5,0.00195857,s,rep 5
+Pando (64 MiB dirty cap),small,save.npm_ci,1,10.2897,s,"rep 1, exit 0"
+Pando (64 MiB dirty cap),small,save.time,1,0.950933,s,rep 1
+Pando (64 MiB dirty cap),small,save.uploaded,1,2.60683e+08,B,rep 1
+Pando (64 MiB dirty cap),small,save.dirty,1,9.09763e+07,B,rep 1
+Pando (64 MiB dirty cap),small,save.run_written,1,1.14006e+09,B,rep 1
+Pando (64 MiB dirty cap),small,save.unmount,1,0.50807,s,rep 1
+Pando (64 MiB dirty cap),small,save.unmount_written,1,4.52076e+07,B,rep 1
+Pando (64 MiB dirty cap),small,save.detach,1,0.442343,s,rep 1
+Pando (64 MiB dirty cap),small,save.absorb,1,0,s,rep 1
+Pando (64 MiB dirty cap),small,save.flush,1,0,s,rep 1
+Pando (64 MiB dirty cap),small,save.wait,1,0.1704,s,rep 1
+Pando (64 MiB dirty cap),small,save.pack,1,0.0832,s,rep 1
+Pando (64 MiB dirty cap),small,save.ref,1,0.0606,s,rep 1
+Pando (64 MiB dirty cap),small,save.after,1,0.1372,s,rep 1
+Pando (64 MiB dirty cap),small,save.passes_before,1,19,n,rep 1
+Pando (64 MiB dirty cap),small,save.bytes_before,1,2.1684e+08,B,rep 1
+Pando (64 MiB dirty cap),small,save.passes,1,2,n,rep 1
+Pando (64 MiB dirty cap),small,save.bytes,1,3.89996e+06,B,rep 1
+Pando (64 MiB dirty cap),small,save.stalls,1,1855,n,rep 1
+Pando (64 MiB dirty cap),small,save.stall,1,64.2722,s,rep 1
+Pando (64 MiB dirty cap),small,save.fetched_bytes,1,1.0545e+08,B,rep 1
+Pando (64 MiB dirty cap),small,save.exit,1,0.000115721,s,rep 1
+Pando (64 MiB dirty cap),small,save.npm_ci,2,9.08751,s,"rep 2, exit 0"
+Pando (64 MiB dirty cap),small,save.time,2,1.08223,s,rep 2
+Pando (64 MiB dirty cap),small,save.uploaded,2,2.61957e+08,B,rep 2
+Pando (64 MiB dirty cap),small,save.dirty,2,1.29716e+08,B,rep 2
+Pando (64 MiB dirty cap),small,save.run_written,2,1.15391e+09,B,rep 2
+Pando (64 MiB dirty cap),small,save.unmount,2,0.536654,s,rep 2
+Pando (64 MiB dirty cap),small,save.unmount_written,2,4.2668e+07,B,rep 2
+Pando (64 MiB dirty cap),small,save.detach,2,0.545106,s,rep 2
+Pando (64 MiB dirty cap),small,save.absorb,2,0,s,rep 2
+Pando (64 MiB dirty cap),small,save.flush,2,0,s,rep 2
+Pando (64 MiB dirty cap),small,save.wait,2,0.2045,s,rep 2
+Pando (64 MiB dirty cap),small,save.pack,2,0.109,s,rep 2
+Pando (64 MiB dirty cap),small,save.ref,2,0.0551,s,rep 2
+Pando (64 MiB dirty cap),small,save.after,2,0.2094,s,rep 2
+Pando (64 MiB dirty cap),small,save.passes_before,2,18,n,rep 2
+Pando (64 MiB dirty cap),small,save.bytes_before,2,2.19931e+08,B,rep 2
+Pando (64 MiB dirty cap),small,save.passes,2,2,n,rep 2
+Pando (64 MiB dirty cap),small,save.bytes,2,3.40622e+06,B,rep 2
+Pando (64 MiB dirty cap),small,save.stalls,2,892,n,rep 2
+Pando (64 MiB dirty cap),small,save.stall,2,16.9887,s,rep 2
+Pando (64 MiB dirty cap),small,save.fetched_bytes,2,8.34001e+07,B,rep 2
+Pando (64 MiB dirty cap),small,save.exit,2,8.579e-05,s,rep 2
+Pando (64 MiB dirty cap),small,save.npm_ci,3,8.83897,s,"rep 3, exit 0"
+Pando (64 MiB dirty cap),small,save.time,3,0.919027,s,rep 3
+Pando (64 MiB dirty cap),small,save.uploaded,3,2.56245e+08,B,rep 3
+Pando (64 MiB dirty cap),small,save.dirty,3,1.14938e+08,B,rep 3
+Pando (64 MiB dirty cap),small,save.run_written,3,1.1543e+09,B,rep 3
+Pando (64 MiB dirty cap),small,save.unmount,3,0.477268,s,rep 3
+Pando (64 MiB dirty cap),small,save.unmount_written,3,2.91635e+07,B,rep 3
+Pando (64 MiB dirty cap),small,save.detach,3,0.441259,s,rep 3
+Pando (64 MiB dirty cap),small,save.absorb,3,0,s,rep 3
+Pando (64 MiB dirty cap),small,save.flush,3,0.0001,s,rep 3
+Pando (64 MiB dirty cap),small,save.wait,3,0.1902,s,rep 3
+Pando (64 MiB dirty cap),small,save.pack,3,0.1074,s,rep 3
+Pando (64 MiB dirty cap),small,save.ref,3,0.0551,s,rep 3
+Pando (64 MiB dirty cap),small,save.after,3,0.1566,s,rep 3
+Pando (64 MiB dirty cap),small,save.passes_before,3,17,n,rep 3
+Pando (64 MiB dirty cap),small,save.bytes_before,3,2.17271e+08,B,rep 3
+Pando (64 MiB dirty cap),small,save.passes,3,2,n,rep 3
+Pando (64 MiB dirty cap),small,save.bytes,3,2.86827e+06,B,rep 3
+Pando (64 MiB dirty cap),small,save.stalls,3,806,n,rep 3
+Pando (64 MiB dirty cap),small,save.stall,3,6.0098,s,rep 3
+Pando (64 MiB dirty cap),small,save.fetched_bytes,3,1.4494e+08,B,rep 3
+Pando (64 MiB dirty cap),small,save.exit,3,9.3523e-05,s,rep 3
+Pando (64 MiB dirty cap),small,save.npm_ci,4,8.73904,s,"rep 4, exit 0"
+Pando (64 MiB dirty cap),small,save.time,4,0.91107,s,rep 4
+Pando (64 MiB dirty cap),small,save.uploaded,4,2.54085e+08,B,rep 4
+Pando (64 MiB dirty cap),small,save.dirty,4,8.85637e+07,B,rep 4
+Pando (64 MiB dirty cap),small,save.run_written,4,1.13865e+09,B,rep 4
+Pando (64 MiB dirty cap),small,save.unmount,4,0.462772,s,rep 4
+Pando (64 MiB dirty cap),small,save.unmount_written,4,4.25329e+07,B,rep 4
+Pando (64 MiB dirty cap),small,save.detach,4,0.447834,s,rep 4
+Pando (64 MiB dirty cap),small,save.absorb,4,0,s,rep 4
+Pando (64 MiB dirty cap),small,save.flush,4,0.0001,s,rep 4
+Pando (64 MiB dirty cap),small,save.wait,4,0.1836,s,rep 4
+Pando (64 MiB dirty cap),small,save.pack,4,0.0892,s,rep 4
+Pando (64 MiB dirty cap),small,save.ref,4,0.0492,s,rep 4
+Pando (64 MiB dirty cap),small,save.after,4,0.175,s,rep 4
+Pando (64 MiB dirty cap),small,save.passes_before,4,17,n,rep 4
+Pando (64 MiB dirty cap),small,save.bytes_before,4,2.13658e+08,B,rep 4
+Pando (64 MiB dirty cap),small,save.passes,4,2,n,rep 4
+Pando (64 MiB dirty cap),small,save.bytes,4,3.79169e+06,B,rep 4
+Pando (64 MiB dirty cap),small,save.stalls,4,675,n,rep 4
+Pando (64 MiB dirty cap),small,save.stall,4,7.5193,s,rep 4
+Pando (64 MiB dirty cap),small,save.fetched_bytes,4,1.69616e+08,B,rep 4
+Pando (64 MiB dirty cap),small,save.exit,4,8.1011e-05,s,rep 4
+Pando (64 MiB dirty cap),small,save.npm_ci,5,8.585,s,"rep 5, exit 0"
+Pando (64 MiB dirty cap),small,save.time,5,0.868879,s,rep 5
+Pando (64 MiB dirty cap),small,save.uploaded,5,2.5129e+08,B,rep 5
+Pando (64 MiB dirty cap),small,save.dirty,5,8.3796e+07,B,rep 5
+Pando (64 MiB dirty cap),small,save.run_written,5,1.15336e+09,B,rep 5
+Pando (64 MiB dirty cap),small,save.unmount,5,0.425813,s,rep 5
+Pando (64 MiB dirty cap),small,save.unmount_written,5,2.63864e+07,B,rep 5
+Pando (64 MiB dirty cap),small,save.detach,5,0.442563,s,rep 5
+Pando (64 MiB dirty cap),small,save.absorb,5,0,s,rep 5
+Pando (64 MiB dirty cap),small,save.flush,5,0,s,rep 5
+Pando (64 MiB dirty cap),small,save.wait,5,0.174,s,rep 5
+Pando (64 MiB dirty cap),small,save.pack,5,0.0934,s,rep 5
+Pando (64 MiB dirty cap),small,save.ref,5,0.0592,s,rep 5
+Pando (64 MiB dirty cap),small,save.after,5,0.1847,s,rep 5
+Pando (64 MiB dirty cap),small,save.passes_before,5,16,n,rep 5
+Pando (64 MiB dirty cap),small,save.bytes_before,5,2.12531e+08,B,rep 5
+Pando (64 MiB dirty cap),small,save.passes,5,2,n,rep 5
+Pando (64 MiB dirty cap),small,save.bytes,5,3.82914e+06,B,rep 5
+Pando (64 MiB dirty cap),small,save.stalls,5,667,n,rep 5
+Pando (64 MiB dirty cap),small,save.stall,5,7.7627,s,rep 5
+Pando (64 MiB dirty cap),small,save.fetched_bytes,5,1.68824e+08,B,rep 5
+Pando (64 MiB dirty cap),small,save.exit,5,9.4607e-05,s,rep 5

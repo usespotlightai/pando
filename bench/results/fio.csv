@@ -74,53 +74,53 @@ Amazon S3 Files,small,fio.randread_qd32,3,24680.3,IOPS,rep 3
 Amazon S3 Files,small,fio.randwrite_qd32,3,4871.82,IOPS,rep 3
 Amazon S3 Files,small,fio.seqread,3,488.323,MB/s,rep 3
 Amazon S3 Files,small,fio.seqwrite,3,185.655,MB/s,rep 3
-Pando (ublk),small,fio.randread_qd1,1,107211,IOPS,rep 1
-Pando (ublk),small,fio.randread_qd32,1,820002,IOPS,rep 1
-Pando (ublk),small,fio.randwrite_qd32,1,123426,IOPS,rep 1
-Pando (ublk),small,fio.seqread,1,6804.05,MB/s,rep 1
-Pando (ublk),small,fio.seqwrite,1,906.305,MB/s,rep 1
-Pando (ublk),small,fio.randread_qd1,2,110351,IOPS,rep 2
-Pando (ublk),small,fio.randread_qd32,2,819984,IOPS,rep 2
-Pando (ublk),small,fio.randwrite_qd32,2,124677,IOPS,rep 2
-Pando (ublk),small,fio.seqread,2,6731.81,MB/s,rep 2
-Pando (ublk),small,fio.seqwrite,2,906.264,MB/s,rep 2
-Pando (ublk),small,fio.randread_qd1,3,109475,IOPS,rep 3
-Pando (ublk),small,fio.randread_qd32,3,819595,IOPS,rep 3
-Pando (ublk),small,fio.randwrite_qd32,3,123049,IOPS,rep 3
-Pando (ublk),small,fio.seqread,3,7027.01,MB/s,rep 3
-Pando (ublk),small,fio.seqwrite,3,940.106,MB/s,rep 3
-Pando (ublk),small,fio.randread_qd1,4,106325,IOPS,rep 4
-Pando (ublk),small,fio.randread_qd32,4,820410,IOPS,rep 4
-Pando (ublk),small,fio.randwrite_qd32,4,123096,IOPS,rep 4
-Pando (ublk),small,fio.seqread,4,6727.52,MB/s,rep 4
-Pando (ublk),small,fio.seqwrite,4,906.871,MB/s,rep 4
-Pando (ublk),small,fio.randread_qd1,5,104410,IOPS,rep 5
-Pando (ublk),small,fio.randread_qd32,5,824629,IOPS,rep 5
-Pando (ublk),small,fio.randwrite_qd32,5,125271,IOPS,rep 5
-Pando (ublk),small,fio.seqread,5,6686.68,MB/s,rep 5
-Pando (ublk),small,fio.seqwrite,5,906.435,MB/s,rep 5
-Pando (after handoff),small,fio.randread_qd1,1,7366.48,IOPS,rep 1
-Pando (after handoff),small,fio.randread_qd32,1,254925,IOPS,rep 1
-Pando (after handoff),small,fio.randwrite_qd32,1,131413,IOPS,rep 1
-Pando (after handoff),small,fio.seqread,1,1910.34,MB/s,rep 1
-Pando (after handoff),small,fio.seqwrite,1,901.475,MB/s,rep 1
-Pando (after handoff),small,fio.randread_qd1,2,7875.71,IOPS,rep 2
-Pando (after handoff),small,fio.randread_qd32,2,251770,IOPS,rep 2
-Pando (after handoff),small,fio.randwrite_qd32,2,132015,IOPS,rep 2
+Pando (ublk),small,fio.randread_qd1,1,50094.2,IOPS,rep 1
+Pando (ublk),small,fio.randread_qd32,1,811086,IOPS,rep 1
+Pando (ublk),small,fio.randwrite_qd32,1,118595,IOPS,rep 1
+Pando (ublk),small,fio.seqread,1,6538,MB/s,rep 1
+Pando (ublk),small,fio.seqwrite,1,881.664,MB/s,rep 1
+Pando (ublk),small,fio.randread_qd1,2,47521.8,IOPS,rep 2
+Pando (ublk),small,fio.randread_qd32,2,803867,IOPS,rep 2
+Pando (ublk),small,fio.randwrite_qd32,2,122155,IOPS,rep 2
+Pando (ublk),small,fio.seqread,2,6314,MB/s,rep 2
+Pando (ublk),small,fio.seqwrite,2,896.093,MB/s,rep 2
+Pando (ublk),small,fio.randread_qd1,3,49695.5,IOPS,rep 3
+Pando (ublk),small,fio.randread_qd32,3,811905,IOPS,rep 3
+Pando (ublk),small,fio.randwrite_qd32,3,119056,IOPS,rep 3
+Pando (ublk),small,fio.seqread,3,6553.32,MB/s,rep 3
+Pando (ublk),small,fio.seqwrite,3,916.829,MB/s,rep 3
+Pando (ublk),small,fio.randread_qd1,4,38784.5,IOPS,rep 4
+Pando (ublk),small,fio.randread_qd32,4,816583,IOPS,rep 4
+Pando (ublk),small,fio.randwrite_qd32,4,120659,IOPS,rep 4
+Pando (ublk),small,fio.seqread,4,6380.05,MB/s,rep 4
+Pando (ublk),small,fio.seqwrite,4,925.57,MB/s,rep 4
+Pando (ublk),small,fio.randread_qd1,5,35123.5,IOPS,rep 5
+Pando (ublk),small,fio.randread_qd32,5,822927,IOPS,rep 5
+Pando (ublk),small,fio.randwrite_qd32,5,116216,IOPS,rep 5
+Pando (ublk),small,fio.seqread,5,6380.47,MB/s,rep 5
+Pando (ublk),small,fio.seqwrite,5,908.588,MB/s,rep 5
+Pando (after handoff),small,fio.randread_qd1,1,6581.42,IOPS,rep 1
+Pando (after handoff),small,fio.randread_qd32,1,243080,IOPS,rep 1
+Pando (after handoff),small,fio.randwrite_qd32,1,131823,IOPS,rep 1
+Pando (after handoff),small,fio.seqread,1,1910.39,MB/s,rep 1
+Pando (after handoff),small,fio.seqwrite,1,901.167,MB/s,rep 1
+Pando (after handoff),small,fio.randread_qd1,2,6611.02,IOPS,rep 2
+Pando (after handoff),small,fio.randread_qd32,2,246503,IOPS,rep 2
+Pando (after handoff),small,fio.randwrite_qd32,2,132559,IOPS,rep 2
 Pando (after handoff),small,fio.seqread,2,1910.34,MB/s,rep 2
 Pando (after handoff),small,fio.seqwrite,2,901.999,MB/s,rep 2
-Pando (after handoff),small,fio.randread_qd1,3,8202.99,IOPS,rep 3
-Pando (after handoff),small,fio.randread_qd32,3,255045,IOPS,rep 3
-Pando (after handoff),small,fio.randwrite_qd32,3,131798,IOPS,rep 3
+Pando (after handoff),small,fio.randread_qd1,3,5338.73,IOPS,rep 3
+Pando (after handoff),small,fio.randread_qd32,3,247289,IOPS,rep 3
+Pando (after handoff),small,fio.randwrite_qd32,3,132778,IOPS,rep 3
 Pando (after handoff),small,fio.seqread,3,1910.39,MB/s,rep 3
-Pando (after handoff),small,fio.seqwrite,3,902.051,MB/s,rep 3
-Pando (after handoff),small,fio.randread_qd1,4,7779.41,IOPS,rep 4
-Pando (after handoff),small,fio.randread_qd32,4,254100,IOPS,rep 4
-Pando (after handoff),small,fio.randwrite_qd32,4,131697,IOPS,rep 4
-Pando (after handoff),small,fio.seqread,4,1910.34,MB/s,rep 4
-Pando (after handoff),small,fio.seqwrite,4,902.058,MB/s,rep 4
-Pando (after handoff),small,fio.randread_qd1,5,5732.46,IOPS,rep 5
-Pando (after handoff),small,fio.randread_qd32,5,252799,IOPS,rep 5
-Pando (after handoff),small,fio.randwrite_qd32,5,131743,IOPS,rep 5
-Pando (after handoff),small,fio.seqread,5,1910.34,MB/s,rep 5
-Pando (after handoff),small,fio.seqwrite,5,901.954,MB/s,rep 5
+Pando (after handoff),small,fio.seqwrite,3,902.103,MB/s,rep 3
+Pando (after handoff),small,fio.randread_qd1,4,7905.8,IOPS,rep 4
+Pando (after handoff),small,fio.randread_qd32,4,248390,IOPS,rep 4
+Pando (after handoff),small,fio.randwrite_qd32,4,132682,IOPS,rep 4
+Pando (after handoff),small,fio.seqread,4,1910.39,MB/s,rep 4
+Pando (after handoff),small,fio.seqwrite,4,901.999,MB/s,rep 4
+Pando (after handoff),small,fio.randread_qd1,5,6599.22,IOPS,rep 5
+Pando (after handoff),small,fio.randread_qd32,5,248206,IOPS,rep 5
+Pando (after handoff),small,fio.randwrite_qd32,5,132672,IOPS,rep 5
+Pando (after handoff),small,fio.seqread,5,1910.39,MB/s,rep 5
+Pando (after handoff),small,fio.seqwrite,5,901.999,MB/s,rep 5

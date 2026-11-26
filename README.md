@@ -326,7 +326,7 @@ records and hints to the store.
 
 | p50 over up to 1,000 branches | median | range |
 |---|---|---|
-| Pando | 129 ms | 129 ms to 129 ms |
+| Pando | 131 ms | 131 ms to 131 ms |
 | Docker (overlayfs, local) | 11.1 ms | 11.1 ms to 11.1 ms |
 | EBS snapshot to volume | 2.6 s | 2.6 s to 2.6 s |
 | JuiceFS | 12.8 s | 12.8 s to 12.8 s |
@@ -336,7 +336,7 @@ records and hints to the store.
 
 | storage added per branch | median | range |
 |---|---|---|
-| Pando | 136 B | 136 B to 136 B |
+| Pando | 172 B | 172 B to 172 B |
 | Docker (overlayfs, local) | 36.5 KiB | 36.5 KiB to 36.5 KiB |
 | EBS snapshot to volume | 16 GiB | 16 GiB to 16 GiB |
 | JuiceFS | 25.4 MiB | 25.4 MiB to 25.4 MiB |
@@ -346,7 +346,7 @@ records and hints to the store.
 
 | storage added by a 5 MiB edit to a branch | median | range |
 |---|---|---|
-| Pando | 5.08 MiB | 5.08 MiB to 5.08 MiB |
+| Pando | 5.07 MiB | 5.07 MiB to 5.07 MiB |
 | Docker (overlayfs, local) | 5 MiB | 5 MiB to 5 MiB |
 | EBS snapshot to volume | none: billed by volume size | |
 | JuiceFS | 5 MiB | 5 MiB to 5 MiB |
@@ -376,8 +376,8 @@ file and S3 Files copies every file for each branch; S3 Files ran 3 times, not 5
 
 | fork, mount and git status done | median | range |
 |---|---|---|
-| Pando | 1.22 s | 1.16 s to 2.83 s |
-| Pando (handoff) | 1.21 s | 1.19 s to 2.32 s |
+| Pando | 1.14 s | 1 s to 2.92 s |
+| Pando (handoff) | 1.28 s | 1.21 s to 2.34 s |
 | tar from S3 | 4.44 s | 4.41 s to 4.48 s |
 | image download from S3 | 4.72 s | 4.69 s to 4.79 s |
 | Docker (overlayfs) | 26.9 s | 26.8 s to 27.3 s |
@@ -413,8 +413,8 @@ file again for each branch, so its warm start is as slow as its cold start.
 
 | fork, mount and git status done | median | range |
 |---|---|---|
-| Pando | 1.31 s | 1.29 s to 1.32 s |
-| Pando (handoff) | 1.75 s | 1.68 s to 1.81 s |
+| Pando | 1.33 s | 1.31 s to 1.34 s |
+| Pando (handoff) | 1.77 s | 1.66 s to 1.83 s |
 | tar from S3 | 2.51 s | 2.5 s to 2.52 s |
 | image download from S3 | 2.8 s | 2.8 s to 3.12 s |
 | Docker (overlayfs) | 1.27 s | 1.23 s to 1.31 s |
@@ -449,9 +449,9 @@ commands.
 
 | total time as a ratio to native (1.00x) | median | range |
 |---|---|---|
-| native ext4 (NVMe) | 1.00x | 1.00x to 1.00x |
-| Pando | 1.03x | 1.03x to 1.16x |
-| Pando (handoff) | 1.02x | 1.02x to 1.06x |
+| native ext4 (NVMe) | 1.00x | 0.97x to 1.02x |
+| Pando | 1.04x | 1.03x to 1.20x |
+| Pando (handoff) | 1.01x | 1.01x to 1.01x |
 | image download from S3 | 1.03x | 1.03x to 1.04x |
 | Docker (overlayfs) | 1.02x | 1.02x to 1.03x |
 | SOCI lazy pull | 1.21x | 1.20x to 1.34x |
@@ -489,7 +489,7 @@ Three runs each, five for Pando.
 
 | time to durable after npm ci | median | range |
 |---|---|---|
-| Pando | 2.65 s | 2.21 s to 5.97 s |
+| Pando | 2.97 s | 2.52 s to 7.47 s |
 | tar from S3 | 3.2 s | 3.17 s to 3.2 s |
 | Docker (overlayfs) | 41.1 s | 40.9 s to 41.2 s |
 | EBS snapshot to volume | 93.9 s | 83.8 s to 102 s |
@@ -499,7 +499,7 @@ Three runs each, five for Pando.
 
 | uploaded after npm ci | median | range |
 |---|---|---|
-| Pando | 216 MiB | 208 MiB to 217 MiB |
+| Pando | 209 MiB | 203 MiB to 215 MiB |
 | tar from S3 | 323 MiB | 323 MiB to 323 MiB |
 | Docker (overlayfs) | 194 MiB | 194 MiB to 194 MiB |
 | EBS snapshot to volume | 1.05 GiB | 1.05 GiB to 1.05 GiB |
@@ -533,8 +533,8 @@ to the file system, so a single 4 KiB read waits on a round trip.
 | 4 KiB random read, QD1 | median | range |
 |---|---|---|
 | local NVMe | 11k | 10.4k to 11.1k |
-| Pando (ublk) | 107k | 104k to 110k |
-| Pando (after handoff) | 7.78k | 5.73k to 8.2k |
+| Pando (ublk) | 47.5k | 35.1k to 50.1k |
+| Pando (after handoff) | 6.6k | 5.34k to 7.91k |
 | EBS gp3 | 1.54k | 1.54k to 1.6k |
 | JuiceFS | 6.37k | 5.98k to 6.58k |
 | ZeroFS (NBD) | 5.99k | 4.55k to 6.77k |
@@ -543,8 +543,8 @@ to the file system, so a single 4 KiB read waits on a round trip.
 | 4 KiB random read, 4 x QD32 | median | range |
 |---|---|---|
 | local NVMe | 269k | 269k to 269k |
-| Pando (ublk) | 820k | 820k to 825k |
-| Pando (after handoff) | 254k | 252k to 255k |
+| Pando (ublk) | 812k | 804k to 823k |
+| Pando (after handoff) | 247k | 243k to 248k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 76.7k | 76.4k to 77.3k |
 | ZeroFS (NBD) | 31.7k | 28.4k to 32.7k |
@@ -553,8 +553,8 @@ to the file system, so a single 4 KiB read waits on a round trip.
 | 4 KiB random write, 4 x QD32 | median | range |
 |---|---|---|
 | local NVMe | 134k | 134k to 134k |
-| Pando (ublk) | 123k | 123k to 125k |
-| Pando (after handoff) | 132k | 131k to 132k |
+| Pando (ublk) | 119k | 116k to 122k |
+| Pando (after handoff) | 133k | 132k to 133k |
 | EBS gp3 | 2.99k | 2.99k to 3k |
 | JuiceFS | 484 | 456 to 493 |
 | ZeroFS (NBD) | 1.32k | 1.23k to 1.54k |
@@ -563,7 +563,7 @@ to the file system, so a single 4 KiB read waits on a round trip.
 | 1 MiB sequential read | median | range |
 |---|---|---|
 | local NVMe | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
-| Pando (ublk) | 6,732 MB/s | 6,687 MB/s to 7,027 MB/s |
+| Pando (ublk) | 6,380 MB/s | 6,314 MB/s to 6,553 MB/s |
 | Pando (after handoff) | 1,910 MB/s | 1,910 MB/s to 1,910 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,611 MB/s | 1,576 MB/s to 1,660 MB/s |
@@ -573,7 +573,7 @@ to the file system, so a single 4 KiB read waits on a round trip.
 | 1 MiB sequential write | median | range |
 |---|---|---|
 | local NVMe | 908 MB/s | 908 MB/s to 908 MB/s |
-| Pando (ublk) | 906 MB/s | 906 MB/s to 940 MB/s |
+| Pando (ublk) | 909 MB/s | 882 MB/s to 926 MB/s |
 | Pando (after handoff) | 902 MB/s | 901 MB/s to 902 MB/s |
 | EBS gp3 | 131 MB/s | 131 MB/s to 131 MB/s |
 | JuiceFS | 1,328 MB/s | 1,317 MB/s to 1,330 MB/s |
