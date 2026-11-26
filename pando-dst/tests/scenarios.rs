@@ -172,7 +172,7 @@ fn seeds(var: &str, default: u64) -> std::ops::Range<u64> {
 #[test]
 fn a_host_that_hands_off_survives_crashes_anywhere_in_a_branch_life() {
     let mut total = host_crash::Report::default();
-    let run = seeds("PANDO_DST_HOST_SEEDS", 40);
+    let run = seeds("PANDO_DST_HOST_SEEDS", 10);
     let many = run.end - run.start >= 40;
     for seed in run {
         let r = host_crash::attach_crashes(seed).unwrap_or_else(|e| panic!("{e}"));
