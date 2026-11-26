@@ -875,7 +875,7 @@ impl ObjectLog {
             .unwritten
             .fetch_add(u64::from(len) + HEADER_LEN, Ordering::AcqRel);
         if n + u64::from(len) >= WRITEBACK_BYTES && self.holds.load(Ordering::Acquire) == 0 {
-            self.write_behind().await;
+            self.write_back();
         }
         Ok(())
     }
